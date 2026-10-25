@@ -27,6 +27,7 @@ Output is deterministic for a given `-seed`, so regenerating produces a diff of
 | `tokenizer_estimate_message_tokens.json` | `pkg/tokenizer.EstimateMessageTokens` | 1550 | token count |
 | `tokenizer_estimate_tool_defs_tokens.json` | `pkg/tokenizer.EstimateToolDefsTokens` | 802 | token count |
 | `go_json_encode_parameters.json` | `encoding/json.Marshal` | 1558 | the exact output string, or `null` where Go returns an error |
+| `protocoltypes_marshal.json` | `pkg/providers/protocoltypes` + `json.Marshal` | 248 | the exact output string |
 
 Each file carries `schema`, `generator`, `source_repo`, `source_commit` and
 `seed`. The harness refuses a `schema` it does not recognise and refuses a file

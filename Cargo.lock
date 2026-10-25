@@ -21,6 +21,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crab-protocoltypes"
+version = "0.0.0"
+dependencies = [
+ "conformance",
+ "crab-gojson",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "crab-tokenizer"
 version = "0.0.0"
 dependencies = [

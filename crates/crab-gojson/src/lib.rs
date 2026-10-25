@@ -31,6 +31,10 @@
 //! producing something approximate, because the caller's behaviour on error is to
 //! skip the value entirely.
 
+pub mod structs;
+
+pub use structs::{omit, GoMarshal, ObjectWriter};
+
 use std::collections::BTreeMap;
 
 /// A value as Go's `map[string]any` can hold it.
@@ -258,7 +262,7 @@ fn format_go_float(f: f64) -> Result<Vec<u8>, MarshalError> {
 
     let abs = f.abs();
     // Go: 'e' when the magnitude is outside [1e-6, 1e21), except for zero.
-    let use_exponent = abs != 0.0 && (abs < 1e-6 || abs >= 1e21);
+    let use_exponent = abs != 0.0 && !(1e-6..1e21).contains(&abs);
 
     if !use_exponent {
         // Rust's Display for f64 is shortest-round-trip and always positional,

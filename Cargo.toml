@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/crab-gojson", "crates/crab-tokenizer", "conformance"]
+members = [
+    "conformance",
+    "crates/crab-gojson",
+    "crates/crab-protocoltypes",
+    "crates/crab-tokenizer",
+]
 
 [workspace.package]
 version = "0.0.0"
