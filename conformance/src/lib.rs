@@ -24,6 +24,8 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::Value;
 
+pub mod go_value;
+
 /// Schemas this harness knows how to interpret.
 pub const SUPPORTED_SCHEMAS: &[&str] = &["rusty-crab-conformance/1"];
 

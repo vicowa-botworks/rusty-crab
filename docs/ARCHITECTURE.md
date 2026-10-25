@@ -69,13 +69,22 @@ sides unambiguously.
 
 | Rust crate | Go package |
 |---|---|
-| `crab-tokenizer` | `pkg/tokenizer`, plus `go_json` for the `encoding/json` behaviour it depends on |
+| `crab-tokenizer` | `pkg/tokenizer` |
+| `crab-gojson` | Go's `encoding/json` — standard library, not a picoclaw package |
 
-Deviations from one-to-one need a reason written next to them. `go_json` is the
-first such: `pkg/tokenizer` does not own `encoding/json`, but the *contract* being
-ported is `len(json.Marshal(x))`, so the encoder's exact bytes are part of the
-tokenizer's surface and belong with it rather than in a general-purpose crate
-anyone might "improve".
+Deviations from one-to-one need a reason written next to them. `crab-gojson` is
+one: picoclaw does not own `encoding/json`, but it is a *dependency whose bytes
+are load-bearing* — `pkg/tokenizer` measures `len(json.Marshal(x))`, and
+`pkg/providers/protocoltypes` puts those bytes on the wire and into session files.
+So it is ported as infrastructure and shared, because two copies would drift and
+disagree about what the same Go value serialises to. It is pinned by its own
+fixture (1558 cases), which is what makes sharing safe: "improving" it fails a test
+that names the byte.
+
+The crate sits **below** `crab-tokenizer`, matching Go's graph — `protocoltypes` is
+layer 0 and `tokenizer` is layer 6, so a wire type must never depend on the
+tokenizer. `crab_tokenizer` re-exports the value type because
+`ToolFunctionDefinition::parameters` mentions it in a public signature.
 
 ## Rules
 

@@ -1,10 +1,20 @@
-//! A re-implementation of Go's `encoding/json` for the subset of values that
-//! reach the tokenizer.
+//! Go's `encoding/json`, byte for byte, for the value shapes the port reaches.
 //!
-//! This is not "JSON". It is the byte-for-byte output of `json.Marshal`, because
-//! the ported code measures that output with `len()` -- the number is a token
-//! estimate, so the exact bytes are the contract, not an implementation detail.
-//! Three places where a generic JSON serialiser disagrees with Go:
+//! This is not "JSON". It is the byte-for-byte output of `json.Marshal`, and it
+//! is shared infrastructure rather than a utility crate on purpose: two copies
+//! would drift, and drift here means two crates disagreeing about what the same
+//! Go value serialises to. It is pinned by `go_json_encode_parameters.json`
+//! (1558 cases), so "improving" it fails a test that names the byte.
+//!
+//! Two consumers today, for two different reasons:
+//!
+//! * `crab-tokenizer` measures `len(json.Marshal(x))` as a token estimate, so the
+//!   byte count *is* its output.
+//! * `crab-protocoltypes` puts these bytes on the wire to providers and into
+//!   session files, where a changed byte is a file the next release reads back
+//!   differently.
+//!
+//! Places where a generic JSON serialiser disagrees with Go:
 //!
 //! * **Map keys are sorted.** Go sorts them by raw byte order, which puts
 //!   `"M"` before `"_"` before `"a"` and puts non-ASCII keys last.
