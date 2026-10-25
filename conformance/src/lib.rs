@@ -227,10 +227,6 @@ fn truncate(s: &str, max: usize) -> String {
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}: go={} rust={}",
-            self.case, self.expected, self.got
-        )
+        write!(f, "{}: go={} rust={}", self.case, self.expected, self.got)
     }
 }

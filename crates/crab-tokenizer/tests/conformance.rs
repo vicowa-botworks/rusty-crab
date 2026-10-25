@@ -142,7 +142,9 @@ impl FixtureMessage {
                 })
                 .collect(),
             tool_call_id: self.tool_call_id,
-            media: (0..self.media_count).map(|i| format!("media-{i}")).collect(),
+            media: (0..self.media_count)
+                .map(|i| format!("media-{i}"))
+                .collect(),
         }
     }
 }
