@@ -1,0 +1,11 @@
+[package]
+name = "conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Fixture harness that replays picoclaw's recorded behaviour against the Rust port"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
