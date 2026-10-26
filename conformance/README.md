@@ -28,11 +28,23 @@ Output is deterministic for a given `-seed`, so regenerating produces a diff of
 | `tokenizer_estimate_tool_defs_tokens.json` | `pkg/tokenizer.EstimateToolDefsTokens` | 802 | token count |
 | `go_json_encode_parameters.json` | `encoding/json.Marshal` | 1558 | the exact output string, or `null` where Go returns an error |
 | `protocoltypes_marshal.json` | `pkg/providers/protocoltypes` + `json.Marshal` | 248 | the exact output string |
+| `memory_jsonl_store.json` | `pkg/memory.JSONLStore` | 78 | the directory left on disk plus every query's answer, or `{error, op}` where a step is refused |
 
 Each file carries `schema`, `generator`, `source_repo`, `source_commit` and
 `seed`. The harness refuses a `schema` it does not recognise and refuses a file
 with zero cases, so a format change or an emptied corpus fails loudly instead of
 passing.
+
+The memory file is the one whose shape is not a call and a return value. A session
+store's contract is the files it leaves behind, so its `input.ops` is a *script*
+of public calls and its `expected` is the directory after the script plus one
+entry per query. Two consequences for whoever replays it: a case is only as
+deterministic as the store's clock (the generator masks any timestamp at or after
+its own process start, which is the only line between a time the case scripted and
+a time the store stamped), and a refused step records the directory too —
+`{error, op}` alone cannot tell "refused" from "refused after writing something",
+and for rules like *compact writes the metadata before it rewrites the history*
+the files are the whole assertion.
 
 The third file exists because the first two reach `json.Marshal` only through a
 byte *count*: a one-byte encoding difference would surface as an off-by-one token

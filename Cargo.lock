@@ -21,6 +21,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crab-memory"
+version = "0.0.0"
+dependencies = [
+ "conformance",
+ "crab-gojson",
+ "crab-protocoltypes",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "crab-protocoltypes"
 version = "0.0.0"
 dependencies = [
