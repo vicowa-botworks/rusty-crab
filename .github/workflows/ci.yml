@@ -28,7 +28,22 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: |
+          set -euo pipefail
+          # A warm rust-cache can turn this step into a no-op: clippy prints
+          # nothing, exits 0, and has not looked at a single crate. Touch the
+          # sources so the step always re-checks, then fail if the crate count
+          # it reports does not match the workspace.
+          find crates conformance -name '*.rs' -exec touch {} +
+          crates=$(cargo metadata --no-deps --format-version 1 | jq '[.packages[].name] | length')
+          set +e
+          cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log
+          status=${PIPESTATUS[0]}
+          set -e
+          checked=$(grep -c 'Checking' /tmp/clippy.log || true)
+          echo "clippy checked $checked of $crates crates"
+          [ "$status" -eq 0 ] || exit "$status"
+          [ "$checked" -ge "$crates" ] || { echo "clippy checked nothing"; exit 1; }
 
       - name: Test
         run: cargo test --all-targets

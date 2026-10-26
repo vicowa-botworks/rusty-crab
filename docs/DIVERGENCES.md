@@ -22,7 +22,23 @@ entry here is a bug, not a decision.
 
 ## Divergences
 
-None.
+### Wording of a refused `time.Time`
+
+- Go: marshalling a `time.Time` with a year outside `[0, 9999]`, or in a zone
+  whose hour exceeds 23, fails the whole document with
+  `json: error calling MarshalJSON for type *time.Time: year outside of range [0,9999]`
+  (`time.appendStrictRFC3339`, reached through `json.Marshal`).
+- Rust: `go_time::format_rfc3339_nano` returns `MarshalError` carrying Go's
+  *inner* message; `MarshalError`'s `Display` renders it as
+  `json: unsupported value: <message>`, which is Go's wording for the NaN/Inf
+  family rather than for a `MarshalJSON` refusal.
+- Why: `MarshalError` is one flat type shared with the unsupported-value family.
+  Matching Go exactly here means a second error variant in `crab-gojson` for a
+  string nothing parses.
+- Blast radius: anyone printing or pattern-matching the error text. The
+  observable contract -- no bytes emitted, the whole document fails -- is
+  unchanged, and that is the half the conformance corpus can see.
+- Recorded: 2026-10-26, #3.
 
 Structural deviations -- a function living in a different crate than its Go
 package, a module split that does not match a directory -- are not divergences in

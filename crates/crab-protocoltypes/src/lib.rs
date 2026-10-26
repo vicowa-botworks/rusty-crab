@@ -57,17 +57,21 @@ pub struct GoTime {
 
 impl GoTime {
     /// What `MarshalJSON` returns: the quoted RFC3339Nano string.
-    pub fn to_json_string(&self) -> String {
-        format!(
+    ///
+    /// Fails for the instants Go refuses to marshal (see [`go_time`]), which
+    /// `json.Marshal` turns into an error for the whole document rather than a
+    /// missing field.
+    pub fn to_json_string(&self) -> Result<String, crab_gojson::MarshalError> {
+        Ok(format!(
             "\"{}\"",
-            format_rfc3339_nano(self.unix_seconds, self.nanos, self.offset_seconds)
-        )
+            format_rfc3339_nano(self.unix_seconds, self.nanos, self.offset_seconds)?
+        ))
     }
 }
 
 impl GoMarshal for GoTime {
     fn marshal_go(&self, out: &mut Vec<u8>) -> Result<(), crab_gojson::MarshalError> {
-        out.extend_from_slice(self.to_json_string().as_bytes());
+        out.extend_from_slice(self.to_json_string()?.as_bytes());
         Ok(())
     }
 }

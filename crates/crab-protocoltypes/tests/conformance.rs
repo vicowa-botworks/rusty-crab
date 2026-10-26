@@ -5,6 +5,13 @@
 //! form could not say which of the two a case was testing. `null` and `[]` stay
 //! distinguishable here, and this file is where they get mapped onto the Rust
 //! types' own nil/empty split.
+//!
+//! Escaping is deliberately thin here: each of the three HTML escapes is pinned
+//! by exactly two cases, and U+2028/U+2029 only rides along in the fuzz alphabet.
+//! That is not a gap to widen -- `go_json_encode_parameters.json` owns escaping
+//! and pins it exhaustively at the encoder that implements it. What this crate
+//! has to prove is that a wire type routes its strings through that encoder, so
+//! two cases per escape is the right amount of evidence.
 
 use std::collections::BTreeMap;
 

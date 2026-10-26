@@ -216,6 +216,10 @@ pub mod omit {
         v.as_ref().is_none_or(|s| s.is_empty())
     }
 
+    /// A nil-or-empty map. Nothing in `crab-protocoltypes` uses this because no
+    /// map field there carries `omitempty` -- and it must not be reached for
+    /// `ToolFunctionDefinition.parameters`, where Go distinguishes the two:
+    /// nil marshals as `null` and an empty map as `{}`.
     pub fn map<K, V>(v: &Option<BTreeMap<K, V>>) -> bool {
         v.as_ref().is_none_or(|m| m.is_empty())
     }
