@@ -31,8 +31,10 @@
 //! producing something approximate, because the caller's behaviour on error is to
 //! skip the value entirely.
 
+pub mod indent;
 pub mod structs;
 
+pub use indent::{compact_html, indent};
 pub use structs::{omit, GoMarshal, ObjectWriter};
 
 use std::collections::BTreeMap;
