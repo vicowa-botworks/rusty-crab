@@ -46,7 +46,8 @@ Regenerating the corpus, and what to do when a fixture fails, is
 
 | Path | What it is |
 |---|---|
-| `crates/crab-tokenizer` | Token-count estimation (`picoclaw/pkg/tokenizer`), and `go_json`, a byte-exact re-implementation of Go's `encoding/json` |
+| `crates/crab-tokenizer` | Token-count estimation (`picoclaw/pkg/tokenizer`) |
+| `crates/crab-gojson` | A byte-exact re-implementation of Go's `encoding/json`, for the values the port reaches |
 | `conformance` | The fixture harness and the committed fixtures |
 | `docs/ARCHITECTURE.md` | The Go package graph, the port order, and the layering rules the port must not break |
 
