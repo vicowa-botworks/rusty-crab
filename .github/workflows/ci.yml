@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The conformance fixtures are committed, so CI needs no Go toolchain and
+      # no checkout of picoclaw: it replays recorded Go behaviour. Regenerating
+      # the corpus is a deliberate, separate act (conformance/README.md).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # A fixture file that parses to zero cases passes vacuously, which is the
+      # worst failure an oracle can have. Cheap enough to assert on every run.
+      - name: Fixtures are non-empty and versioned
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(conformance/fixtures/*.json)
+          test "${#files[@]}" -gt 0 || { echo "no fixture files"; exit 1; }
+          for f in "${files[@]}"; do
+            schema=$(jq -r .schema "$f")
+            count=$(jq -r .case_count "$f")
+            actual=$(jq -r '.cases | length' "$f")
+            echo "$f schema=$schema cases=$count"
+            [ "$schema" = "rusty-crab-conformance/1" ] || { echo "$f: unexpected schema $schema"; exit 1; }
+            [ "$count" -gt 0 ] || { echo "$f: zero cases"; exit 1; }
+            [ "$count" = "$actual" ] || { echo "$f: case_count $count != $(jq '.cases|length' "$f") actual"; exit 1; }
+          done
