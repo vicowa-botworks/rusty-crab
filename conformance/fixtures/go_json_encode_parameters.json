@@ -2,7 +2,7 @@
   "schema": "rusty-crab-conformance/1",
   "generator": "cmd/oracle",
   "source_repo": "github.com/sipeed/picoclaw",
-  "source_commit": "626387ca38971f9998375abbd2fc359de7ef92c5",
+  "source_commit": "01635da3af7a7f07110bf145da8b6609c96b984c",
   "seed": 24301,
   "seam": "encoding/json.Marshal",
   "note": "expected is the exact output of json.Marshal, or null when it returns an error. Map keys are sorted by byte; \u003c, \u003e and \u0026 are escaped as \\u003c \\u003e \\u0026; U+2028 and U+2029 are escaped; \\b and \\f have short forms and the rest of C0 is \\u00XX with lower-case hex; non-ASCII is not escaped. Floats are shortest round-trip, positional in [1e-6, 1e21) and exponent form outside it, with a positive exponent padded to two digits (1e+21) and a negative exponent stripped to one (1e-7, but 5e-324).",
