@@ -54,6 +54,7 @@
 
 use crate::doc::Doc;
 use crate::yaml::Security;
+use crate::Error;
 
 /// What `SkillRegistryConfig.MarshalJSON` writes for any non-empty `SecureString`.
 const NOT_HERE: &str = "[NOT_HERE]";
@@ -180,15 +181,28 @@ fn scalar_text(node: &Doc) -> String {
 /// struct and masks only at marshal time; with the document standing in for the struct, the
 /// mask has to be undone by the save path from this list. Same reason `Config::virtual_models`
 /// exists: state the loader knows and the document cannot hold.
-pub fn apply(merged: &mut Doc, security: &Security) -> Vec<(String, String)> {
+pub fn apply(merged: &mut Doc, security: &Security) -> Result<Vec<(String, String)>, Error> {
     let Some(file_skills) = security.document.get("skills") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    // A value that is not a mapping fails the whole load, and `null` is not one of them.
+    // Go decodes this section into the typed `SkillsToolsConfig`, so yaml.v3 refuses a
+    // scalar, a sequence and a number -- three shapes, three corpus cases, because a port
+    // that handles the scalar still accepts the other two. A null it unmarshals into the
+    // zero value without complaint, which is why "refuse anything that is not an object" is
+    // wrong in the other direction: it rejects `skills: null`, a file the shipped binary
+    // loads. Pinned by `security_skills_null_loads_unchanged`.
+    if !matches!(file_skills, Doc::Object(_) | Doc::Null) {
+        return Err(Error::SecurityType(format!(
+            "cannot unmarshal {} into config.SkillsToolsConfig",
+            go_yaml_kind(file_skills)
+        )));
+    }
     let Some(target) = merged
         .get_mut_at("tools")
         .and_then(|tools| tools.get_mut_at("skills"))
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     // The registries the document already carries, in the shape Go holds them.
@@ -283,7 +297,7 @@ pub fn apply(merged: &mut Doc, security: &Security) -> Vec<(String, String)> {
         .collect();
 
     if registries.is_empty() {
-        return tokens;
+        return Ok(tokens);
     }
     let mut out: Vec<(String, Doc)> = registries
         .iter()
@@ -298,7 +312,20 @@ pub fn apply(merged: &mut Doc, security: &Security) -> Vec<(String, String)> {
             None => entries.push(("registries".to_string(), Doc::Object(out))),
         }
     }
-    tokens
+    Ok(tokens)
+}
+
+/// Go's yaml type name for a node, as it appears in an unmarshal error: `!!str`, `!!int`,
+/// `!!seq`, `!!bool`, `!!float`. Only reached on the refusal above, so the wording is Go's
+/// for whoever reads the message rather than something the corpus grades.
+fn go_yaml_kind(value: &Doc) -> &'static str {
+    match value {
+        Doc::Bool(_) => "!!bool",
+        Doc::Int(_) => "!!int",
+        Doc::Float(_) => "!!float",
+        Doc::Array(_) => "!!seq",
+        _ => "!!str",
+    }
 }
 
 fn lookup<'a>(list: &'a [(String, Registry)], name: &str) -> Option<&'a Registry> {

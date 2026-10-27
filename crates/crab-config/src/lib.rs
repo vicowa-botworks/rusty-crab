@@ -599,7 +599,7 @@ fn apply_security(
         }
     }
 
-    Ok(skills::apply(merged, security))
+    skills::apply(merged, security)
 }
 
 /// What `loadConfigMap` (migration.go:429) builds: config.json and `.security.yml`
