@@ -566,7 +566,7 @@ fn apply_security(
                 }
                 if let Some(value) = security.document.get(child.json) {
                     if let Some(slot) = target.get_mut_at(child.json) {
-                        merge_filling(slot, value, inner_schema.field(child.json), Keys::Yaml);
+                        merge_filling(slot, value, inner_schema.field(child.json));
                     }
                 }
             }
@@ -588,7 +588,7 @@ fn apply_security(
             continue;
         }
         if let Some(target) = merged.get_mut_at(field.json) {
-            merge_filling(target, value, schema.field(field.json), Keys::Yaml);
+            merge_filling(target, value, schema.field(field.json));
         }
     }
 
@@ -843,17 +843,14 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
                 .get(&name)
                 .cloned()
                 .unwrap_or(Doc::Object(Vec::new()));
-            // The channel's own `type` decides which struct its settings decode into, and
-            // for a channel the file never named that is the default's type -- which is
-            // why this reads the merged document rather than the map key.
-            let channel_type = channel
-                .get("type")
-                .and_then(Doc::as_str)
-                .map_or_else(|| name.clone(), str::to_string);
-            let fields = config_schema
-                .settings_schema(&channel_type)
-                .or_else(|| config_schema.settings_schema(&name));
-            merge_filling(&mut merged, settings, fields, Keys::Json);
+            // No schema here, deliberately. `Channel` keeps `settings` as a `RawNode`, so
+            // the security file's node is merged as data and only later decoded -- through
+            // JSON, into the typed struct, by `InitChannelList`. A key the settings type
+            // does not have is therefore *kept* by this walk and dropped at marshal time,
+            // which is what the corpus records; gating it here would drop it from the
+            // document and change what a later save writes.
+            //
+            merge_filling(&mut merged, settings, None);
             channel.set("settings", merged);
         }
         // Everything else in the entry is dropped, and not by a schema check: every base
@@ -871,8 +868,8 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
     }
 }
 
-/// The security file's walk: like [`merge_over`], but a key the **target's own** schema
-/// cannot place is dropped rather than added.
+/// The security file's walk: like [`merge_over`], but a key the **target's own** yaml
+/// surface cannot place is dropped rather than added.
 ///
 /// That is the whole difference between the two passes: the JSON document is validated
 /// before it is merged, so an unknown key there is a refusal; the security file is not
@@ -887,31 +884,15 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
 /// back with the zero its own entry had already forced, which is exactly what a port that
 /// ignored the security file entirely records.
 ///
-/// `None` is not "no schema found", it is "this node has no schema to consult": a channel
-/// type `channelSettingsFactory` does not know decodes into `map[string]any`, which accepts
-/// every key. Callers that pass `None` therefore keep everything.
-/// Which tag family decides whether a key the security file names is readable at this node.
+/// `fields` is the yaml surface of the node being merged into, or `None` where there is no
+/// yaml decoder in play at all -- a channel's `settings`, which is stored as a raw node and
+/// decoded later through JSON. `None` means every key is readable, and that is a claim about
+/// Go, not an absence of one: an unknown key inside `settings` survives the merge and is
+/// dropped at marshal time, which is what the corpus records.
 ///
-/// The two are not interchangeable, and the difference is a decode that happens twice:
-///
-/// * [`Keys::Yaml`] is the normal one. `.security.yml` is decoded by `yaml.v3` into typed
-///   structs, so a field tagged `yaml:"-"` is invisible to it -- which is how Go keeps a
-///   secrets file from setting `tools.web.brave.max_results` (`config.go:896`) or any of a
-///   channel's base fields. Reading the JSON list instead sets values the shipped binary
-///   silently ignores, and the user's file then says one thing and their running config
-///   another.
-/// * [`Keys::Json`] applies inside a channel's `settings`. That node is never decoded by
-///   the yaml decoder: `Channel` stores it as a `RawNode` and `InitChannelList` decodes it
-///   into the typed struct through JSON, so only `json` tags are in force there. Measured:
-///   `media_group_delay_ms` is `yaml:"-"` (`config.go:550`) and a security file still sets
-///   it to 1234, while `max_results` at the same depth in the file is dropped.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Keys {
-    Yaml,
-    Json,
-}
-
-fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>, keys: Keys) {
+/// Visibility comes from `yaml_fields`, never from the JSON list. `tools.web.brave` has
+/// three JSON fields and one yaml field, and a secrets file can set exactly the one.
+fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
     let (Some(base_entries), Some(overlay_entries)) = (base.as_object_mut(), overlay.as_object())
     else {
         // Not an object on both sides, so there is nothing to fill: the security value
@@ -923,12 +904,9 @@ fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>, keys: K
     let overlay_entries = overlay_entries.clone();
     for (k, v) in &overlay_entries {
         let child = fields.and_then(|schema| schema.field(k));
-        let readable = match keys {
-            Keys::Json => child.is_some(),
-            Keys::Yaml => fields
-                .map(|schema| schema.yaml_fields().iter().any(|f| f.json == *k))
-                .unwrap_or(true),
-        };
+        let readable = fields
+            .map(|schema| schema.yaml_fields().iter().any(|f| f.json == *k))
+            .unwrap_or(true);
         if fields.is_some() && !readable {
             // Not a field of the target type. Go's yaml decode has no place for it and
             // moves on; the JSON path would have refused the same key. `None` means the
@@ -937,7 +915,7 @@ fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>, keys: K
             continue;
         }
         match base_entries.iter_mut().find(|(bk, _)| bk == k) {
-            Some(slot) => merge_filling(&mut slot.1, v, child, keys),
+            Some(slot) => merge_filling(&mut slot.1, v, child),
             None => base_entries.push((k.clone(), v.clone())),
         }
     }

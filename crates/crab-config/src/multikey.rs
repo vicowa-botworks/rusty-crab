@@ -183,6 +183,13 @@ fn api_keys(entry: &Doc) -> Vec<Doc> {
 /// `model_list`'s element schema, the one position this stage reads the dump for.
 /// Rebuilds a `model_list` entry in the order and with the fields `ModelConfig` has.
 ///
+/// It fills in what the struct has and the file omitted; it does **not** drop what the file
+/// has and the omit option would. Both directions look like the same job and only one of
+/// them is this function's: emptiness is the marshaller's rule, applied where the bytes are
+/// written, and it is applied to both files. A fault that ignores `field.omit` here passes
+/// the whole corpus, which is the proof that the two are one rule and not two — so the check
+/// lives in `marshal` alone and this function only reorders and fills.
+///
 /// The JSON loader decodes each entry into a struct, and `json.Marshal` then writes every
 /// field whose omit option cannot fire -- `model_name`, `model` and `provider` carry no
 /// option at all, so a config that never mentions `provider` still comes back with
@@ -223,27 +230,9 @@ fn materialise(entry: Doc, elem: &Schema) -> Doc {
             }
             continue;
         };
-        if field.omit.is_some() && is_zero(value) {
-            continue;
-        }
         out.push((field.json.to_string(), value.clone()));
     }
     Doc::Object(out)
-}
-
-/// Go's emptiness for the omit options that appear on `ModelConfig`: false, 0, "", and a
-/// nil or zero-length slice or map. A struct is none of those, which is why `omitzero`
-/// exists and why nothing here treats an object as empty.
-fn is_zero(value: &Doc) -> bool {
-    match value {
-        Doc::Null => true,
-        Doc::Bool(false) => true,
-        Doc::Int(0) => true,
-        Doc::String(s) => s.is_empty(),
-        Doc::Array(items) => items.is_empty(),
-        Doc::Object(entries) => entries.is_empty(),
-        _ => false,
-    }
 }
 
 fn model_elem(schema: &Schema) -> Option<&Schema> {
@@ -280,16 +269,15 @@ mod tests {
         )
         .doc;
         assert!(expand(&mut doc, &config_schema()).is_empty());
-        // The entry is the same struct, so `Enabled` is still false in memory -- but
-        // `enabled` is `omitempty`, so a false never reaches the bytes. This asserted
-        // `Some(&Doc::Bool(false))` until a save case showed the shipped binary writes no
-        // such key: the assertion was describing the document the port echoed, not the
-        // document Go marshals.
+        // The document keeps `enabled`. Dropping it is the marshaller's rule, applied where
+        // the bytes are written, and `model_entry_drops_its_empty_optional_fields` pins the
+        // byte-level half -- this one pins that the stage does not pre-empt it. The two
+        // assertions together are the reason there is no omit check in `materialise`.
         assert_eq!(
             doc.get("model_list")
                 .and_then(first)
                 .and_then(|e| e.get("enabled")),
-            None
+            Some(&Doc::Bool(false))
         );
     }
 
