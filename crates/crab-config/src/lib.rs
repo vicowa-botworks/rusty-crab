@@ -588,6 +588,13 @@ fn apply_security(
             continue;
         }
         if let Some(target) = merged.get_mut_at(field.json) {
+            // The schema is threaded for the document's sake, not the corpus's: dropping it
+            // here passes all 68 cases, because both output files are rendered from the
+            // typed struct and the schema, so an invented key never reaches either. It is
+            // kept because Go's struct genuinely does not have the key, and a document that
+            // carries things Go's does not is a document that will diverge the first time
+            // anything renders it raw. `security_unknown_key_reaches_neither_written_file`
+            // is the byte-level half of the same rule.
             merge_filling(target, value, schema.field(field.json));
         }
     }
