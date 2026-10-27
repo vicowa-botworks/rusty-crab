@@ -9,9 +9,15 @@
 //! whether or not the file mentioned it:
 //!
 //! ```text
-//! {"base_url":"","proxy":"","use_markdown_v2":false,"media_group_delay_ms":0,
-//!  "token":"x"}
+//! {"base_url":"","proxy":"","use_markdown_v2":false,"media_group_delay_ms":0}
 //! ```
+//!
+//! Note what is *not* in that output: `token`. `SecureString` fields are dropped from the
+//! settings entirely -- not written as the `[NOT_HERE]` placeholder their `MarshalJSON`
+//! returns, and not echoed. A port that applies only `omitzero` sees a non-zero
+//! `SecureString`, keeps it, and writes either the placeholder or, if it reads the stored
+//! value instead of the typed one, every secret in the file. Pinned by
+//! `a_string_in_a_secure_string_channel_setting_loads`.
 //!
 //! Two consequences a port cannot guess from the file:
 //!
@@ -105,8 +111,13 @@ pub fn init_channel_list(document: &mut Doc, schema: &Schema) -> Result<(), Erro
             };
             if field.json == SETTINGS_KEY {
                 let stored = channel.get(SETTINGS_KEY);
-                let mut settings = project(settings_schema, stored).ok_or_else(|| {
-                    Error::Channel(format!("channel {name:?} failed to decode settings"))
+                // The decode targets the settings struct, so that is what Go names at the
+                // head of a field path -- not `settings`.
+                let seed = settings_schema.name().unwrap_or(SETTINGS_KEY).to_string();
+                let mut settings = project(settings_schema, stored, &seed).map_err(|reason| {
+                    Error::Channel(format!(
+                        "channel {name:?} failed to decode settings: {reason}"
+                    ))
                 })?;
                 preserve_explicit_disabled_streaming(&mut settings, stored);
                 // `settings,omitzero` never fires past this point: with the typed struct
@@ -124,14 +135,12 @@ pub fn init_channel_list(document: &mut Doc, schema: &Schema) -> Result<(), Erro
             let value = if field.json == "type" {
                 Doc::String(channel_type.clone())
             } else {
-                project(child, channel.get(field.json)).ok_or_else(|| {
-                    Error::Channel(format!(
-                        "channel {name:?} failed to decode settings: field {:?}",
-                        field.json
-                    ))
+                let path = format!("Channel.{}", field.json);
+                project(child, channel.get(field.json), &path).map_err(|reason| {
+                    Error::Channel(format!("channel {name:?} failed to decode: {reason}"))
                 })?
             };
-            if is_dropped_by_omit(child, &value) {
+            if crate::marshal::is_dropped_by_omit(child, &value) {
                 continue;
             }
             out.push((field.json.to_string(), value));
@@ -145,82 +154,171 @@ pub fn init_channel_list(document: &mut Doc, schema: &Schema) -> Result<(), Erro
     Ok(())
 }
 
+/// Why a stored value cannot be decoded into the type the schema says belongs there.
+///
+/// The corpus records no error text -- Go quotes absolute paths, so a byte-comparing
+/// fixture cannot keep one -- so none of this is compared. It exists for whoever debugs a
+/// real user's refused config, where `channel "telegram" failed to decode settings` on its
+/// own says neither which field nor which type.
+#[derive(Debug)]
+pub(crate) enum Mismatch {
+    /// A whole value of the wrong shape: Go's `cannot unmarshal string into Go value of
+    /// type config.TelegramSettings`.
+    Value {
+        got: &'static str,
+        type_name: String,
+    },
+    /// One field inside it: Go's `cannot unmarshal string into Go struct field
+    /// TelegramSettings.streaming.enabled of type bool`.
+    Field {
+        got: &'static str,
+        path: String,
+        type_name: String,
+    },
+}
+
+impl std::fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value { got, type_name } => write!(
+                f,
+                "json: cannot unmarshal {got} into Go value of type config.{type_name}"
+            ),
+            Self::Field {
+                got,
+                path,
+                type_name,
+            } => write!(
+                f,
+                "json: cannot unmarshal {got} into Go struct field {path} of type {type_name}"
+            ),
+        }
+    }
+}
+
 /// The value `encoding/json` would write for `schema` given what the document holds.
 ///
 /// This is the decode and the re-marshal in one walk, because for the values a config
 /// can hold they compose to very little: a scalar round-trips, a struct comes back with
 /// every declared field, and a nil map or slice comes back as `null`. What it is *not*
-/// is permissive -- a value Go's decoder would reject returns `None`, which the caller
-/// turns into the same refusal `InitChannelList` returns.
-fn project(schema: &Schema, stored: Option<&Doc>) -> Option<Doc> {
+/// is permissive -- a value Go's decoder would reject returns [`Mismatch`], which the
+/// caller turns into the same refusal `InitChannelList` returns.
+///
+/// `path` is the dotted Go field path the leaf was reached by, seeded with the type the
+/// decode targets; it exists only so a refusal can name the field.
+fn project(schema: &Schema, stored: Option<&Doc>, path: &str) -> Result<Doc, Mismatch> {
     match schema {
         Schema::Struct { .. } => {
+            let type_name = schema.name().unwrap_or("").to_string();
+            if let Some(stored) = stored.filter(|s| !matches!(s, Doc::Null)) {
+                // Go's decoder refuses the value before it looks at a single field:
+                // `cannot unmarshal string into Go value of type
+                // config.TelegramSettings`, which InitChannelList wraps as
+                // `channel %q failed to decode settings` (config_channel.go:746). Reading
+                // fields off a string instead returns None for every one of them and
+                // yields the fully-shaped *default* settings -- a silently different
+                // config rather than an error, which is the failure this arm exists to
+                // prevent. `settings` is a RawNode, so nothing earlier rejects the bytes.
+                //
+                // `SecureString` is the one struct exempt, because it declares its own
+                // UnmarshalJSON (config_struct.go:241) and decodes a bare string. It is
+                // the only struct reachable through a channel's settings that does not
+                // decode from an object; the exemption is pinned by
+                // `a_string_in_a_secure_string_channel_setting_loads`, and it accepts a
+                // string only -- a bool is still refused, because that is what Go does.
+                let accepted = stored.is_object()
+                    || (type_name == "SecureString" && matches!(stored, Doc::String(_)));
+                if !accepted {
+                    return Err(Mismatch::Value {
+                        got: stored.json_kind(),
+                        type_name,
+                    });
+                }
+            }
             let mut out: Vec<(String, Doc)> = Vec::new();
             for field in schema.json_fields() {
                 let Some(child) = schema.field(field.json) else {
                     continue;
                 };
-                let value = project(child, stored.and_then(|s| s.get(field.json)))?;
-                if is_dropped_by_omit(child, &value) {
+                let child_path = format!("{path}.{}", field.json);
+                let value = project(child, stored.and_then(|s| s.get(field.json)), &child_path)?;
+                if crate::marshal::is_dropped_by_omit(child, &value) {
                     continue;
                 }
                 out.push((field.json.to_string(), value));
             }
-            Some(Doc::Object(out))
+            Ok(Doc::Object(out))
         }
         Schema::Map { elem, .. } => match stored {
             // A nil map marshals as `null`, not `{}`. The distinction survives in the
             // fixture: `random_reaction_emoji` is `null` while `irc.channels` is `[]`.
-            None | Some(Doc::Null) => Some(Doc::Null),
+            None | Some(Doc::Null) => Ok(Doc::Null),
             Some(Doc::Object(entries)) => {
                 let mut out = Vec::with_capacity(entries.len());
                 for (key, value) in entries {
-                    out.push((key.clone(), project(elem, Some(value))?));
+                    let child_path = format!("{path}.{key}");
+                    out.push((key.clone(), project(elem, Some(value), &child_path)?));
                 }
-                Some(Doc::Object(out))
+                Ok(Doc::Object(out))
             }
-            Some(_) => None,
+            Some(other) => Err(Mismatch::Value {
+                got: other.json_kind(),
+                type_name: schema.name().unwrap_or("").to_string(),
+            }),
         },
         Schema::Slice { elem, .. } => match stored {
-            None | Some(Doc::Null) => Some(Doc::Null),
+            None | Some(Doc::Null) => Ok(Doc::Null),
             Some(Doc::Array(items)) => {
                 let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    out.push(project(elem, Some(item))?);
+                for (index, item) in items.iter().enumerate() {
+                    let child_path = format!("{path}[{index}]");
+                    out.push(project(elem, Some(item), &child_path)?);
                 }
-                Some(Doc::Array(out))
+                Ok(Doc::Array(out))
             }
-            Some(_) => None,
+            Some(other) => Err(Mismatch::Value {
+                got: other.json_kind(),
+                type_name: schema.name().unwrap_or("").to_string(),
+            }),
         },
-        Schema::Scalar { .. } => project_scalar(schema, stored),
+        Schema::Scalar { .. } => project_scalar(schema, stored, path),
     }
 }
 
 /// A scalar's round trip: the stored value when the JSON type agrees with the Go type,
 /// the zero value when the document holds nothing or holds `null`.
 ///
-/// `None` is a decode error, and the set of mismatches is narrower than it looks. A
-/// number with a fraction in an int field is one of them -- measured, not assumed:
-/// `{"media_group_delay_ms":1500.0}` fails with `cannot unmarshal number 1500.0 into Go
-/// struct field TelegramSettings.media_group_delay_ms of type int`, so the conversion
-/// that looks obvious (the value *is* 1500) is exactly what Go refuses. The reverse is
+/// The target's type decides, not whether the target is numeric. Measured refusals:
+/// `1500.0` in an int field (`cannot unmarshal number 1500.0 into Go struct field
+/// TelegramSettings.media_group_delay_ms of type int` -- the conversion that looks obvious,
+/// the value *is* 1500, is exactly what Go refuses), `"true"` in a bool field, `1` in a
+/// bool field, and a fraction in a bool or a string field. The reverse of the int case is
 /// allowed: an integer literal loads into a `float64`.
-fn project_scalar(schema: &Schema, stored: Option<&Doc>) -> Option<Doc> {
+fn project_scalar(schema: &Schema, stored: Option<&Doc>, path: &str) -> Result<Doc, Mismatch> {
     let Some(stored) = stored.filter(|v| !matches!(v, Doc::Null)) else {
-        return Some(zero(schema));
+        return Ok(zero(schema));
     };
     let name = schema.name().unwrap_or("");
+    // A byte holder takes the bytes as they came; a free `any` takes anything.
+    if matches!(name, "json.RawMessage" | "RawNode" | "any") {
+        return Ok(stored.clone());
+    }
     match stored {
-        // A byte holder takes the bytes as they came; a free `any` takes anything.
-        _ if matches!(name, "json.RawMessage" | "RawNode" | "any") => Some(stored.clone()),
-        Doc::Bool(b) => matches!(name, "bool").then(|| Doc::Bool(*b)),
-        Doc::String(s) => (!is_numeric(name)).then_some(Doc::String(s.clone())),
-        Doc::Int(v) if is_int_type(name) => Some(Doc::Int(*v)),
-        Doc::Int(v) if is_float_type(name) => Some(Doc::Float(*v as f64)),
-        Doc::Float(_) if is_int_type(name) => None,
-        Doc::Float(f) => Some(Doc::Float(*f)),
-        // An object or array where the field is a scalar.
-        _ => None,
+        Doc::Bool(b) if name == "bool" => Ok(Doc::Bool(*b)),
+        // A string is accepted anywhere the field is neither a number nor a bool. The
+        // arm used to gate on `!is_numeric(name)`, which made a string satisfy a bool
+        // field: `{"channel_list":{"telegram":{"enabled":"true"}}}` is refused by Go and
+        // was accepted here, then re-emitted as a string in the slot every downstream
+        // reader treats as a flag.
+        Doc::String(s) if !is_numeric(name) && name != "bool" => Ok(Doc::String(s.clone())),
+        Doc::Int(v) if is_int_type(name) => Ok(Doc::Int(*v)),
+        Doc::Int(v) if is_float_type(name) => Ok(Doc::Float(*v as f64)),
+        Doc::Float(f) if is_float_type(name) => Ok(Doc::Float(*f)),
+        _ => Err(Mismatch::Field {
+            got: stored.json_kind(),
+            path: path.to_string(),
+            type_name: name.to_string(),
+        }),
     }
 }
 
@@ -241,7 +339,7 @@ fn zero(schema: &Schema) -> Doc {
                     continue;
                 };
                 let value = zero(child);
-                if is_dropped_by_omit(child, &value) {
+                if crate::marshal::is_dropped_by_omit(child, &value) {
                     continue;
                 }
                 out.push((field.json.to_string(), value));
@@ -266,36 +364,6 @@ fn is_int_type(name: &str) -> bool {
 
 fn is_float_type(name: &str) -> bool {
     name.starts_with("float")
-}
-
-/// Whether the field's own encoding option drops this value.
-///
-/// `omitzero` and `omitempty` are *not* the same test, and the difference is exactly
-/// where the channel settings live: `streaming` carries `omitzero`, so a zero
-/// `StreamingConfig` disappears, while `group_trigger` carries `omitempty`, so an empty
-/// `GroupTriggerConfig` is kept -- a struct is never "empty" to `omitempty`, which is
-/// the same rule that keeps `isolation: {}` in the config file.
-fn is_dropped_by_omit(schema: &Schema, value: &Doc) -> bool {
-    match schema.omit() {
-        None => false,
-        Some("omitzero") => is_go_zero(schema, value),
-        Some(_) => crate::marshal::is_empty_by_go(value, schema),
-    }
-}
-
-/// Go's `reflect.Value.IsZero`. Unlike `isEmpty`, this one *does* fire on a struct: it
-/// is zero when every field is.
-fn is_go_zero(schema: &Schema, value: &Doc) -> bool {
-    match (value, schema) {
-        (Doc::Object(entries), Schema::Struct { .. }) => entries.iter().all(|(key, value)| {
-            schema
-                .field(key)
-                .is_some_and(|child| is_go_zero(child, value))
-        }),
-        (Doc::Object(entries), Schema::Map { .. }) => entries.is_empty(),
-        (Doc::Array(items), Schema::Slice { .. }) => items.is_empty(),
-        _ => crate::marshal::is_empty_by_go(value, schema),
-    }
 }
 
 /// `preserveExplicitDisabledStreaming` (`config_channel.go:260`).

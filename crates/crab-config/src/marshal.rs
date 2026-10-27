@@ -131,7 +131,7 @@ pub fn apply_omit(document: &Doc, schema: &Schema) -> Doc {
                     ));
                     continue;
                 };
-                if child.omit().is_some() && is_empty_by_go(value, child) {
+                if is_dropped_by_omit(child, value) {
                     continue;
                 }
                 out.push((key.clone(), apply_omit(value, child)));
@@ -188,6 +188,46 @@ pub(crate) fn is_empty_by_go(value: &Doc, schema: &Schema) -> bool {
         Doc::Array(items) => items.is_empty(),
         Doc::Object(entries) => entries.is_empty(),
         _ => false,
+    }
+}
+
+/// Whether the field's own encoding option drops this value -- the one place the crate
+/// decides that, for both the marshal path and the channel projection.
+///
+/// `omitzero` and `omitempty` are *not* the same test, and the difference is exactly
+/// where the channel settings live: `streaming` carries `omitzero`, so a zero
+/// `StreamingConfig` disappears, while `group_trigger` carries `omitempty`, so an empty
+/// `GroupTriggerConfig` is kept -- a struct is never "empty" to `omitempty`, which is
+/// the same rule that keeps `isolation: {}` in the config file.
+///
+/// This used to live in `channels` while `apply_omit` routed *both* spellings through
+/// `is_empty_by_go`, so which definition applied to a given value depended on which
+/// stage touched it first. One rule, one place.
+pub(crate) fn is_dropped_by_omit(schema: &Schema, value: &Doc) -> bool {
+    match schema.omit() {
+        None => false,
+        Some("omitzero") => is_go_zero(schema, value),
+        Some(_) => is_empty_by_go(value, schema),
+    }
+}
+
+/// Go's `reflect.Value.IsZero`. Unlike `isEmpty`, this one *does* fire on a struct: it
+/// is zero when every field is.
+fn is_go_zero(schema: &Schema, value: &Doc) -> bool {
+    match (value, schema) {
+        (Doc::Object(entries), Schema::Struct { .. }) => entries.iter().all(|(key, value)| {
+            schema
+                .field(key)
+                .is_some_and(|child| is_go_zero(child, value))
+        }),
+        // `IsZero` on a map or slice is *nil-ness*, not length: a non-nil empty slice is
+        // not zero, so `omitzero` keeps it as `[]`. The document already carries the
+        // distinction -- `Doc::Null` is nil, `Doc::Array(vec![])` is non-nil empty, the
+        // same pair `project` preserves -- so reading length here would drop an `[]` that
+        // Go writes. `omitempty` does test length, and that is `is_empty_by_go`.
+        (Doc::Null, Schema::Map { .. } | Schema::Slice { .. }) => true,
+        (Doc::Object(_), Schema::Map { .. }) | (Doc::Array(_), Schema::Slice { .. }) => false,
+        _ => is_empty_by_go(value, schema),
     }
 }
 

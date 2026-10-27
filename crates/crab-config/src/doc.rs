@@ -152,6 +152,22 @@ impl Doc {
         matches!(self, Self::Object(_))
     }
 
+    /// The value's JSON type name, spelled the way Go spells it in a decode error:
+    /// `cannot unmarshal string into Go value of type ...`. Both integers and floats are
+    /// `number`, because that is what the document says -- the Go field type is the
+    /// other half of the sentence, not this one.
+    #[must_use]
+    pub fn json_kind(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Bool(_) => "bool",
+            Self::Int(_) | Self::Float(_) => "number",
+            Self::String(_) => "string",
+            Self::Array(_) => "array",
+            Self::Object(_) => "object",
+        }
+    }
+
     /// Replaces a key's value, appending it when the key is absent.
     ///
     /// Appending is the only option that keeps the rest of the document's order
