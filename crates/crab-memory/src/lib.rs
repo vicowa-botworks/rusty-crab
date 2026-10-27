@@ -702,7 +702,9 @@ impl<'de> serde::Deserialize<'de> for OrderedFields {
                 A: serde::de::MapAccess<'de>,
             {
                 let mut fields = Vec::with_capacity(map.size_hint().unwrap_or(0));
-                while let Some(entry) = map.next_entry::<String, Box<serde_json::value::RawValue>>()? {
+                while let Some(entry) =
+                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                {
                     fields.push(entry);
                 }
                 Ok(fields)
@@ -1578,8 +1580,16 @@ mod tests {
             0,
             "group- or other-writable history: {jsonl_mode:o}"
         );
-        assert_eq!(jsonl_mode | 0o644, 0o644, "bits Go never sets: {jsonl_mode:o}");
-        assert_eq!(mode_of(&meta), 0o644, "the meta is chmodded, not merely created");
+        assert_eq!(
+            jsonl_mode | 0o644,
+            0o644,
+            "bits Go never sets: {jsonl_mode:o}"
+        );
+        assert_eq!(
+            mode_of(&meta),
+            0o644,
+            "the meta is chmodded, not merely created"
+        );
     }
 
     #[test]
@@ -1612,7 +1622,11 @@ mod tests {
             expect("CRAB_EXPECT_META"),
             "the meta is chmodded, not merely created"
         );
-        assert_eq!(mode_of(&jsonl), expect("CRAB_EXPECT_JSONL"), "Go's OpenFile mode is umask-masked");
+        assert_eq!(
+            mode_of(&jsonl),
+            expect("CRAB_EXPECT_JSONL"),
+            "Go's OpenFile mode is umask-masked"
+        );
     }
 
     fn modes_under_umask(umask: &str, jsonl: &str, meta: &str) {
@@ -1665,9 +1679,14 @@ mod tests {
         let (jsonl, meta) = store.paths_for("agent:main:now");
 
         let msg: serde_json::Value = serde_json::from_str(&read(&dir, &file_name(&jsonl))).unwrap();
-        let meta_v: serde_json::Value = serde_json::from_str(&read(&dir, &file_name(&meta))).unwrap();
+        let meta_v: serde_json::Value =
+            serde_json::from_str(&read(&dir, &file_name(&meta))).unwrap();
         let stamped = msg["created_at"].as_str().unwrap().to_string();
-        assert_eq!(stamped, meta_v["updated_at"].as_str().unwrap(), "one instant");
+        assert_eq!(
+            stamped,
+            meta_v["updated_at"].as_str().unwrap(),
+            "one instant"
+        );
     }
 
     #[test]
@@ -1691,7 +1710,10 @@ mod tests {
             meta_text.contains(r#""created_at": "0001-01-01T00:00:00Z""#),
             "Go leaves the year-1 stamp alone: {meta_text}"
         );
-        assert!(meta_text.contains(r#""count": 6"#), "the count still moves: {meta_text}");
+        assert!(
+            meta_text.contains(r#""count": 6"#),
+            "the count still moves: {meta_text}"
+        );
         let _: &Path = jsonl.as_path();
     }
 
@@ -1700,14 +1722,14 @@ mod tests {
         // Go's decoder walks the object in source order and takes the last occurrence.
         // Sorting the field names to make a HashMap deterministic instead resolves
         // `{"key":...,"KEY":...}` alphabetically, which is a different field.
-        let meta = SessionMeta::decode(
-            br#"{"key":"first","KEY":"second"}"#,
-        )
-        .unwrap();
+        let meta = SessionMeta::decode(br#"{"key":"first","KEY":"second"}"#).unwrap();
         assert_eq!(meta.key, "second", "document order, not alphabetical");
 
         let flipped = SessionMeta::decode(br#"{"KEY":"second","key":"first"}"#).unwrap();
-        assert_eq!(flipped.key, "first", "the same two names, reversed, flip the answer");
+        assert_eq!(
+            flipped.key, "first",
+            "the same two names, reversed, flip the answer"
+        );
     }
 
     fn file_name(path: &Path) -> String {
