@@ -97,7 +97,7 @@ fn run_script(name: &str, ops: &[Op]) -> Value {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{name}: temp dir: {e}"));
 
-    let store = Store::new(&dir);
+    let store = Store::new(&dir).unwrap();
     // Key -> stem, learned from disk. Cached across the script because a case may
     // corrupt the .meta.json and still need to address the session afterwards.
     let mut stems: HashMap<String, String> = HashMap::new();

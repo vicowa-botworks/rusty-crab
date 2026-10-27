@@ -117,14 +117,21 @@ pub struct SessionMeta {
 }
 
 impl SessionMeta {
-    /// Go's `time.Time.IsZero`, which is the year-1 instant in UTC and nothing
-    /// else. A file that spells out `0001-01-01T00:00:00Z` reads back as zero, so
-    /// the check is on the instant, not on whether the field was present.
+    /// Go's `time.Time.IsZero`, which is the year-1 *instant* and nothing else.
+    /// `t.sec() == 0 && t.nsec() == 0` -- the location is never consulted -- so
+    /// `0001-01-01T01:00:00+01:00` and `0001-01-01T23:00:00+23:00` are both zero
+    /// while `0001-01-01T00:00:00-24:00` is not. `unix_seconds` is already the
+    /// instant, so no normalisation is needed; adding an offset test here makes a
+    /// zero timestamp carried in a non-UTC zone look real, which changes both the
+    /// bytes (`addMsg` refuses to stamp it) and `get_meta` (Go reports `null`,
+    /// because `omitempty` fires on a zero time). Pinned by
+    /// `meta_zero_in_a_non_utc_zone_reads_as_zero` and
+    /// `meta_zero_in_a_non_utc_zone_is_stamped_by_a_write`.
     #[must_use]
     fn is_zero(t: &Option<GoTime>) -> bool {
         match t {
             None => true,
-            Some(t) => t.unix_seconds == -62_135_596_800 && t.nanos == 0 && t.offset_seconds == 0,
+            Some(t) => t.unix_seconds == -62_135_596_800 && t.nanos == 0,
         }
     }
 }
@@ -307,10 +314,15 @@ pub struct Store {
 }
 
 impl Store {
-    /// `memory.NewJSONLStore(dir)`. Go also creates the directory; the harness
-    /// hands it a temp dir that already exists, so this does not touch the disk.
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Store { dir: dir.into() }
+    /// `memory.NewJSONLStore(dir)`, which creates the directory with
+    /// `os.MkdirAll(dir, 0o755)` before handing the store back. A store pointed at
+    /// a path that does not exist yet therefore produces the same directory, with
+    /// the same mode, as the Go binary -- and the constructor can fail for the
+    /// same reasons Go's does.
+    pub fn new(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        create_dir_all(&dir)?;
+        Ok(Store { dir })
     }
 
     #[must_use]
@@ -990,6 +1002,30 @@ fn normalize_aliases(canonical: &str, aliases: Option<Vec<String>>) -> Option<Ve
     }
 }
 
+/// The mode Go gives every directory it creates: `os.MkdirAll(dir, 0o755)`.
+const DIR_MODE: u32 = 0o755;
+
+/// `os.MkdirAll(dir, 0o755)` -- create the directory and every missing parent at
+/// `0o755` masked by the process umask, leaving an existing directory alone.
+///
+/// `fs::create_dir_all` cannot express this: it creates at `0o777` masked, so
+/// under `umask 002` -- the default on many distros -- the session directory
+/// lands `0o775`, group-writable, where the Go store writes `0o755`. At the
+/// ambient `umask 022` the two agree, which is why this needs the child test
+/// rather than a plain assertion. `DirBuilder` applies `mode` to every component
+/// it creates, which is what `MkdirAll` does.
+fn create_dir_all(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(DIR_MODE);
+    }
+    builder.create(path)?;
+    Ok(())
+}
+
 /// `fileutil.WriteFileAtomic`: write a hidden temp file in the same directory,
 /// then rename it over the target.
 ///
@@ -1001,7 +1037,7 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| Error::new("memory: meta path has no directory"))?;
-    fs::create_dir_all(dir)?;
+    create_dir_all(dir)?;
     let tmp = dir.join(format!(
         ".tmp-{}-{}",
         std::process::id(),
@@ -1048,7 +1084,7 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
 fn append_bytes(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        create_dir_all(dir)?;
     }
     let mut opts = fs::OpenOptions::new();
     opts.append(true).create(true);
@@ -1514,7 +1550,7 @@ mod tests {
     #[test]
     fn a_key_becomes_two_files_with_the_exact_bytes() {
         let dir = temp_dir("plain");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store
             .add_message("agent:main:signal:+4477", "user", "hi")
             .unwrap();
@@ -1537,7 +1573,7 @@ mod tests {
     #[test]
     fn a_thought_only_message_writes_nothing() {
         let dir = temp_dir("transient");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         let msg = Message {
             role: "assistant".into(),
             reasoning_content: "thinking".into(),
@@ -1552,7 +1588,7 @@ mod tests {
     #[test]
     fn scope_is_reindented_and_reescaped() {
         let dir = temp_dir("scope");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store
             .upsert_session_meta("s1", Some(b"{\n  \"q\": \"<b> &\" }".to_vec()), None)
             .unwrap();
@@ -1568,7 +1604,7 @@ mod tests {
     #[test]
     fn an_invalid_scope_is_refused_before_anything_is_written() {
         let dir = temp_dir("bad-scope");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         let err = store
             .upsert_session_meta("s1", Some(b"{\"a\": <1>}".to_vec()), None)
             .unwrap_err();
@@ -1581,7 +1617,7 @@ mod tests {
     #[test]
     fn a_null_scope_is_kept_and_an_absent_one_is_not() {
         let dir = temp_dir("null-scope");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store
             .upsert_session_meta("null", Some(b"null".to_vec()), None)
             .unwrap();
@@ -1594,7 +1630,7 @@ mod tests {
     #[test]
     fn count_counts_raw_lines_and_history_counts_messages() {
         let dir = temp_dir("torn");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store.add_message("s1", "user", "one").unwrap();
         // Simulate a crash: a final line cut off mid-write.
         fs::OpenOptions::new()
@@ -1622,7 +1658,7 @@ mod tests {
     #[test]
     fn compact_is_a_no_op_without_a_skip_offset() {
         let dir = temp_dir("compact-noop");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store.add_message("s1", "user", "one").unwrap();
         let before = read(&dir, "s1.meta.json");
         store.compact("s1").unwrap();
@@ -1633,7 +1669,7 @@ mod tests {
     #[test]
     fn list_sorts_and_skips_unreadable_meta() {
         let dir = temp_dir("list");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store.add_message("b", "user", "hi").unwrap();
         store.add_message("a", "user", "hi").unwrap();
         fs::write(dir.join("c.meta.json"), b"not json at all\n").unwrap();
@@ -1645,7 +1681,7 @@ mod tests {
     #[test]
     fn a_missing_session_reads_as_empty_not_as_an_error() {
         let dir = temp_dir("missing");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         assert_eq!(store.get_history("nope").unwrap(), Vec::new());
         assert_eq!(store.get_session_meta("nope").unwrap().key, "nope");
         store.truncate_history("nope", 3).unwrap();
@@ -1658,7 +1694,7 @@ mod tests {
     #[test]
     fn aliases_are_trimmed_deduplicated_and_nil_when_empty() {
         let dir = temp_dir("aliases");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store
             .upsert_session_meta(
                 "s1",
@@ -1690,7 +1726,7 @@ mod tests {
     #[test]
     fn the_rollback_distinguishes_absent_from_empty() {
         let dir = temp_dir("rollback");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
 
         let (bytes, existed) = store.read_raw_jsonl("s1").unwrap();
         assert!(!existed, "a fresh session has no history file");
@@ -1801,7 +1837,7 @@ mod tests {
         // a literal 0644, because the create mode is umask-masked in Go too; the
         // umask-independent half is the meta, and that is the child test below.
         let dir = temp_dir("mode-jsonl");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store.add_message("agent:main:mode", "user", "hi").unwrap();
         let (jsonl, meta) = store.paths_for("agent:main:mode");
 
@@ -1833,19 +1869,25 @@ mod tests {
         //   * the meta is chmodded *after* the write by `WriteFileAtomic`, so it is 0644
         //     whatever the umask;
         //   * the history file only *requests* a create mode, exactly as Go's
-        //     `os.OpenFile` does, so it follows the umask: 0644 & ~umask.
+        //     `os.OpenFile` does, so it follows the umask: 0644 & ~umask;
+        //   * the directory comes from `os.MkdirAll(dir, 0o755)`, so it follows the
+        //     umask too but from 0755, not 0777: 0755 & ~umask.
         //
         // Under `umask 077` the two must disagree (0600 beside 0644) -- a port that chmods
         // both, or neither, fails here. Under `umask 002` the history file must still be
         // 0644, which is what a missing `.mode(0o644)` breaks: 0o666 & ~002 is 0664, a
         // group-writable session log. That second one is invisible at the ambient umask,
-        // which is why the umask is set rather than read.
+        // which is why the umask is set rather than read. The directory is discriminated
+        // the same way: `fs::create_dir_all` gives 0775 at 002 where Go gives 0755, and
+        // the two agree at the ambient 022.
         let expect = |var: &str| -> u32 {
             u32::from_str_radix(&std::env::var(var).unwrap(), 8)
                 .unwrap_or_else(|e| panic!("{var}: {e}"))
         };
-        let dir = temp_dir(&format!("mode-{}", expect("CRAB_EXPECT_JSONL")));
-        let store = Store::new(&dir);
+        // The store has to create this one itself -- `temp_dir` would make it at
+        // `0o777 & ~umask` and the assertion would measure the harness.
+        let dir = temp_dir(&format!("mode-{}", expect("CRAB_EXPECT_JSONL"))).join("store");
+        let store = Store::new(&dir).unwrap();
         store.add_message("agent:main:umask", "user", "hi").unwrap();
         let (jsonl, meta) = store.paths_for("agent:main:umask");
         assert_eq!(
@@ -1858,14 +1900,20 @@ mod tests {
             expect("CRAB_EXPECT_JSONL"),
             "Go's OpenFile mode is umask-masked"
         );
+        assert_eq!(
+            mode_of(&dir),
+            expect("CRAB_EXPECT_DIR"),
+            "Go's MkdirAll passes 0o755, not 0o777"
+        );
     }
 
-    fn modes_under_umask(umask: &str, jsonl: &str, meta: &str) {
+    fn modes_under_umask(umask: &str, jsonl: &str, meta: &str, dir: &str) {
         let exe = std::env::current_exe().unwrap();
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!(
-                "umask {umask} && CRAB_EXPECT_JSONL={jsonl} CRAB_EXPECT_META={meta} exec \
+                "umask {umask} && CRAB_EXPECT_JSONL={jsonl} CRAB_EXPECT_META={meta} \
+                 CRAB_EXPECT_DIR={dir} exec \
                  '{}' --ignored --exact --nocapture tests::umask_child",
                 exe.display()
             ))
@@ -1877,7 +1925,9 @@ mod tests {
         // is exactly how the first version of this test passed while running zero tests.
         assert!(
             stdout.contains("1 passed"),
-            "umask {umask}: the child did not run the check:\n{stdout}\n{}",
+            "umask {umask}: the child did not report a passing run. A filtered-out test \
+             exits 0 and prints nothing, and a failing one prints its panic instead of \
+             \"1 passed\", so both land here:\n{stdout}\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
@@ -1889,14 +1939,14 @@ mod tests {
 
     #[test]
     fn modes_under_umask_077() {
-        modes_under_umask("077", "600", "644");
+        modes_under_umask("077", "600", "644", "700");
     }
 
     #[test]
     fn modes_under_umask_002() {
         // The case the review reproduced: without a create mode the history file lands
         // 0664 here, and the ambient umask on most machines is 022, where it would not.
-        modes_under_umask("002", "644", "644");
+        modes_under_umask("002", "644", "644", "755");
     }
 
     #[test]
@@ -1905,7 +1955,7 @@ mod tests {
         // differ in the nanoseconds; the corpus mask hides that today, so nothing but a
         // unit test says the port kept the single instant.
         let dir = temp_dir("one-now");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         store.add_message("agent:main:now", "user", "hi").unwrap();
         let (jsonl, meta) = store.paths_for("agent:main:now");
 
@@ -1927,7 +1977,7 @@ mod tests {
         // here is a file-byte difference the corpus cannot see until a write follows a
         // raw meta, which no scripted case does yet.
         let dir = temp_dir("count-guard");
-        let store = Store::new(&dir);
+        let store = Store::new(&dir).unwrap();
         let (jsonl, meta_path) = store.paths_for("s1");
         fs::write(
             &meta_path,
