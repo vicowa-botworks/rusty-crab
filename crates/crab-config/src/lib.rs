@@ -904,15 +904,12 @@ fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
     let overlay_entries = overlay_entries.clone();
     for (k, v) in &overlay_entries {
         let child = fields.and_then(|schema| schema.field(k));
-        let readable = fields
-            .map(|schema| schema.yaml_fields().iter().any(|f| f.json == *k))
-            .unwrap_or(true);
-        if fields.is_some() && !readable {
-            // Not a field of the target type. Go's yaml decode has no place for it and
-            // moves on; the JSON path would have refused the same key. `None` means the
-            // target has no schema to consult -- a type the factory does not know, which
-            // decodes into map[string]any and therefore accepts everything.
-            continue;
+        if let Some(schema) = fields {
+            // Not a field the yaml decoder can place. Go's decode has no place for it and
+            // moves on; the JSON path would have refused the same key.
+            if !schema.yaml_fields().iter().any(|f| f.json == *k) {
+                continue;
+            }
         }
         match base_entries.iter_mut().find(|(bk, _)| bk == k) {
             Some(slot) => merge_filling(&mut slot.1, v, child),
