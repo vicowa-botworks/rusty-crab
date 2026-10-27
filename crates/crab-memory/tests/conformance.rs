@@ -208,6 +208,13 @@ fn run_op(
                 .map(|()| None)
                 .map_err(|e| e.to_string())
         }
+        "promote_alias" => {
+            let scope = op.scope.clone().filter(|s| !s.is_empty());
+            store
+                .promote_alias_history(op.key(), scope.map(String::into_bytes), op.aliases.clone())
+                .map(|promoted| Some(json!(promoted)))
+                .map_err(|e| e.to_string())
+        }
         "write_file" => {
             let name = op.name.clone().unwrap_or_default();
             fs::write(dir.join(&name), op.content.as_deref().unwrap_or_default())
