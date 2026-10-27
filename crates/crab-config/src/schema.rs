@@ -47,6 +47,11 @@ pub enum Schema {
         /// What `yaml.v3` writes for this struct: the emitted fields in declaration
         /// order. Empty for a struct no yaml path reaches.
         yaml: Vec<YamlField>,
+        /// What `encoding/json` writes for this struct: the emitted keys in declaration
+        /// order, each with its omit option. This is the order a re-marshalled config
+        /// uses, and the only complete list of the keys a position can hold -- a field
+        /// with no omit option is written even when its value is zero.
+        json: Vec<JsonField>,
         /// `Channel` only: the JSON keys that belong to the channel itself rather than
         /// to its `settings`. `migration.go` consults the Go map this came from.
         base_fields: Vec<&'static str>,
@@ -98,7 +103,26 @@ pub struct YamlField {
     pub omit: Option<&'static str>,
 }
 
+/// One entry of a struct's JSON emission list, straight out of the dump.
+#[derive(Debug, Clone)]
+pub struct JsonField {
+    /// The key `encoding/json` writes.
+    pub json: &'static str,
+    /// `omitzero` or `omitempty`. Absent means the key survives a zero value, which is
+    /// most of what a channel's `settings` object holds.
+    pub omit: Option<&'static str>,
+}
+
 impl Schema {
+    /// The struct's JSON emission list: the keys `encoding/json` writes, in declaration
+    /// order. Empty for anything that is not a struct.
+    #[must_use]
+    pub fn json_fields(&self) -> &[JsonField] {
+        match self {
+            Self::Struct { json, .. } => json,
+            _ => &[],
+        }
+    }
     /// The element schema of a map or slice.
     #[must_use]
     pub fn elem(&self) -> Option<&Schema> {
@@ -274,6 +298,29 @@ fn from_value(value: &Value) -> Schema {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Both omit spellings are kept here, unlike the yaml list: `omitzero` and
+            // `omitempty` disagree about structs, and which one a field carries decides
+            // whether `streaming: {}` reaches the document.
+            let json = value
+                .get("json_fields")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|f| {
+                            let json = f.get("json").and_then(Value::as_str)?;
+                            Some(JsonField {
+                                json: Box::leak(json.to_string().into_boxed_str()) as &'static str,
+                                omit: match f.get("omit").and_then(Value::as_str) {
+                                    Some("omitempty") => Some("omitempty"),
+                                    Some("omitzero") => Some("omitzero"),
+                                    _ => None,
+                                },
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut fields = Vec::new();
             if let Some(obj) = value.get("fields").and_then(Value::as_object) {
                 for (name, child) in obj {
@@ -292,6 +339,7 @@ fn from_value(value: &Value) -> Schema {
                 omit,
                 name,
                 yaml,
+                json,
                 base_fields,
                 settings_schemas,
                 marshaler,

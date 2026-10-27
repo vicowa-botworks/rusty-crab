@@ -142,10 +142,16 @@ pub fn apply_omit(document: &Doc, schema: &Schema) -> Doc {
             Doc::Array(items.iter().map(|item| apply_omit(item, elem)).collect())
         }
         (Doc::Object(entries), Schema::Map { elem, .. }) => {
-            let out = entries
+            let mut out: Vec<(String, Doc)> = entries
                 .iter()
                 .map(|(k, v)| (k.clone(), apply_omit(v, elem)))
                 .collect();
+            // A Go map has no order, and `encoding/json` gives it one by sorting the
+            // keys. So `channel_list` comes out a, b, deltachat, dingtalk -- not the
+            // order the file or the defaults table happened to list them in. Equal
+            // bytes either way to anything that parses it, and a different document to
+            // anything that compares them, which is what this seam compares.
+            out.sort_by(|(a, _), (b, _)| a.cmp(b));
             Doc::Object(out)
         }
         (other, _) => other.clone(),
@@ -159,9 +165,19 @@ pub fn apply_omit(document: &Doc, schema: &Schema) -> Doc {
 /// `omitempty`. A map or slice is empty at length zero, including a nil one, and a
 /// pointer-to-struct is not modelled here because `Config` has no such field at the
 /// top level.
-fn is_empty_by_go(value: &Doc, schema: &Schema) -> bool {
+pub(crate) fn is_empty_by_go(value: &Doc, schema: &Schema) -> bool {
     if matches!(schema, Schema::Struct { .. }) {
         return false;
+    }
+    // A byte-holder is not a string here. `RawNode` and `json.RawMessage` hold encoded
+    // JSON, so `null` is the only document form that means nil; an empty *object* is two
+    // non-nil bytes, which is why a slack channel keeps `"settings": {}` past
+    // `settings,omitzero` once InitChannelList has decoded its settings struct.
+    if matches!(
+        schema.name(),
+        Some("RawNode") | Some("json.RawMessage") | Some("[]byte")
+    ) {
+        return matches!(value, Doc::Null);
     }
     match value {
         Doc::Null => true,
