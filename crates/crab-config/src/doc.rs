@@ -56,6 +56,13 @@ impl Parsed {
     }
 }
 
+impl Default for Doc {
+    /// The absent value: a document that says nothing.
+    fn default() -> Self {
+        Self::Null
+    }
+}
+
 impl Doc {
     /// Looks a key up in an object.
     #[must_use]

@@ -106,7 +106,24 @@
         }
        },
        "name": "RoutingConfig",
-       "omit": "omitempty"
+       "omit": "omitempty",
+       "yaml_fields": [
+        {
+         "json": "enabled",
+         "name": "enabled",
+         "untagged": true
+        },
+        {
+         "json": "light_model",
+         "name": "lightmodel",
+         "untagged": true
+        },
+        {
+         "json": "threshold",
+         "name": "threshold",
+         "untagged": true
+        }
+       ]
       },
       "split_on_marker": {
        "kind": "scalar",
@@ -141,7 +158,34 @@
          "name": "int"
         }
        },
-       "name": "SubTurnConfig"
+       "name": "SubTurnConfig",
+       "yaml_fields": [
+        {
+         "json": "max_depth",
+         "name": "maxdepth",
+         "untagged": true
+        },
+        {
+         "json": "max_concurrent",
+         "name": "maxconcurrent",
+         "untagged": true
+        },
+        {
+         "json": "default_timeout_minutes",
+         "name": "defaulttimeoutminutes",
+         "untagged": true
+        },
+        {
+         "json": "default_token_budget",
+         "name": "defaulttokenbudget",
+         "untagged": true
+        },
+        {
+         "json": "concurrency_timeout_sec",
+         "name": "concurrencytimeoutsec",
+         "untagged": true
+        }
+       ]
       },
       "summarize_message_threshold": {
        "kind": "scalar",
@@ -173,7 +217,24 @@
         }
        },
        "name": "ToolFeedbackConfig",
-       "omit": "omitempty"
+       "omit": "omitempty",
+       "yaml_fields": [
+        {
+         "json": "enabled",
+         "name": "enabled",
+         "untagged": true
+        },
+        {
+         "json": "max_args_length",
+         "name": "maxargslength",
+         "untagged": true
+        },
+        {
+         "json": "separate_messages",
+         "name": "separatemessages",
+         "untagged": true
+        }
+       ]
       },
       "turn_profile": {
        "kind": "struct",
@@ -196,12 +257,24 @@
           },
           "mode": {
            "kind": "scalar",
-           "name": "string",
+           "name": "TurnProfileMode",
            "omit": "omitempty"
           }
          },
          "name": "TurnProfileBlock",
-         "omit": "omitempty"
+         "omit": "omitempty",
+         "yaml_fields": [
+          {
+           "json": "mode",
+           "name": "mode",
+           "untagged": true
+          },
+          {
+           "json": "allow",
+           "name": "allow",
+           "untagged": true
+          }
+         ]
         },
         "skills": {
          "kind": "struct",
@@ -217,12 +290,24 @@
           },
           "mode": {
            "kind": "scalar",
-           "name": "string",
+           "name": "TurnProfileMode",
            "omit": "omitempty"
           }
          },
          "name": "TurnProfileBlock",
-         "omit": "omitempty"
+         "omit": "omitempty",
+         "yaml_fields": [
+          {
+           "json": "mode",
+           "name": "mode",
+           "untagged": true
+          },
+          {
+           "json": "allow",
+           "name": "allow",
+           "untagged": true
+          }
+         ]
         },
         "system_prompt": {
          "kind": "struct",
@@ -238,12 +323,24 @@
           },
           "mode": {
            "kind": "scalar",
-           "name": "string",
+           "name": "TurnProfileMode",
            "omit": "omitempty"
           }
          },
          "name": "TurnProfileBlock",
-         "omit": "omitempty"
+         "omit": "omitempty",
+         "yaml_fields": [
+          {
+           "json": "mode",
+           "name": "mode",
+           "untagged": true
+          },
+          {
+           "json": "allow",
+           "name": "allow",
+           "untagged": true
+          }
+         ]
         },
         "tools": {
          "kind": "struct",
@@ -259,23 +356,194 @@
           },
           "mode": {
            "kind": "scalar",
-           "name": "string",
+           "name": "TurnProfileMode",
            "omit": "omitempty"
           }
          },
          "name": "TurnProfileBlock",
-         "omit": "omitempty"
+         "omit": "omitempty",
+         "yaml_fields": [
+          {
+           "json": "mode",
+           "name": "mode",
+           "untagged": true
+          },
+          {
+           "json": "allow",
+           "name": "allow",
+           "untagged": true
+          }
+         ]
         }
        },
        "name": "TurnProfileConfig",
-       "omit": "omitempty"
+       "omit": "omitempty",
+       "yaml_fields": [
+        {
+         "json": "enabled",
+         "name": "enabled",
+         "untagged": true
+        },
+        {
+         "json": "history",
+         "name": "history",
+         "untagged": true
+        },
+        {
+         "json": "system_prompt",
+         "name": "systemprompt",
+         "untagged": true
+        },
+        {
+         "json": "skills",
+         "name": "skills",
+         "untagged": true
+        },
+        {
+         "json": "tools",
+         "name": "tools",
+         "untagged": true
+        }
+       ]
       },
       "workspace": {
        "kind": "scalar",
        "name": "string"
       }
      },
-     "name": "AgentDefaults"
+     "name": "AgentDefaults",
+     "yaml_fields": [
+      {
+       "json": "workspace",
+       "name": "workspace",
+       "untagged": true
+      },
+      {
+       "json": "restrict_to_workspace",
+       "name": "restricttoworkspace",
+       "untagged": true
+      },
+      {
+       "json": "allow_read_outside_workspace",
+       "name": "allowreadoutsideworkspace",
+       "untagged": true
+      },
+      {
+       "json": "provider",
+       "name": "provider",
+       "untagged": true
+      },
+      {
+       "json": "model_name",
+       "name": "modelname",
+       "untagged": true
+      },
+      {
+       "json": "model_fallbacks",
+       "name": "modelfallbacks",
+       "untagged": true
+      },
+      {
+       "json": "image_model",
+       "name": "imagemodel",
+       "untagged": true
+      },
+      {
+       "json": "image_model_fallbacks",
+       "name": "imagemodelfallbacks",
+       "untagged": true
+      },
+      {
+       "json": "max_tokens",
+       "name": "maxtokens",
+       "untagged": true
+      },
+      {
+       "json": "context_window",
+       "name": "contextwindow",
+       "untagged": true
+      },
+      {
+       "json": "temperature",
+       "name": "temperature",
+       "untagged": true
+      },
+      {
+       "json": "max_tool_iterations",
+       "name": "maxtooliterations",
+       "untagged": true
+      },
+      {
+       "json": "summarize_message_threshold",
+       "name": "summarizemessagethreshold",
+       "untagged": true
+      },
+      {
+       "json": "summarize_token_percent",
+       "name": "summarizetokenpercent",
+       "untagged": true
+      },
+      {
+       "json": "max_media_size",
+       "name": "maxmediasize",
+       "untagged": true
+      },
+      {
+       "json": "routing",
+       "name": "routing",
+       "untagged": true
+      },
+      {
+       "json": "steering_mode",
+       "name": "steeringmode",
+       "untagged": true
+      },
+      {
+       "json": "max_parallel_turns",
+       "name": "maxparallelturns",
+       "untagged": true
+      },
+      {
+       "json": "subturn",
+       "name": "subturn",
+       "untagged": true
+      },
+      {
+       "json": "tool_feedback",
+       "name": "toolfeedback",
+       "untagged": true
+      },
+      {
+       "json": "split_on_marker",
+       "name": "splitonmarker",
+       "untagged": true
+      },
+      {
+       "json": "context_manager",
+       "name": "contextmanager",
+       "untagged": true
+      },
+      {
+       "json": "context_manager_config",
+       "name": "contextmanagerconfig",
+       "untagged": true
+      },
+      {
+       "json": "turn_profile",
+       "name": "turnprofile",
+       "untagged": true
+      },
+      {
+       "json": "max_llm_retries",
+       "name": "maxllmretries",
+       "untagged": true
+      },
+      {
+       "json": "llm_retry_backoff_secs",
+       "name": "llmretrybackoffsecs",
+       "untagged": true
+      }
+     ]
     },
     "dispatch": {
      "kind": "struct",
@@ -342,17 +610,83 @@
             "omit": "omitempty"
            }
           },
-          "name": "DispatchSelector"
+          "name": "DispatchSelector",
+          "yaml_fields": [
+           {
+            "json": "channel",
+            "name": "channel",
+            "untagged": true
+           },
+           {
+            "json": "account",
+            "name": "account",
+            "untagged": true
+           },
+           {
+            "json": "space",
+            "name": "space",
+            "untagged": true
+           },
+           {
+            "json": "chat",
+            "name": "chat",
+            "untagged": true
+           },
+           {
+            "json": "topic",
+            "name": "topic",
+            "untagged": true
+           },
+           {
+            "json": "sender",
+            "name": "sender",
+            "untagged": true
+           },
+           {
+            "json": "mentioned",
+            "name": "mentioned",
+            "untagged": true
+           }
+          ]
          }
         },
-        "name": "DispatchRule"
+        "name": "DispatchRule",
+        "yaml_fields": [
+         {
+          "json": "name",
+          "name": "name",
+          "untagged": true
+         },
+         {
+          "json": "agent",
+          "name": "agent",
+          "untagged": true
+         },
+         {
+          "json": "when",
+          "name": "when",
+          "untagged": true
+         },
+         {
+          "json": "session_dimensions",
+          "name": "sessiondimensions",
+          "untagged": true
+         }
+        ]
        },
        "name": "[]DispatchRule",
        "omit": "omitempty"
       }
      },
      "name": "DispatchConfig",
-     "omit": "omitempty"
+     "omit": "omitempty",
+     "yaml_fields": [
+      {
+       "json": "rules",
+       "name": "rules",
+       "untagged": true
+      }
+     ]
     },
     "list": {
      "kind": "slice",
@@ -387,7 +721,19 @@
          }
         },
         "name": "AgentModelConfig",
-        "omit": "omitempty"
+        "omit": "omitempty",
+        "yaml_fields": [
+         {
+          "json": "primary",
+          "name": "primary",
+          "untagged": true
+         },
+         {
+          "json": "fallbacks",
+          "name": "fallbacks",
+          "untagged": true
+         }
+        ]
        },
        "name": {
         "kind": "scalar",
@@ -434,11 +780,35 @@
            }
           },
           "name": "AgentModelConfig",
-          "omit": "omitempty"
+          "omit": "omitempty",
+          "yaml_fields": [
+           {
+            "json": "primary",
+            "name": "primary",
+            "untagged": true
+           },
+           {
+            "json": "fallbacks",
+            "name": "fallbacks",
+            "untagged": true
+           }
+          ]
          }
         },
         "name": "SubagentsConfig",
-        "omit": "omitempty"
+        "omit": "omitempty",
+        "yaml_fields": [
+         {
+          "json": "allow_agents",
+          "name": "allowagents",
+          "untagged": true
+         },
+         {
+          "json": "model",
+          "name": "model",
+          "untagged": true
+         }
+        ]
        },
        "workspace": {
         "kind": "scalar",
@@ -446,13 +816,67 @@
         "omit": "omitempty"
        }
       },
-      "name": "AgentConfig"
+      "name": "AgentConfig",
+      "yaml_fields": [
+       {
+        "json": "id",
+        "name": "id",
+        "untagged": true
+       },
+       {
+        "json": "default",
+        "name": "default",
+        "untagged": true
+       },
+       {
+        "json": "name",
+        "name": "name",
+        "untagged": true
+       },
+       {
+        "json": "workspace",
+        "name": "workspace",
+        "untagged": true
+       },
+       {
+        "json": "model",
+        "name": "model",
+        "untagged": true
+       },
+       {
+        "json": "skills",
+        "name": "skills",
+        "untagged": true
+       },
+       {
+        "json": "subagents",
+        "name": "subagents",
+        "untagged": true
+       }
+      ]
      },
      "name": "[]AgentConfig",
      "omit": "omitempty"
     }
    },
-   "name": "AgentsConfig"
+   "name": "AgentsConfig",
+   "yaml_fields": [
+    {
+     "json": "defaults",
+     "name": "defaults",
+     "untagged": true
+    },
+    {
+     "json": "list",
+     "name": "list",
+     "untagged": true
+    },
+    {
+     "json": "dispatch",
+     "name": "dispatch",
+     "untagged": true
+    }
+   ]
   },
   "build_info": {
    "kind": "struct",
@@ -475,7 +899,29 @@
     }
    },
    "name": "BuildInfo",
-   "omit": "omitempty"
+   "omit": "omitempty",
+   "yaml_fields": [
+    {
+     "json": "version",
+     "name": "version",
+     "untagged": true
+    },
+    {
+     "json": "git_commit",
+     "name": "gitcommit",
+     "untagged": true
+    },
+    {
+     "json": "build_time",
+     "name": "buildtime",
+     "untagged": true
+    },
+    {
+     "json": "go_version",
+     "name": "goversion",
+     "untagged": true
+    }
+   ]
   },
   "channel_list": {
    "kind": "map",
@@ -488,7 +934,7 @@
        "kind": "scalar",
        "name": "string"
       },
-      "name": "[]string",
+      "name": "FlexibleStringSlice",
       "omit": "omitempty"
      },
      "enabled": {
@@ -514,7 +960,19 @@
        }
       },
       "name": "GroupTriggerConfig",
-      "omit": "omitempty"
+      "omit": "omitempty",
+      "yaml_fields": [
+       {
+        "json": "mention_only",
+        "name": "mentiononly",
+        "untagged": true
+       },
+       {
+        "json": "prefixes",
+        "name": "prefixes",
+        "untagged": true
+       }
+      ]
      },
      "placeholder": {
       "kind": "struct",
@@ -529,12 +987,24 @@
          "kind": "scalar",
          "name": "string"
         },
-        "name": "[]string",
+        "name": "FlexibleStringSlice",
         "omit": "omitempty"
        }
       },
       "name": "PlaceholderConfig",
-      "omit": "omitempty"
+      "omit": "omitempty",
+      "yaml_fields": [
+       {
+        "json": "enabled",
+        "name": "enabled",
+        "untagged": true
+       },
+       {
+        "json": "text",
+        "name": "text",
+        "untagged": true
+       }
+      ]
      },
      "reasoning_channel_id": {
       "kind": "scalar",
@@ -542,8 +1012,9 @@
      },
      "settings": {
       "kind": "scalar",
-      "name": "json.RawMessage",
-      "omit": "omitzero"
+      "name": "RawNode",
+      "omit": "omitzero",
+      "marshaler": true
      },
      "type": {
       "kind": "scalar",
@@ -559,12 +1030,1024 @@
        }
       },
       "name": "TypingConfig",
-      "omit": "omitempty"
+      "omit": "omitempty",
+      "yaml_fields": [
+       {
+        "json": "enabled",
+        "name": "enabled",
+        "untagged": true
+       }
+      ]
      }
     },
-    "name": "Channel"
+    "name": "Channel",
+    "yaml_fields": [
+     {
+      "json": "settings",
+      "name": "settings",
+      "omit": "omitempty"
+     }
+    ],
+    "base_fields": [
+     "allow_from",
+     "enabled",
+     "group_trigger",
+     "placeholder",
+     "reasoning_channel_id",
+     "type",
+     "typing"
+    ],
+    "settings_schemas": {
+     "deltachat": {
+      "kind": "struct",
+      "fields": {
+       "allow_crosspost": {
+        "kind": "scalar",
+        "name": "bool",
+        "omit": "omitempty"
+       },
+       "avatar_image": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "data_dir": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "display_name": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "email": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "imap_port": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "imap_server": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "invite_link": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "password": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "rpc_server_path": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "smtp_port": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "smtp_server": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "DeltaChatSettings",
+      "yaml_fields": [
+       {
+        "json": "password",
+        "name": "password",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "dingtalk": {
+      "kind": "struct",
+      "fields": {
+       "client_id": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "client_secret": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       }
+      },
+      "name": "DingTalkSettings",
+      "yaml_fields": [
+       {
+        "json": "client_secret",
+        "name": "client_secret",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "discord": {
+      "kind": "struct",
+      "fields": {
+       "mention_only": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "proxy": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       }
+      },
+      "name": "DiscordSettings",
+      "yaml_fields": [
+       {
+        "json": "token",
+        "name": "token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "feishu": {
+      "kind": "struct",
+      "fields": {
+       "app_id": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "app_secret": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "encrypt_key": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "is_lark": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "random_reaction_emoji": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "FlexibleStringSlice"
+       },
+       "verification_token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       }
+      },
+      "name": "FeishuSettings",
+      "yaml_fields": [
+       {
+        "json": "app_secret",
+        "name": "app_secret",
+        "omit": "omitempty"
+       },
+       {
+        "json": "encrypt_key",
+        "name": "encrypt_key",
+        "omit": "omitempty"
+       },
+       {
+        "json": "verification_token",
+        "name": "verification_token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "irc": {
+      "kind": "struct",
+      "fields": {
+       "channels": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "FlexibleStringSlice"
+       },
+       "nick": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "nickserv_password": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "password": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "real_name": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "request_caps": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "FlexibleStringSlice",
+        "omit": "omitempty"
+       },
+       "sasl_password": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "sasl_user": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "server": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "tls": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "user": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "IRCSettings",
+      "yaml_fields": [
+       {
+        "json": "password",
+        "name": "password",
+        "omit": "omitempty"
+       },
+       {
+        "json": "nickserv_password",
+        "name": "nickserv_password",
+        "omit": "omitempty"
+       },
+       {
+        "json": "sasl_password",
+        "name": "sasl_password",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "line": {
+      "kind": "struct",
+      "fields": {
+       "channel_access_token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "channel_secret": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "webhook_host": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "webhook_path": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "webhook_port": {
+        "kind": "scalar",
+        "name": "int"
+       }
+      },
+      "name": "LINESettings",
+      "yaml_fields": [
+       {
+        "json": "channel_secret",
+        "name": "channel_secret",
+        "omit": "omitempty"
+       },
+       {
+        "json": "channel_access_token",
+        "name": "channel_access_token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "maixcam": {
+      "kind": "struct",
+      "fields": {
+       "host": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "port": {
+        "kind": "scalar",
+        "name": "int"
+       }
+      },
+      "name": "MaixCamSettings"
+     },
+     "matrix": {
+      "kind": "struct",
+      "fields": {
+       "access_token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "crypto_database_path": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "crypto_passphrase": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "device_id": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "homeserver": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "join_on_invite": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "message_format": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "user_id": {
+        "kind": "scalar",
+        "name": "string"
+       }
+      },
+      "name": "MatrixSettings",
+      "yaml_fields": [
+       {
+        "json": "access_token",
+        "name": "access_token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "mqtt": {
+      "kind": "struct",
+      "fields": {
+       "agent_id": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "broker": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "client_id": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "keep_alive": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "password": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "qos": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "topic_prefix": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "username": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       }
+      },
+      "name": "MQTTSettings",
+      "yaml_fields": [
+       {
+        "json": "username",
+        "name": "username",
+        "omit": "omitempty"
+       },
+       {
+        "json": "password",
+        "name": "password",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "onebot": {
+      "kind": "struct",
+      "fields": {
+       "access_token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "group_trigger_prefix": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string"
+       },
+       "reconnect_interval": {
+        "kind": "scalar",
+        "name": "int"
+       },
+       "ws_url": {
+        "kind": "scalar",
+        "name": "string"
+       }
+      },
+      "name": "OneBotSettings",
+      "yaml_fields": [
+       {
+        "json": "access_token",
+        "name": "access_token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "pico": {
+      "kind": "struct",
+      "fields": {
+       "allow_origins": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string",
+        "omit": "omitempty"
+       },
+       "allow_token_query": {
+        "kind": "scalar",
+        "name": "bool",
+        "omit": "omitempty"
+       },
+       "max_connections": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "ping_interval": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "read_timeout": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "streaming": {
+        "kind": "struct",
+        "fields": {
+         "enabled": {
+          "kind": "scalar",
+          "name": "bool",
+          "omit": "omitempty"
+         },
+         "min_growth_chars": {
+          "kind": "scalar",
+          "name": "int",
+          "omit": "omitempty"
+         },
+         "throttle_seconds": {
+          "kind": "scalar",
+          "name": "int",
+          "omit": "omitempty"
+         }
+        },
+        "name": "StreamingConfig",
+        "omit": "omitzero",
+        "yaml_fields": [
+         {
+          "json": "enabled",
+          "name": "enabled",
+          "untagged": true
+         },
+         {
+          "json": "throttle_seconds",
+          "name": "throttleseconds",
+          "untagged": true
+         },
+         {
+          "json": "min_growth_chars",
+          "name": "mingrowthchars",
+          "untagged": true
+         }
+        ]
+       },
+       "token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "write_timeout": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       }
+      },
+      "name": "PicoSettings",
+      "yaml_fields": [
+       {
+        "json": "token",
+        "name": "token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "pico_client": {
+      "kind": "struct",
+      "fields": {
+       "ping_interval": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "read_timeout": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "session_id": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "url": {
+        "kind": "scalar",
+        "name": "string"
+       }
+      },
+      "name": "PicoClientSettings",
+      "yaml_fields": [
+       {
+        "json": "token",
+        "name": "token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "qq": {
+      "kind": "struct",
+      "fields": {
+       "app_id": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "app_secret": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "max_base64_file_size_mib": {
+        "kind": "scalar",
+        "name": "int64"
+       },
+       "max_message_length": {
+        "kind": "scalar",
+        "name": "int"
+       },
+       "send_markdown": {
+        "kind": "scalar",
+        "name": "bool"
+       }
+      },
+      "name": "QQSettings",
+      "yaml_fields": [
+       {
+        "json": "app_secret",
+        "name": "app_secret",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "slack": {
+      "kind": "struct",
+      "fields": {
+       "app_token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "bot_token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       }
+      },
+      "name": "SlackSettings",
+      "yaml_fields": [
+       {
+        "json": "bot_token",
+        "name": "bot_token",
+        "omit": "omitempty"
+       },
+       {
+        "json": "app_token",
+        "name": "app_token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "slack_webhook": {
+      "kind": "struct",
+      "fields": {
+       "webhooks": {
+        "kind": "map",
+        "elem": {
+         "kind": "struct",
+         "fields": {
+          "icon_emoji": {
+           "kind": "scalar",
+           "name": "string",
+           "omit": "omitempty"
+          },
+          "username": {
+           "kind": "scalar",
+           "name": "string",
+           "omit": "omitempty"
+          },
+          "webhook_url": {
+           "kind": "struct",
+           "name": "SecureString",
+           "omit": "omitzero",
+           "marshaler": true
+          }
+         },
+         "name": "SlackWebhookTarget",
+         "yaml_fields": [
+          {
+           "json": "webhook_url",
+           "name": "webhook_url",
+           "omit": "omitempty"
+          }
+         ]
+        },
+        "name": "map[string]SlackWebhookTarget"
+       }
+      },
+      "name": "SlackWebhookSettings",
+      "yaml_fields": [
+       {
+        "json": "webhooks",
+        "name": "webhooks",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "teams_webhook": {
+      "kind": "struct",
+      "fields": {
+       "webhooks": {
+        "kind": "map",
+        "elem": {
+         "kind": "struct",
+         "fields": {
+          "title": {
+           "kind": "scalar",
+           "name": "string",
+           "omit": "omitempty"
+          },
+          "webhook_url": {
+           "kind": "struct",
+           "name": "SecureString",
+           "omit": "omitzero",
+           "marshaler": true
+          }
+         },
+         "name": "TeamsWebhookTarget",
+         "yaml_fields": [
+          {
+           "json": "webhook_url",
+           "name": "webhook_url",
+           "omit": "omitempty"
+          }
+         ]
+        },
+        "name": "map[string]TeamsWebhookTarget"
+       }
+      },
+      "name": "TeamsWebhookSettings",
+      "yaml_fields": [
+       {
+        "json": "webhooks",
+        "name": "webhooks",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "telegram": {
+      "kind": "struct",
+      "fields": {
+       "base_url": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "media_group_delay_ms": {
+        "kind": "scalar",
+        "name": "int"
+       },
+       "proxy": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "streaming": {
+        "kind": "struct",
+        "fields": {
+         "enabled": {
+          "kind": "scalar",
+          "name": "bool",
+          "omit": "omitempty"
+         },
+         "min_growth_chars": {
+          "kind": "scalar",
+          "name": "int",
+          "omit": "omitempty"
+         },
+         "throttle_seconds": {
+          "kind": "scalar",
+          "name": "int",
+          "omit": "omitempty"
+         }
+        },
+        "name": "StreamingConfig",
+        "omit": "omitzero",
+        "yaml_fields": [
+         {
+          "json": "enabled",
+          "name": "enabled",
+          "untagged": true
+         },
+         {
+          "json": "throttle_seconds",
+          "name": "throttleseconds",
+          "untagged": true
+         },
+         {
+          "json": "min_growth_chars",
+          "name": "mingrowthchars",
+          "untagged": true
+         }
+        ]
+       },
+       "token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "use_markdown_v2": {
+        "kind": "scalar",
+        "name": "bool"
+       }
+      },
+      "name": "TelegramSettings",
+      "yaml_fields": [
+       {
+        "json": "token",
+        "name": "token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "vk": {
+      "kind": "struct",
+      "fields": {
+       "group_id": {
+        "kind": "scalar",
+        "name": "int"
+       },
+       "token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       }
+      },
+      "name": "VKSettings",
+      "yaml_fields": [
+       {
+        "json": "token",
+        "name": "token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "wecom": {
+      "kind": "struct",
+      "fields": {
+       "bot_id": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "secret": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       },
+       "send_thinking_message": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "streaming": {
+        "kind": "struct",
+        "fields": {
+         "enabled": {
+          "kind": "scalar",
+          "name": "bool",
+          "omit": "omitempty"
+         },
+         "min_growth_chars": {
+          "kind": "scalar",
+          "name": "int",
+          "omit": "omitempty"
+         },
+         "throttle_seconds": {
+          "kind": "scalar",
+          "name": "int",
+          "omit": "omitempty"
+         }
+        },
+        "name": "StreamingConfig",
+        "omit": "omitzero",
+        "yaml_fields": [
+         {
+          "json": "enabled",
+          "name": "enabled",
+          "untagged": true
+         },
+         {
+          "json": "throttle_seconds",
+          "name": "throttleseconds",
+          "untagged": true
+         },
+         {
+          "json": "min_growth_chars",
+          "name": "mingrowthchars",
+          "untagged": true
+         }
+        ]
+       },
+       "websocket_url": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "WeComSettings",
+      "yaml_fields": [
+       {
+        "json": "secret",
+        "name": "secret",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "weixin": {
+      "kind": "struct",
+      "fields": {
+       "account_id": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "base_url": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "cdn_base_url": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "proxy": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "token": {
+        "kind": "struct",
+        "name": "SecureString",
+        "omit": "omitzero",
+        "marshaler": true
+       }
+      },
+      "name": "WeixinSettings",
+      "yaml_fields": [
+       {
+        "json": "token",
+        "name": "token",
+        "omit": "omitempty"
+       }
+      ]
+     },
+     "whatsapp": {
+      "kind": "struct",
+      "fields": {
+       "bridge_url": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "session_store_path": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "use_native": {
+        "kind": "scalar",
+        "name": "bool"
+       }
+      },
+      "name": "WhatsAppSettings"
+     },
+     "whatsapp_native": {
+      "kind": "struct",
+      "fields": {
+       "bridge_url": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "session_store_path": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "use_native": {
+        "kind": "scalar",
+        "name": "bool"
+       }
+      },
+      "name": "WhatsAppSettings"
+     }
+    },
+    "marshaler": true
    },
-   "name": "map[string]*Channel"
+   "name": "ChannelsConfig"
   },
   "devices": {
    "kind": "struct",
@@ -578,7 +2061,19 @@
      "name": "bool"
     }
    },
-   "name": "DevicesConfig"
+   "name": "DevicesConfig",
+   "yaml_fields": [
+    {
+     "json": "enabled",
+     "name": "enabled",
+     "untagged": true
+    },
+    {
+     "json": "monitor_usb",
+     "name": "monitorusb",
+     "untagged": true
+    }
+   ]
   },
   "events": {
    "kind": "struct",
@@ -620,11 +2115,45 @@
       }
      },
      "name": "EventLoggingConfig",
-     "omit": "omitempty"
+     "omit": "omitempty",
+     "yaml_fields": [
+      {
+       "json": "enabled",
+       "name": "enabled",
+       "untagged": true
+      },
+      {
+       "json": "include",
+       "name": "include",
+       "untagged": true
+      },
+      {
+       "json": "exclude",
+       "name": "exclude",
+       "untagged": true
+      },
+      {
+       "json": "min_severity",
+       "name": "minseverity",
+       "untagged": true
+      },
+      {
+       "json": "include_payload",
+       "name": "includepayload",
+       "untagged": true
+      }
+     ]
     }
    },
    "name": "EventsConfig",
-   "omit": "omitempty"
+   "omit": "omitempty",
+   "yaml_fields": [
+    {
+     "json": "logging",
+     "name": "logging",
+     "untagged": true
+    }
+   ]
   },
   "evolution": {
    "kind": "struct",
@@ -680,7 +2209,54 @@
     }
    },
    "name": "EvolutionConfig",
-   "omit": "omitempty"
+   "omit": "omitempty",
+   "yaml_fields": [
+    {
+     "json": "enabled",
+     "name": "enabled",
+     "untagged": true
+    },
+    {
+     "json": "mode",
+     "name": "mode",
+     "untagged": true
+    },
+    {
+     "json": "state_dir",
+     "name": "statedir",
+     "untagged": true
+    },
+    {
+     "json": "min_task_count",
+     "name": "mintaskcount",
+     "untagged": true
+    },
+    {
+     "json": "min_success_ratio",
+     "name": "minsuccessratio",
+     "untagged": true
+    },
+    {
+     "json": "cold_path_trigger",
+     "name": "coldpathtrigger",
+     "untagged": true
+    },
+    {
+     "json": "cold_path_times",
+     "name": "coldpathtimes",
+     "untagged": true
+    },
+    {
+     "json": "min_case_count",
+     "name": "mincasecount",
+     "untagged": true
+    },
+    {
+     "json": "min_success_rate",
+     "name": "minsuccessrate",
+     "untagged": true
+    }
+   ]
   },
   "gateway": {
    "kind": "struct",
@@ -703,7 +2279,29 @@
      "name": "int"
     }
    },
-   "name": "GatewayConfig"
+   "name": "GatewayConfig",
+   "yaml_fields": [
+    {
+     "json": "host",
+     "name": "host",
+     "untagged": true
+    },
+    {
+     "json": "port",
+     "name": "port",
+     "untagged": true
+    },
+    {
+     "json": "hot_reload",
+     "name": "hotreload",
+     "untagged": true
+    },
+    {
+     "json": "log_level",
+     "name": "loglevel",
+     "untagged": true
+    }
+   ]
   },
   "heartbeat": {
    "kind": "struct",
@@ -717,7 +2315,19 @@
      "name": "int"
     }
    },
-   "name": "HeartbeatConfig"
+   "name": "HeartbeatConfig",
+   "yaml_fields": [
+    {
+     "json": "enabled",
+     "name": "enabled",
+     "untagged": true
+    },
+    {
+     "json": "interval",
+     "name": "interval",
+     "untagged": true
+    }
+   ]
   },
   "hooks": {
    "kind": "struct",
@@ -742,7 +2352,24 @@
         "omit": "omitempty"
        }
       },
-      "name": "BuiltinHookConfig"
+      "name": "BuiltinHookConfig",
+      "yaml_fields": [
+       {
+        "json": "enabled",
+        "name": "enabled",
+        "untagged": true
+       },
+       {
+        "json": "priority",
+        "name": "priority",
+        "untagged": true
+       },
+       {
+        "json": "config",
+        "name": "config",
+        "untagged": true
+       }
+      ]
      },
      "name": "map[string]BuiltinHookConfig",
      "omit": "omitempty"
@@ -767,7 +2394,24 @@
       }
      },
      "name": "HookDefaultsConfig",
-     "omit": "omitempty"
+     "omit": "omitempty",
+     "yaml_fields": [
+      {
+       "json": "observer_timeout_ms",
+       "name": "observertimeoutms",
+       "untagged": true
+      },
+      {
+       "json": "interceptor_timeout_ms",
+       "name": "interceptortimeoutms",
+       "untagged": true
+      },
+      {
+       "json": "approval_timeout_ms",
+       "name": "approvaltimeoutms",
+       "untagged": true
+      }
+     ]
     },
     "enabled": {
      "kind": "scalar",
@@ -834,14 +2478,78 @@
         "omit": "omitempty"
        }
       },
-      "name": "ProcessHookConfig"
+      "name": "ProcessHookConfig",
+      "yaml_fields": [
+       {
+        "json": "enabled",
+        "name": "enabled",
+        "untagged": true
+       },
+       {
+        "json": "priority",
+        "name": "priority",
+        "untagged": true
+       },
+       {
+        "json": "transport",
+        "name": "transport",
+        "untagged": true
+       },
+       {
+        "json": "command",
+        "name": "command",
+        "untagged": true
+       },
+       {
+        "json": "dir",
+        "name": "dir",
+        "untagged": true
+       },
+       {
+        "json": "env",
+        "name": "env",
+        "untagged": true
+       },
+       {
+        "json": "observe",
+        "name": "observe",
+        "untagged": true
+       },
+       {
+        "json": "intercept",
+        "name": "intercept",
+        "untagged": true
+       }
+      ]
      },
      "name": "map[string]ProcessHookConfig",
      "omit": "omitempty"
     }
    },
    "name": "HooksConfig",
-   "omit": "omitempty"
+   "omit": "omitempty",
+   "yaml_fields": [
+    {
+     "json": "enabled",
+     "name": "enabled",
+     "untagged": true
+    },
+    {
+     "json": "defaults",
+     "name": "defaults",
+     "untagged": true
+    },
+    {
+     "json": "builtins",
+     "name": "builtins",
+     "untagged": true
+    },
+    {
+     "json": "processes",
+     "name": "processes",
+     "untagged": true
+    }
+   ]
   },
   "isolation": {
    "kind": "struct",
@@ -870,14 +2578,43 @@
         "omit": "omitempty"
        }
       },
-      "name": "ExposePath"
+      "name": "ExposePath",
+      "yaml_fields": [
+       {
+        "json": "source",
+        "name": "source",
+        "untagged": true
+       },
+       {
+        "json": "target",
+        "name": "target",
+        "untagged": true
+       },
+       {
+        "json": "mode",
+        "name": "mode",
+        "untagged": true
+       }
+      ]
      },
      "name": "[]ExposePath",
      "omit": "omitempty"
     }
    },
    "name": "IsolationConfig",
-   "omit": "omitempty"
+   "omit": "omitempty",
+   "yaml_fields": [
+    {
+     "json": "enabled",
+     "name": "enabled",
+     "untagged": true
+    },
+    {
+     "json": "expose_paths",
+     "name": "exposepaths",
+     "untagged": true
+    }
+   ]
   },
   "model_list": {
    "kind": "slice",
@@ -894,9 +2631,9 @@
       "elem": {
        "kind": "struct",
        "name": "SecureString",
-       "omit": "omitzero"
+       "marshaler": true
       },
-      "name": "[]*SecureString",
+      "name": "SecureStrings",
       "omit": "omitzero"
      },
      "auth_method": {
@@ -983,7 +2720,14 @@
        }
       },
       "name": "ModelStreamingConfig",
-      "omit": "omitzero"
+      "omit": "omitzero",
+      "yaml_fields": [
+       {
+        "json": "enabled",
+        "name": "enabled",
+        "untagged": true
+       }
+      ]
      },
      "thinking_level": {
       "kind": "scalar",
@@ -1006,9 +2750,107 @@
       "omit": "omitempty"
      }
     },
-    "name": "ModelConfig"
+    "name": "ModelConfig",
+    "yaml_fields": [
+     {
+      "json": "model_name",
+      "name": "modelname",
+      "untagged": true
+     },
+     {
+      "json": "provider",
+      "name": "provider",
+      "untagged": true
+     },
+     {
+      "json": "model",
+      "name": "model",
+      "untagged": true
+     },
+     {
+      "json": "api_base",
+      "name": "apibase",
+      "untagged": true
+     },
+     {
+      "json": "proxy",
+      "name": "proxy",
+      "untagged": true
+     },
+     {
+      "json": "fallbacks",
+      "name": "fallbacks",
+      "untagged": true
+     },
+     {
+      "json": "auth_method",
+      "name": "authmethod",
+      "untagged": true
+     },
+     {
+      "json": "connect_mode",
+      "name": "connectmode",
+      "untagged": true
+     },
+     {
+      "json": "workspace",
+      "name": "workspace",
+      "untagged": true
+     },
+     {
+      "json": "rpm",
+      "name": "rpm",
+      "untagged": true
+     },
+     {
+      "json": "max_tokens_field",
+      "name": "maxtokensfield",
+      "untagged": true
+     },
+     {
+      "json": "request_timeout",
+      "name": "requesttimeout",
+      "untagged": true
+     },
+     {
+      "json": "thinking_level",
+      "name": "thinkinglevel",
+      "untagged": true
+     },
+     {
+      "json": "tool_schema_transform",
+      "name": "toolschematransform",
+      "untagged": true
+     },
+     {
+      "json": "streaming",
+      "name": "streaming",
+      "untagged": true
+     },
+     {
+      "json": "extra_body",
+      "name": "extrabody",
+      "untagged": true
+     },
+     {
+      "json": "custom_headers",
+      "name": "customheaders",
+      "untagged": true
+     },
+     {
+      "json": "api_keys",
+      "name": "api_keys",
+      "omit": "omitempty"
+     },
+     {
+      "json": "enabled",
+      "name": "enabled",
+      "omit": "omitempty"
+     }
+    ]
    },
-   "name": "[]*ModelConfig"
+   "name": "SecureModelList",
+   "marshaler": true
   },
   "session": {
    "kind": "struct",
@@ -1042,7 +2884,24 @@
     }
    },
    "name": "SessionConfig",
-   "omit": "omitempty"
+   "omit": "omitempty",
+   "yaml_fields": [
+    {
+     "json": "dimensions",
+     "name": "dimensions",
+     "untagged": true
+    },
+    {
+     "json": "identity_links",
+     "name": "identitylinks",
+     "untagged": true
+    },
+    {
+     "json": "dm_scope",
+     "name": "dmscope",
+     "untagged": true
+    }
+   ]
   },
   "tools": {
    "kind": "struct",
@@ -1097,7 +2956,24 @@
        "name": "int"
       }
      },
-     "name": "CronToolsConfig"
+     "name": "CronToolsConfig",
+     "yaml_fields": [
+      {
+       "json": "exec_timeout_minutes",
+       "name": "exectimeoutminutes",
+       "untagged": true
+      },
+      {
+       "json": "allow_command",
+       "name": "allowcommand",
+       "untagged": true
+      },
+      {
+       "json": "command_allowed_remotes",
+       "name": "commandallowedremotes",
+       "untagged": true
+      }
+     ]
     },
     "edit_file": {
      "kind": "struct",
@@ -1145,7 +3021,34 @@
        "name": "int"
       }
      },
-     "name": "ExecConfig"
+     "name": "ExecConfig",
+     "yaml_fields": [
+      {
+       "json": "enable_deny_patterns",
+       "name": "enabledenypatterns",
+       "untagged": true
+      },
+      {
+       "json": "allow_remote",
+       "name": "allowremote",
+       "untagged": true
+      },
+      {
+       "json": "custom_deny_patterns",
+       "name": "customdenypatterns",
+       "untagged": true
+      },
+      {
+       "json": "custom_allow_patterns",
+       "name": "customallowpatterns",
+       "untagged": true
+      },
+      {
+       "json": "timeout_seconds",
+       "name": "timeoutseconds",
+       "untagged": true
+      }
+     ]
     },
     "filter_min_length": {
      "kind": "scalar",
@@ -1232,7 +3135,34 @@
          "name": "bool"
         }
        },
-       "name": "ToolDiscoveryConfig"
+       "name": "ToolDiscoveryConfig",
+       "yaml_fields": [
+        {
+         "json": "enabled",
+         "name": "enabled",
+         "untagged": true
+        },
+        {
+         "json": "ttl",
+         "name": "ttl",
+         "untagged": true
+        },
+        {
+         "json": "max_search_results",
+         "name": "maxsearchresults",
+         "untagged": true
+        },
+        {
+         "json": "use_bm25",
+         "name": "usebm25",
+         "untagged": true
+        },
+        {
+         "json": "use_regex",
+         "name": "useregex",
+         "untagged": true
+        }
+       ]
       },
       "enabled": {
        "kind": "scalar",
@@ -1304,13 +3234,77 @@
           "omit": "omitempty"
          }
         },
-        "name": "MCPServerConfig"
+        "name": "MCPServerConfig",
+        "yaml_fields": [
+         {
+          "json": "enabled",
+          "name": "enabled",
+          "untagged": true
+         },
+         {
+          "json": "deferred",
+          "name": "deferred",
+          "untagged": true
+         },
+         {
+          "json": "command",
+          "name": "command",
+          "untagged": true
+         },
+         {
+          "json": "args",
+          "name": "args",
+          "untagged": true
+         },
+         {
+          "json": "env",
+          "name": "env",
+          "untagged": true
+         },
+         {
+          "json": "env_file",
+          "name": "envfile",
+          "untagged": true
+         },
+         {
+          "json": "type",
+          "name": "type",
+          "untagged": true
+         },
+         {
+          "json": "url",
+          "name": "url",
+          "untagged": true
+         },
+         {
+          "json": "headers",
+          "name": "headers",
+          "untagged": true
+         }
+        ]
        },
        "name": "map[string]MCPServerConfig",
        "omit": "omitempty"
       }
      },
-     "name": "MCPConfig"
+     "name": "MCPConfig",
+     "yaml_fields": [
+      {
+       "json": "discovery",
+       "name": "discovery",
+       "untagged": true
+      },
+      {
+       "json": "max_inline_text_chars",
+       "name": "maxinlinetextchars",
+       "untagged": true
+      },
+      {
+       "json": "servers",
+       "name": "servers",
+       "untagged": true
+      }
+     ]
     },
     "media_cleanup": {
      "kind": "struct",
@@ -1328,7 +3322,19 @@
        "name": "int"
       }
      },
-     "name": "MediaCleanupConfig"
+     "name": "MediaCleanupConfig",
+     "yaml_fields": [
+      {
+       "json": "max_age_minutes",
+       "name": "maxage",
+       "untagged": true
+      },
+      {
+       "json": "interval_minutes",
+       "name": "interval",
+       "untagged": true
+      }
+     ]
     },
     "message": {
      "kind": "struct",
@@ -1360,7 +3366,24 @@
        "name": "string"
       }
      },
-     "name": "ReadFileToolConfig"
+     "name": "ReadFileToolConfig",
+     "yaml_fields": [
+      {
+       "json": "enabled",
+       "name": "enabled",
+       "untagged": true
+      },
+      {
+       "json": "mode",
+       "name": "mode",
+       "untagged": true
+      },
+      {
+       "json": "max_read_file_size",
+       "name": "maxreadfilesize",
+       "untagged": true
+      }
+     ]
     },
     "send_file": {
      "kind": "struct",
@@ -1415,10 +3438,18 @@
         "token": {
          "kind": "struct",
          "name": "SecureString",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "marshaler": true
         }
        },
-       "name": "SkillsGithubConfig"
+       "name": "SkillsGithubConfig",
+       "yaml_fields": [
+        {
+         "json": "token",
+         "name": "token",
+         "omit": "omitempty"
+        }
+       ]
       },
       "max_concurrent_searches": {
        "kind": "scalar",
@@ -1432,7 +3463,8 @@
          "auth_token": {
           "kind": "struct",
           "name": "SecureString",
-          "omit": "omitzero"
+          "omit": "omitzero",
+          "marshaler": true
          },
          "base_url": {
           "kind": "scalar",
@@ -1448,9 +3480,18 @@
           "omit": "omitempty"
          }
         },
-        "name": "SkillRegistryConfig"
+        "name": "SkillRegistryConfig",
+        "yaml_fields": [
+         {
+          "json": "auth_token",
+          "name": "auth_token",
+          "omit": "omitempty"
+         }
+        ],
+        "marshaler": true
        },
-       "name": "[]*SkillRegistryConfig"
+       "name": "SkillsRegistriesConfig",
+       "marshaler": true
       },
       "search_cache": {
        "kind": "struct",
@@ -1464,10 +3505,34 @@
          "name": "int"
         }
        },
-       "name": "SearchCacheConfig"
+       "name": "SearchCacheConfig",
+       "yaml_fields": [
+        {
+         "json": "max_size",
+         "name": "maxsize",
+         "untagged": true
+        },
+        {
+         "json": "ttl_seconds",
+         "name": "ttlseconds",
+         "untagged": true
+        }
+       ]
       }
      },
-     "name": "SkillsToolsConfig"
+     "name": "SkillsToolsConfig",
+     "yaml_fields": [
+      {
+       "json": "registries",
+       "name": "registries",
+       "omit": "omitempty"
+      },
+      {
+       "json": "github",
+       "name": "github",
+       "omit": "omitempty"
+      }
+     ]
     },
     "spawn": {
      "kind": "struct",
@@ -1518,7 +3583,8 @@
         "api_key": {
          "kind": "struct",
          "name": "SecureString",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "marshaler": true
         },
         "base_url": {
          "kind": "scalar",
@@ -1533,7 +3599,14 @@
          "name": "int"
         }
        },
-       "name": "BaiduSearchConfig"
+       "name": "BaiduSearchConfig",
+       "yaml_fields": [
+        {
+         "json": "api_key",
+         "name": "api_key",
+         "omit": "omitempty"
+        }
+       ]
       },
       "brave": {
        "kind": "struct",
@@ -1543,9 +3616,9 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
-          "omit": "omitzero"
+          "marshaler": true
          },
-         "name": "[]*SecureString",
+         "name": "SecureStrings",
          "omit": "omitzero"
         },
         "enabled": {
@@ -1557,7 +3630,14 @@
          "name": "int"
         }
        },
-       "name": "BraveConfig"
+       "name": "BraveConfig",
+       "yaml_fields": [
+        {
+         "json": "api_keys",
+         "name": "api_keys",
+         "omit": "omitempty"
+        }
+       ]
       },
       "duckduckgo": {
        "kind": "struct",
@@ -1571,7 +3651,19 @@
          "name": "int"
         }
        },
-       "name": "DuckDuckGoConfig"
+       "name": "DuckDuckGoConfig",
+       "yaml_fields": [
+        {
+         "json": "enabled",
+         "name": "enabled",
+         "untagged": true
+        },
+        {
+         "json": "max_results",
+         "name": "maxresults",
+         "untagged": true
+        }
+       ]
       },
       "enabled": {
        "kind": "scalar",
@@ -1593,7 +3685,8 @@
         "api_key": {
          "kind": "struct",
          "name": "SecureString",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "marshaler": true
         },
         "enabled": {
          "kind": "scalar",
@@ -1608,7 +3701,14 @@
          "name": "string"
         }
        },
-       "name": "GeminiSearchConfig"
+       "name": "GeminiSearchConfig",
+       "yaml_fields": [
+        {
+         "json": "api_key",
+         "name": "api_key",
+         "omit": "omitempty"
+        }
+       ]
       },
       "glm_search": {
        "kind": "struct",
@@ -1616,7 +3716,8 @@
         "api_key": {
          "kind": "struct",
          "name": "SecureString",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "marshaler": true
         },
         "base_url": {
          "kind": "scalar",
@@ -1635,7 +3736,14 @@
          "name": "string"
         }
        },
-       "name": "GLMSearchConfig"
+       "name": "GLMSearchConfig",
+       "yaml_fields": [
+        {
+         "json": "api_key",
+         "name": "api_key",
+         "omit": "omitempty"
+        }
+       ]
       },
       "kagi": {
        "kind": "struct",
@@ -1645,9 +3753,9 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
-          "omit": "omitzero"
+          "marshaler": true
          },
-         "name": "[]*SecureString",
+         "name": "SecureStrings",
          "omit": "omitzero"
         },
         "base_url": {
@@ -1663,7 +3771,14 @@
          "name": "int"
         }
        },
-       "name": "KagiConfig"
+       "name": "KagiConfig",
+       "yaml_fields": [
+        {
+         "json": "api_keys",
+         "name": "api_keys",
+         "omit": "omitempty"
+        }
+       ]
       },
       "perplexity": {
        "kind": "struct",
@@ -1673,9 +3788,9 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
-          "omit": "omitzero"
+          "marshaler": true
          },
-         "name": "[]*SecureString",
+         "name": "SecureStrings",
          "omit": "omitzero"
         },
         "enabled": {
@@ -1687,7 +3802,14 @@
          "name": "int"
         }
        },
-       "name": "PerplexityConfig"
+       "name": "PerplexityConfig",
+       "yaml_fields": [
+        {
+         "json": "api_keys",
+         "name": "api_keys",
+         "omit": "omitempty"
+        }
+       ]
       },
       "prefer_native": {
        "kind": "scalar",
@@ -1699,7 +3821,7 @@
         "kind": "scalar",
         "name": "string"
        },
-       "name": "[]string",
+       "name": "FlexibleStringSlice",
        "omit": "omitempty"
       },
       "provider": {
@@ -1728,7 +3850,24 @@
          "name": "int"
         }
        },
-       "name": "SearXNGConfig"
+       "name": "SearXNGConfig",
+       "yaml_fields": [
+        {
+         "json": "enabled",
+         "name": "enabled",
+         "untagged": true
+        },
+        {
+         "json": "base_url",
+         "name": "baseurl",
+         "untagged": true
+        },
+        {
+         "json": "max_results",
+         "name": "maxresults",
+         "untagged": true
+        }
+       ]
       },
       "sogou": {
        "kind": "struct",
@@ -1742,7 +3881,19 @@
          "name": "int"
         }
        },
-       "name": "SogouConfig"
+       "name": "SogouConfig",
+       "yaml_fields": [
+        {
+         "json": "enabled",
+         "name": "enabled",
+         "untagged": true
+        },
+        {
+         "json": "max_results",
+         "name": "maxresults",
+         "untagged": true
+        }
+       ]
       },
       "tavily": {
        "kind": "struct",
@@ -1752,9 +3903,9 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
-          "omit": "omitzero"
+          "marshaler": true
          },
-         "name": "[]*SecureString",
+         "name": "SecureStrings",
          "omit": "omitzero"
         },
         "base_url": {
@@ -1770,10 +3921,54 @@
          "name": "int"
         }
        },
-       "name": "TavilyConfig"
+       "name": "TavilyConfig",
+       "yaml_fields": [
+        {
+         "json": "api_keys",
+         "name": "api_keys",
+         "omit": "omitempty"
+        }
+       ]
       }
      },
-     "name": "WebToolsConfig"
+     "name": "WebToolsConfig",
+     "yaml_fields": [
+      {
+       "json": "brave",
+       "name": "brave",
+       "omit": "omitempty"
+      },
+      {
+       "json": "tavily",
+       "name": "tavily",
+       "omit": "omitempty"
+      },
+      {
+       "json": "kagi",
+       "name": "kagi",
+       "omit": "omitempty"
+      },
+      {
+       "json": "gemini",
+       "name": "gemini",
+       "omit": "omitempty"
+      },
+      {
+       "json": "perplexity",
+       "name": "perplexity",
+       "omit": "omitempty"
+      },
+      {
+       "json": "glm_search",
+       "name": "glm_search",
+       "omit": "omitempty"
+      },
+      {
+       "json": "baidu_search",
+       "name": "baidu_search",
+       "omit": "omitempty"
+      }
+     ]
     },
     "web_fetch": {
      "kind": "struct",
@@ -1796,7 +3991,19 @@
      "name": "ToolConfig"
     }
    },
-   "name": "ToolsConfig"
+   "name": "ToolsConfig",
+   "yaml_fields": [
+    {
+     "json": "web",
+     "name": "web",
+     "omit": "omitempty"
+    },
+    {
+     "json": "skills",
+     "name": "skills",
+     "omit": "omitempty"
+    }
+   ]
   },
   "version": {
    "kind": "scalar",
@@ -1825,8 +4032,45 @@
      "omit": "omitempty"
     }
    },
-   "name": "VoiceConfig"
+   "name": "VoiceConfig",
+   "yaml_fields": [
+    {
+     "json": "model_name",
+     "name": "modelname",
+     "untagged": true
+    },
+    {
+     "json": "tts_model_name",
+     "name": "ttsmodelname",
+     "untagged": true
+    },
+    {
+     "json": "echo_transcription",
+     "name": "echotranscription",
+     "untagged": true
+    },
+    {
+     "json": "elevenlabs_api_key",
+     "name": "elevenlabsapikey",
+     "untagged": true
+    }
+   ]
   }
  },
- "name": "Config"
+ "name": "Config",
+ "yaml_fields": [
+  {
+   "json": "channel_list",
+   "name": "channel_list"
+  },
+  {
+   "json": "model_list",
+   "name": "model_list"
+  },
+  {
+   "json": "tools",
+   "name": "tools",
+   "inline": true
+  }
+ ]
 }

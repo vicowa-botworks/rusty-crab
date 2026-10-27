@@ -110,6 +110,17 @@ pub enum Error {
     /// A recognised security section whose shape is wrong -- `model_list` as a sequence
     /// where Go wants `map[string]*ModelConfig`.
     SecurityType(String),
+    /// `version` is present but is not an integer. Go's version probe unmarshals into a
+    /// typed struct, so `{"version":"3"}` is a decode error there and never reaches the
+    /// migration ladder; reading it as "no version" would run the ladder over a document
+    /// the shipped binary refuses.
+    VersionType(String),
+    /// A behaviour this crate does not implement yet, reached by real input.
+    ///
+    /// It exists so "not ported" is an answer rather than a guess: the alternative is
+    /// that an unported position emits something plausible, and a plausible wrong file
+    /// is the failure mode this whole seam is arranged to prevent.
+    NotPorted(String),
     Io(String),
 }
 
@@ -124,6 +135,8 @@ impl std::fmt::Display for Error {
             Self::UnparseableSecurity(m) | Self::SecurityType(m) => {
                 write!(f, "failed to parse security config: {m}")
             }
+            Self::VersionType(m) => write!(f, "{m}"),
+            Self::NotPorted(m) => write!(f, "not ported: {m}"),
             Self::Io(m) => write!(f, "{m}"),
         }
     }
@@ -166,15 +179,26 @@ impl Config {
 ///   environment cleared, so they are inert for every recorded case -- but a real
 ///   process is not, and this loader would silently differ from Go there.
 /// * `InitChannelList`: inferring `type` from the map key, refusing an unregistered
-///   type, and the singleton constraints.
+///   type, the singleton constraints, and -- the part the corpus actually sees -- decoding
+///   each channel's `settings` into the typed struct for that type, so the loaded value
+///   carries every field of e.g. `TelegramSettings` rather than the keys the file happened
+///   to mention. That is why four of the fifteen replayable config cases are listed in
+///   `tests/conformance.rs` as known gaps; the per-type field lists are already in the
+///   schema dump as `settings_schemas`.
 /// * `expandMultiKeyModels`: a model with two `api_keys` becomes two entries, the
 ///   second named `name__key_1`, and the copy carries only the fields the Go function
 ///   lists -- `enabled` among those it drops.
 /// * `ValidateModelList` and `ValidateTurnProfile`.
 ///
-/// The security file *is* read, because leaving it out would load a config whose
-/// secrets are in the wrong place; an unimplemented section in it is an error rather
-/// than a silent drop.
+/// The security file *is* read, because leaving it out would load a config whose secrets
+/// are in the wrong place. `channels`/`channel_list` and `model_list` are merged. The
+/// other two sections Go applies -- `web` and `skills`, which reach `tools.web` and
+/// `tools.skills` through `Tools`' `yaml:",inline"` -- are parsed and then dropped, which
+/// is a divergence and is recorded in `docs/DIVERGENCES.md`. Refusing them instead was the
+/// earlier behaviour and it was worse: every `.security.yml` the shipped binary has ever
+/// written carries both, so refusing made the loader reject the normal case. A key the
+/// struct does not name at all is ignored, because `loadSecurityConfig` calls plain
+/// `yaml.Unmarshal` and not `UnmarshalStrict`.
 ///
 /// A missing file is not an error: Go logs and returns defaults. That is why the return
 /// type is not `Option` -- the caller always gets a config, and the only ways to get an
@@ -207,7 +231,19 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         return Err(Error::Malformed(diagnostic));
     }
     let document = parsed.doc;
-    let version = document.get("version").and_then(Doc::as_i64).unwrap_or(0);
+    // The probe decodes into a typed struct, so a version that is not an integer is a
+    // decode failure, not a missing version. `unwrap_or(0)` here would silently file
+    // `{"version":"3"}` as a v0 document and run the whole migration ladder over it.
+    let version = match document.get("version") {
+        None | Some(Doc::Null) => 0,
+        Some(Doc::Int(v)) => *v,
+        Some(other) => {
+            return Err(Error::VersionType(format!(
+                "cannot unmarshal {} into Go struct field .version of type int",
+                type_word(other)
+            )))
+        }
+    };
 
     if text.len() <= TINY_DOCUMENT_MAX {
         return Ok(Config {
@@ -233,11 +269,25 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // The security file, read after the document and merged into it. Its absence is
     // normal -- a config written before the split has none -- and its presence is what
     // makes a loaded config differ from the file it came from.
+    // The security file. Absent is normal -- a config written before the split has none
+    // -- but any *other* read failure is fatal. `if let Ok(..)` here would treat EACCES
+    // or invalid UTF-8 as "no secrets file" and carry on with default secrets, which is
+    // the one place a silent fallback points the wrong way: it does not load a slightly
+    // staler config, it loads one that believes nothing is configured and then writes
+    // that belief back on the next save.
     let security_path = path.with_file_name(SECURITY_FILE);
-    if let Ok(text) = std::fs::read_to_string(&security_path) {
-        let security = yaml::parse(&text)?;
-        apply_security(&mut merged, &security)?;
+    match std::fs::read_to_string(&security_path) {
+        Ok(text) => {
+            let security = yaml::parse(&text)?;
+            apply_security(&mut merged, &security)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(format!("failed to read security config: {e}"))),
     }
+
+    // The last two stages of LoadConfig, and the reason a loaded config can carry a
+    // dm_scope the file never mentioned.
+    apply_dm_scope(&mut merged);
 
     Ok(Config {
         document: merged,
@@ -245,14 +295,113 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     })
 }
 
+/// `SessionConfig.ApplyDmScope` then `DeriveDmScope` (config.go:360 and :380).
+///
+/// They are a pair, and the order is the point: `dm_scope` expands into `dimensions`,
+/// and only if `dm_scope` was empty does `dimensions` collapse back into `dm_scope`. So
+/// a file saying `dimensions: [chat]` comes back with `dm_scope: per-channel` added, and
+/// a file saying `dm_scope: per-channel` keeps exactly what it said. Neither direction is
+/// derivable from the other, and a port that implements only one of the two produces a
+/// loaded value that differs from Go's on exactly the cases the other one covers.
+fn apply_dm_scope(document: &mut Doc) {
+    let Some(session) = document.get_mut_at("session") else {
+        return;
+    };
+    let scope = session
+        .get("dm_scope")
+        .and_then(Doc::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let dimensions: Vec<String> = session
+        .get("dimensions")
+        .and_then(Doc::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if scope.is_empty() && dimensions.is_empty() {
+        return;
+    }
+    if scope.is_empty() {
+        // DeriveDmScope: only the three known shapes, in this order. A custom array is
+        // left alone -- Go's comment says the UI handles it.
+        let derived = match dimensions
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["chat", "sender"] => Some("per-channel-peer"),
+            ["chat"] => Some("per-channel"),
+            ["sender"] => Some("per-peer"),
+            _ => None,
+        };
+        if let Some(d) = derived {
+            session.set("dm_scope", Doc::String(d.to_string()));
+        }
+        return;
+    }
+    if !dimensions.is_empty() {
+        // ApplyDmScope returns early when dimensions is already set.
+        return;
+    }
+    let expanded = match scope.as_str() {
+        "per-channel-peer" => Some(vec!["chat", "sender"]),
+        "per-channel" => Some(vec!["chat"]),
+        "per-peer" => Some(vec!["sender"]),
+        // "global" clears dimensions; anything else changes nothing.
+        "global" => Some(vec![]),
+        _ => None,
+    };
+    if let Some(items) = expanded {
+        session.set(
+            "dimensions",
+            Doc::Array(
+                items
+                    .into_iter()
+                    .map(|s| Doc::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+/// The word Go's type-error sentence uses for a JSON value.
+fn type_word(value: &Doc) -> &'static str {
+    match value {
+        Doc::String(_) => "string",
+        Doc::Bool(_) => "bool",
+        Doc::Float(_) => "float",
+        Doc::Array(_) => "array",
+        Doc::Object(_) => "object",
+        Doc::Int(_) | Doc::Null => "number",
+    }
+}
+
 /// Fills the security file's sections into a document the JSON loader already settled.
 ///
-/// Per field, not per entry: `loadSecurityConfig` decodes into a `Config` that the JSON
-/// pass has populated, so a security entry replaces the fields it names and leaves the
-/// rest of that entry alone. The unknown keys it carries are ignored -- the yaml-tagged
-/// half has no validator -- which is the asymmetry [`yaml`] documents.
+/// `loadSecurityConfig` runs `yaml.Unmarshal(data, cfg)` over the whole file, so what
+/// applies is decided by the *yaml* tags, not the json ones -- a different set, and the
+/// reason this walks [`Schema::yaml_fields`] rather than the document's keys:
+///
+/// * `channel_list` and `model_list` are the two sections with a projection of their own.
+/// * `tools` is `yaml:",inline"`, so the file's `web` and `skills` land inside `tools`.
+///   They are not optional extras: every `.security.yml` the shipped binary has written
+///   contains both, so a loader that only knew the first two refused every real file.
+/// * Anything else in the file has no yaml-tagged field to land in and is dropped. That
+///   is Go's behaviour, not a gap: the yaml half has no unknown-field validator, which is
+///   the asymmetry [`yaml`] documents.
+///
+/// Per field, not per entry: the file decodes into a `Config` the JSON pass has already
+/// populated, so an entry replaces the fields it names and leaves the rest alone.
 fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Error> {
-    if let Some(models) = &security.model_list {
+    let schema = schema::config_schema();
+
+    if let Some(models) = security.model_list() {
         // The file keys entries `name:index`; the document holds a sequence. Only the
         // entries the file mentions are touched, and a key naming an entry that is not
         // there is added, because Go's map decode creates it.
@@ -272,19 +421,44 @@ fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Err
         }
     }
 
-    if let Some(channels) = &security.channels {
-        // The channel sections merge: the file's entry is decoded into the channel that
-        // the JSON document already produced. Whichever spelling the document uses is
-        // the one the file merges into; Go's struct has one field and two tags.
-        let key = if merged.get("channel_list").is_some() {
-            "channel_list"
-        } else if merged.get("channels").is_some() {
-            "channels"
-        } else {
-            return Ok(());
+    for field in schema.yaml_fields() {
+        if field.json == "model_list" {
+            continue;
+        }
+        if field.inline {
+            // `tools`: the file's children are top level, the document's are nested.
+            let Some(inner_schema) = schema.field(field.json) else {
+                continue;
+            };
+            let Some(target) = merged.get_mut_at(field.json) else {
+                continue;
+            };
+            for child in inner_schema.yaml_fields() {
+                if let Some(value) = security.document.get(child.json) {
+                    if let Some(slot) = target.get_mut_at(child.json) {
+                        merge_filling(slot, value);
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(value) = security.document.get(field.json) else {
+            continue;
         };
-        if let Some(target) = merged.get_mut_at(key) {
-            merge_filling(target, channels);
+        // The channel section merges per entry rather than wholesale, and it answers to
+        // either spelling in the file while the document has only one.
+        if field.json == "channel_list" {
+            let source = security
+                .document
+                .get("channel_list")
+                .or_else(|| security.document.get("channels"));
+            if let (Some(source), Some(target)) = (source, merged.get_mut_at("channel_list")) {
+                merge_filling(target, source);
+            }
+            continue;
+        }
+        if let Some(target) = merged.get_mut_at(field.json) {
+            merge_filling(target, value);
         }
     }
 
@@ -317,17 +491,74 @@ fn merge_filling(base: &mut Doc, overlay: &Doc) {
     }
 }
 
-/// Writes a config the way `pkg/config.SaveConfig` does.
+/// Writes a config the way `pkg/config.SaveConfig` does: both halves, security first.
 ///
-/// Not implemented yet, and deliberately not stubbed with something plausible: the
-/// corpus's save cases are the reason this seam exists, and a stub that wrote one
-/// reasonable file would make the conformance test green on the half of the pair it
-/// happens to get right.
-pub fn save(_path: &Path, _cfg: &mut Config, _home: &str) -> Result<Vec<String>, Error> {
-    Err(Error::Io(
-        "save is not ported yet; the corpus's save cases are expected to fail until it is"
-            .to_string(),
-    ))
+/// Four things in the Go function are behaviour rather than plumbing:
+///
+/// * **The version is bumped in the value before either file is written**, so saving a
+///   migrated config upgrades it in place. `needs_version_bump` is what told the caller
+///   this was going to happen.
+/// * **`.security.yml` is written first.** If it fails, `config.json` still holds the
+///   previous content and the pair is inconsistent in the recoverable direction. Writing
+///   the JSON first fails the other way: a new config pointing at secrets that were never
+///   stored.
+/// * **Both files are 0600 and written atomically** (`fileutil.WriteFileAtomic`: temp in
+///   the same directory, then rename). A secrets file that is briefly world-readable, or
+///   briefly truncated to zero bytes, is a secrets file that has leaked or been destroyed.
+/// * **Virtual models are filtered out** of the written list. That flag is unexported and
+///   never appears in the JSON, so a document this crate loaded cannot carry it -- see the
+///   note on [`Config`].
+///
+/// Returns the bytes of each file written, in the order written, which is what
+/// [`save_is_stable`] consumes.
+pub fn save(path: &Path, cfg: &mut Config, _home: &str) -> Result<Vec<String>, Error> {
+    if cfg
+        .document
+        .get("version")
+        .and_then(Doc::as_i64)
+        .unwrap_or(0)
+        < CURRENT_VERSION
+    {
+        cfg.document.set("version", Doc::Int(CURRENT_VERSION));
+    }
+
+    let schema = schema::config_schema();
+    let security_path = path.with_file_name(SECURITY_FILE);
+    let security = yaml::write(&cfg.document, &schema)?;
+    write_atomic(&security_path, &security)?;
+
+    let document = marshal::config_file(&cfg.document, &schema)?;
+    write_atomic(path, &document)?;
+
+    Ok(vec![security, document])
+}
+
+/// `fileutil.WriteFileAtomic`: write beside the target, then rename over it.
+///
+/// The mode is set on the temp file *before* the rename, so there is no window in which
+/// the new content exists under a permissive mode -- and no window in which the target
+/// exists but is short.
+fn write_atomic(path: &Path, contents: &str) -> Result<(), Error> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+    let tmp = parent.join(format!(
+        ".{}.tmp{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, contents).map_err(|e| Error::Io(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::Io(e.to_string()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| Error::Io(e.to_string()))?;
+    Ok(())
 }
 
 /// Whether two saves of the same file produced identical bytes.
@@ -367,13 +598,205 @@ fn migrate(mut document: Doc, version: i64) -> Doc {
     document
 }
 
-/// v0 to v1: `api_key` (a string) becomes `api_keys` (a list).
+/// v0 to v1 (`migration.go:176`).
 ///
 /// The `providers` branch is *not* here, and that is the bug: the Go step converts
 /// `providers` into a `model_list` and leaves the original key in place, so the decode
 /// that follows refuses the file. Reproducing the bug means not doing the tidy thing
-/// here -- see [`BUG_PROVIDERS_SURVIVES_MIGRATION`].
+/// here -- see [`BUG_PROVIDERS_SURVIVES_MIGRATION`]. Skipping the conversion cannot make
+/// the outcome differ, because the refusal is on the surviving `providers` key either way.
 fn migrate_v0_to_v1(document: &mut Doc) {
+    migrate_legacy_agent_defaults_model(document);
+    unique_api_keys(document);
+    document.set("version", Doc::Int(1));
+}
+
+/// v1 to v2 (`migration.go:266`).
+///
+/// * A channel's `mention_only` moves to `group_trigger.mention_only` **and the old key
+///   is deleted**. Leaving it behind is not harmless: `mention_only` is not a field of
+///   `Channel`, so the validator refuses the migrated document that Go accepts.
+/// * `api_key` folds into `api_keys`, and only when the result is non-empty -- Go writes
+///   inside `if len(ss) > 0`, so an entry with neither key keeps neither key.
+/// * `enabled` is inferred, and only ever *to* `true`: an entry that already says so is
+///   skipped, one with keys becomes enabled, and the reserved `local-model` entry is
+///   enabled. Nothing sets it to `false`, so a migration never disables a model.
+///
+/// `channels` is a **map** keyed by channel name at every version below 3. Reading it as
+/// the sequence that v3 introduces is the shape error that makes this step look like a
+/// no-op on real files.
+fn migrate_v1_to_v2(document: &mut Doc) {
+    if let Some(channels) = document.get_mut_at("channels").and_then(Doc::as_object_mut) {
+        for (_, channel) in channels.iter_mut() {
+            let Some(entries) = channel.as_object_mut() else {
+                continue;
+            };
+            let position = entries.iter().position(|(k, _)| k == "mention_only");
+            let Some(position) = position else { continue };
+            let mention_only = entries.remove(position).1;
+            let mut trigger = entries
+                .iter()
+                .find(|(k, _)| k == "group_trigger")
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Doc::Object(Vec::new()));
+            match &mut trigger {
+                Doc::Object(items) => upsert(items, "mention_only", mention_only),
+                other => *other = Doc::Object(vec![("mention_only".into(), mention_only)]),
+            }
+            upsert(entries, "group_trigger", trigger);
+        }
+    }
+
+    unique_api_keys(document);
+
+    let Some(list) = document
+        .get_mut_at("model_list")
+        .and_then(Doc::as_array_mut)
+    else {
+        document.set("version", Doc::Int(2));
+        return;
+    };
+    for entry in list.iter_mut() {
+        if !entry.is_object() {
+            continue;
+        }
+        if entry.get("enabled").is_some() {
+            continue;
+        }
+        let has_keys = entry
+            .get("api_keys")
+            .and_then(Doc::as_array)
+            .is_some_and(|items| !items.is_empty());
+        if has_keys {
+            entry.set("enabled", Doc::Bool(true));
+            continue;
+        }
+        if entry.get("model_name").and_then(Doc::as_str) == Some("local-model") {
+            entry.set("enabled", Doc::Bool(true));
+        }
+    }
+    document.set("version", Doc::Int(2));
+}
+
+/// v2 to v3 (`migration.go:343`).
+///
+/// `channels` does not simply rename. Each entry gains `type` from its map key, and every
+/// key that is not one of `BaseFieldNames` is **moved** into a `settings` object -- which
+/// is the whole reason the two migrated fixture cases used to fail here: leaving
+/// `bot_token` and `allowed_user_ids` at the channel level makes the validator refuse a
+/// document the shipped binary loads. The list of keys that stay is read from the dump
+/// (`Schema::base_fields`), extracted from the same Go map this migration consults, so it
+/// cannot drift from it.
+///
+/// `bindings` is deleted outright: it has no field to land in any more, and leaving it
+/// would make the validator refuse the migrated document.
+fn migrate_v2_to_v3(document: &mut Doc) {
+    migrate_legacy_agent_defaults_model(document);
+    document.remove("bindings");
+
+    let Some(channels) = document.remove("channels") else {
+        document.set("version", Doc::Int(CURRENT_VERSION));
+        return;
+    };
+    let base: Vec<&str> = schema::config_schema()
+        .field("channel_list")
+        .and_then(Schema::elem)
+        .map(|elem| elem.base_fields().to_vec())
+        .unwrap_or_default();
+    let mut out: Vec<(String, Doc)> = Vec::new();
+    for (name, channel) in channels.as_object().cloned().unwrap_or_default() {
+        let mut channel = channel;
+        let entries = match channel.as_object_mut() {
+            Some(entries) => entries,
+            // A non-object entry is left exactly as it is, as Go's type assertion does.
+            None => {
+                out.push((name, channel));
+                continue;
+            }
+        };
+        upsert(entries, "type", Doc::String(name.clone()));
+        if entries.iter().any(|(k, _)| k == "settings") {
+            out.push((name, channel));
+            continue;
+        }
+        // Onebot's flat prefix list becomes group_trigger.prefixes, and does not overwrite
+        // prefixes the entry already declares.
+        if let Some(position) = entries
+            .iter()
+            .position(|(k, _)| k == "group_trigger_prefix")
+        {
+            let prefixes = entries.remove(position).1;
+            let mut trigger = entries
+                .iter()
+                .find(|(k, _)| k == "group_trigger")
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Doc::Object(Vec::new()));
+            let insert = match &mut trigger {
+                Doc::Object(items) => {
+                    let missing = !items.iter().any(|(k, _)| k == "prefixes");
+                    if missing {
+                        items.push(("prefixes".to_string(), prefixes.clone()));
+                    }
+                    missing
+                }
+                _ => false,
+            };
+            let _ = insert;
+            upsert(entries, "group_trigger", trigger);
+        }
+        let mut settings: Vec<(String, Doc)> = Vec::new();
+        let mut keep: Vec<(String, Doc)> = Vec::new();
+        for (key, value) in entries.drain(..) {
+            if base.contains(&key.as_str()) {
+                keep.push((key, value));
+            } else {
+                settings.push((key, value));
+            }
+        }
+        for (key, value) in keep {
+            entries.push((key, value));
+        }
+        if !settings.is_empty() {
+            entries.push(("settings".to_string(), Doc::Object(settings)));
+        }
+        out.push((name, channel));
+    }
+    document.set("channel_list", Doc::Object(out));
+    document.set("version", Doc::Int(CURRENT_VERSION));
+}
+
+/// `migrateLegacyAgentDefaultsModel` (migration.go:64): a legacy `agents.defaults.model`
+/// string becomes `model_name`, and the old key goes. It runs in the v0 step and again in
+/// the v2 step, so a document that skips versions still meets it.
+fn migrate_legacy_agent_defaults_model(document: &mut Doc) {
+    let Some(defaults) = document
+        .get_mut_at("agents")
+        .and_then(|agents| agents.as_object_mut())
+        .and_then(|entries| entries.iter_mut().find(|(k, _)| k == "defaults"))
+        .map(|(_, v)| v)
+    else {
+        return;
+    };
+    let Some(entries) = defaults.as_object_mut() else {
+        return;
+    };
+    let Some(position) = entries.iter().position(|(k, _)| k == "model") else {
+        return;
+    };
+    let model = entries.remove(position).1;
+    if !entries.iter().any(|(k, _)| k == "model_name") {
+        entries.push(("model_name".to_string(), model));
+    }
+}
+
+/// The `api_key` -> `api_keys` fold shared by the v0 and v1 steps (`toUniqueStrings`).
+///
+/// Both spellings are merged and de-duplicated, and the pair is written **only when the
+/// result is non-empty** -- so `{"api_key":""}` comes back unchanged rather than as an
+/// empty `api_keys`. Go builds the set in a map and reads it back in map order, which
+/// makes a result of two or more keys unordered in Go itself; first-seen order is used
+/// here, and a corpus case with two distinct keys would be pinning a coin flip.
+fn unique_api_keys(document: &mut Doc) {
     let Some(list) = document
         .get_mut_at("model_list")
         .and_then(Doc::as_array_mut)
@@ -381,35 +804,46 @@ fn migrate_v0_to_v1(document: &mut Doc) {
         return;
     };
     for entry in list.iter_mut() {
-        if let Some(key) = entry.remove("api_key") {
-            let keys = match key {
-                Doc::String(s) if s.is_empty() => Vec::new(),
-                Doc::String(s) => vec![Doc::String(s)],
-                Doc::Array(items) => items,
-                Doc::Null => Vec::new(),
-                other => vec![other],
-            };
-            entry.set("api_keys", Doc::Array(keys));
+        let Some(entries) = entry.as_object_mut() else {
+            continue;
+        };
+        let single = entries
+            .iter()
+            .find(|(k, _)| k == "api_key")
+            .and_then(|(_, v)| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let existing: Vec<Doc> = entries
+            .iter()
+            .find(|(k, _)| k == "api_keys")
+            .and_then(|(_, v)| v.as_array().cloned())
+            .unwrap_or_default();
+        let mut merged: Vec<Doc> = Vec::new();
+        if let Some(key) = single {
+            merged.push(Doc::String(key));
         }
+        for item in existing {
+            let keep = item.as_str().is_some_and(|s| !s.is_empty());
+            if keep && !merged.contains(&item) {
+                merged.push(item);
+            }
+        }
+        if merged.is_empty() {
+            continue;
+        }
+        if let Some(position) = entries.iter().position(|(k, _)| k == "api_key") {
+            entries.remove(position);
+        }
+        upsert(entries, "api_keys", Doc::Array(merged));
     }
 }
 
-/// v1 to v2: entries that are not objects are dropped.
-fn migrate_v1_to_v2(document: &mut Doc) {
-    if let Some(list) = document
-        .get_mut_at("model_list")
-        .and_then(Doc::as_array_mut)
-    {
-        list.retain(Doc::is_object);
+/// Sets `key` to `value` in a mapping, keeping the position it already had.
+fn upsert(entries: &mut Vec<(String, Doc)>, key: &str, value: Doc) {
+    match entries.iter_mut().find(|(k, _)| k == key) {
+        Some(slot) => slot.1 = value,
+        None => entries.push((key.to_string(), value)),
     }
-}
-
-/// v2 to v3: `channels` becomes `channel_list`, and the version is stamped.
-fn migrate_v2_to_v3(document: &mut Doc) {
-    if let Some(channels) = document.remove("channels") {
-        document.set("channel_list", channels);
-    }
-    document.set("version", Doc::Int(CURRENT_VERSION));
 }
 
 /// Fills `base` with everything `overlay` says, leaving everything it does not mention

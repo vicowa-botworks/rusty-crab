@@ -31,23 +31,37 @@
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::doc::Doc;
+use crate::schema::Schema;
 use crate::Error;
 
-/// What the loader takes out of the security file.
+/// What the loader takes out of the security file: the file, as a document.
+///
+/// It is deliberately the whole node tree and not a struct with one field per known
+/// section. `loadSecurityConfig` runs `yaml.Unmarshal(data, cfg)` over the entire file;
+/// a key with nowhere to land is dropped by the decoder, not reported. A `Security` that
+/// listed the sections it understood turned every section it did not understand into a
+/// load failure -- including `web` and `skills`, which every `.security.yml` the shipped
+/// binary has written contains.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Security {
-    /// `model_list`, as Go decodes it: a map keyed `name:index` whose entries are
-    /// `ModelConfig` values.
-    pub model_list: Option<Doc>,
-    /// The `channels` / `channel_list` node, merged rather than replaced.
-    pub channels: Option<Doc>,
+    /// The file's root mapping.
+    pub document: Doc,
 }
 
 impl Security {
-    /// Whether the file said anything at all.
+    /// The channels section, under either spelling.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.model_list.is_none() && self.channels.is_none()
+    pub fn channels(&self) -> Option<&Doc> {
+        self.document
+            .get("channel_list")
+            .or_else(|| self.document.get("channels"))
+    }
+
+    /// The `model_list` section, which is a map keyed `name:index` rather than the
+    /// sequence the JSON document uses.
+    #[must_use]
+    pub fn model_list(&self) -> Option<&Doc> {
+        self.document.get("model_list")
     }
 }
 
@@ -81,24 +95,28 @@ pub fn parse(text: &str) -> Result<Security, Error> {
         return Ok(out);
     };
 
+    let mut entries = Vec::with_capacity(mapping.len());
     for (key, value) in mapping {
-        let Some(name) = key.as_str() else {
-            continue;
+        let name = match key
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| key.as_i64().map(|i| i.to_string()))
+        {
+            Some(n) => n,
+            None => continue,
         };
-        match name {
-            "channels" | "channel_list" => out.channels = Some(to_doc(value).unwrap_or(Doc::Null)),
-            "model_list" => out.model_list = Some(decode_model_list(value)?),
-            // Every other key is either not a yaml-tagged field -- ignored, which is
-            // the asymmetry this module is about -- or a section this crate's config
-            // path does not decode yet. Dropping one silently would load a config the
-            // Go build would have changed, so it is reported.
-            other => {
-                return Err(Error::SecurityType(format!(
-                    "security section {other:?} is not implemented by this crate"
-                )))
-            }
+        // `model_list` is checked as it is read because it is the one section whose
+        // shape can be structurally wrong in a way the decoder reports rather than
+        // ignores. Everything else is kept verbatim and filtered at merge time by the
+        // yaml table, which is where "no field can hold this" gets decided -- in the
+        // same place Go decides it.
+        if name == "model_list" {
+            entries.push((name, decode_model_list(value)?));
+        } else {
+            entries.push((name, scalar_or_container(value)));
         }
     }
+    out.document = Doc::Object(entries);
 
     Ok(out)
 }
@@ -169,104 +187,392 @@ fn scalar_or_container(value: &Yaml) -> Doc {
     }
 }
 
-/// Writes the yaml-tagged half of a config.
+/// Writes the yaml-tagged half of a config, driven by the dump's yaml emission lists.
 ///
-/// `document` is the marshalled config; the sections are read out of it in the order
-/// `yaml.v3` emits them, which is not the order they appear in the JSON file.
-#[must_use]
-pub fn write(document: &Doc) -> String {
+/// The file is not "the config minus the secrets" and it is not the JSON document
+/// re-spelled: it is what `yaml.v3` writes for `Config`, which is a different projection
+/// because `Config` marks every non-secret field `yaml:"-"`. That single fact explains
+/// why there is no `version` key in the file, why a channel contributes exactly
+/// `settings`, and why `web` and `skills` are top level (`Tools` is `yaml:",inline"`).
+///
+/// Three things the writer has to get right that a generic map printer gets wrong:
+///
+/// * **Order is declaration order, not sorted.** `channel_list`, `model_list`, then the
+///   inlined `web` and `skills`. A port printing the JSON field map sorts `web` and
+///   `skills` into a different place and produces a different file with the same content.
+/// * **`omitempty` on a struct fires.** `yaml.v3`'s emptiness test recurses into struct
+///   fields, so `github,omitempty` disappears when every field inside it is zero --
+///   which is the opposite of `encoding/json`, where a struct is never empty. That is
+///   why the file has `registries` and no `github`.
+/// * **Four positions are decided by a `MarshalYAML` method**, not by their fields.
+///   `SecureModelList` writes a `name:index`-keyed map of secrets only; `Channel` writes
+///   `{settings: …}`; `SkillRegistryConfig` and `SkillsRegistriesConfig` write their own
+///   shapes. The dump flags them (`marshaler: true`) so the generic walk cannot run here
+///   and quietly produce the struct's shape instead.
+///
+/// # Errors
+///
+/// Returns [`Error::NotPorted`] for a position whose projection this crate does not
+/// implement -- today that is a channel whose `settings` block is non-empty, because the
+/// per-type settings struct that decides which of its keys are secrets is not in the
+/// dump. Refusing is the right answer: the alternative is writing a `.security.yml` that
+/// silently drops a secret, and the next load would then re-add defaults over it.
+pub fn write(document: &Doc, schema: &Schema) -> Result<String, Error> {
     let mut out = String::new();
-    for section in ["channel_list", "model_list", "web", "skills"] {
-        let Some(value) = document.get(section) else {
+    emit_fields(schema, document, 0, &mut out)?;
+    Ok(out)
+}
+
+fn emit_fields(schema: &Schema, value: &Doc, level: usize, out: &mut String) -> Result<(), Error> {
+    for (name, rendered) in struct_entries(schema, value)? {
+        emit_entry(out, &quote_key(&name), level, &rendered)?;
+    }
+    Ok(())
+}
+
+/// The emission list of a struct as `(yaml key, value)` pairs, in declaration order.
+///
+/// Two rules here are yaml.v3's and neither is encoding/json's:
+///
+/// * **`omitempty` is tested against the Go field, not against what gets written.** A
+///   `*BraveConfig` that is non-nil but whose every field is empty still appears, as
+///   `brave: {}`, while `github` -- a value struct whose fields are all zero -- vanishes.
+///   Testing the rendered result instead would drop `brave: {}` and keep whatever a
+///   projection happened to return, and the file would differ from the shipped binary's in
+///   both directions.
+/// * **An empty struct is not empty.** `Tools` is `yaml:",inline"`, and the two fields it
+///   brings in are themselves `omitempty` structs, so the emptiness test has to recurse
+///   through fields the way `reflect.Value.IsZero` does.
+fn struct_entries(schema: &Schema, value: &Doc) -> Result<Vec<(String, Rendered)>, Error> {
+    let mut entries: Vec<(String, Rendered)> = Vec::new();
+    for field in schema.yaml_fields() {
+        let Some(child_schema) = schema.field(field.json) else {
             continue;
         };
-        emit_section(&mut out, section, value);
+        let Some(child) = value.get(field.json) else {
+            continue;
+        };
+        if field.inline {
+            entries.extend(struct_entries(child_schema, child)?);
+            continue;
+        }
+        if field.omit == Some("omitempty") && yaml_is_zero(child) {
+            continue;
+        }
+        entries.push((field.name.to_string(), render(child_schema, child)?));
     }
-    out
+    Ok(entries)
 }
 
-fn emit_section(out: &mut String, key: &str, value: &Doc) {
-    out.push_str(key);
-    out.push(':');
-    match value.as_object() {
-        Some(entries) if entries.is_empty() => out.push_str(" {}\n"),
-        Some(entries) => {
-            out.push('\n');
-            for (k, v) in entries {
-                emit_entry(out, &quote_if_needed(k), 1, v);
+/// Renders one value under the schema that governs it.
+///
+/// The recursion is where the two representations meet: a `MarshalYAML` method replaces
+/// the struct's own fields with whatever it builds, a map's entries are **sorted** because
+/// `yaml.v3` writes a Go map through the same ordering `encoding/json` uses, and a struct's
+/// entries stay in declaration order because a struct is not a map.
+fn render(schema: &Schema, value: &Doc) -> Result<Rendered, Error> {
+    if schema.is_marshaler() {
+        return projection(schema, value);
+    }
+    match schema {
+        Schema::Struct { .. } => Ok(Rendered::Object(struct_entries(schema, value)?)),
+        Schema::Map { .. } => {
+            let Some(elem) = schema.elem() else {
+                return Ok(Rendered::Value(value.clone()));
+            };
+            let mut entries = value.as_object().cloned().unwrap_or_default();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, item) in entries {
+                out.push((key, render(elem, &item)?));
             }
+            Ok(Rendered::Object(out))
         }
-        None => {
-            out.push(' ');
-            out.push_str(&scalar(value));
-            out.push('\n');
+        Schema::Slice { .. } => {
+            let Some(elem) = schema.elem() else {
+                return Ok(Rendered::Value(value.clone()));
+            };
+            let mut out = Vec::new();
+            for item in value.as_array().cloned().unwrap_or_default() {
+                out.push(render(elem, &item)?);
+            }
+            Ok(Rendered::Seq(out))
         }
+        _ => Ok(Rendered::Value(value.clone())),
     }
 }
 
-fn emit_entry(out: &mut String, key: &str, depth: usize, value: &Doc) {
-    let pad = "  ".repeat(depth);
+/// Applies a `MarshalYAML` projection.
+///
+/// The shapes here mirror Go's own code, which builds an anonymous struct per case; the
+/// line references are the ones worth re-reading before changing any of them.
+fn projection(schema: &Schema, value: &Doc) -> Result<Rendered, Error> {
+    match (schema.name(), schema.is_marshaler()) {
+        // config_struct.go:345 -- map[name:index]{api_keys}, and nothing else. Every
+        // other field of ModelConfig is absent from this file because this method returns
+        // a hand-built type, not the struct. The result is a Go map, so its keys sort.
+        (Some("SecureModelList"), true) => {
+            let models = value.as_array().cloned().unwrap_or_default();
+            let keys = to_name_index(&models);
+            let mut entries: Vec<(String, Rendered)> = Vec::with_capacity(models.len());
+            for (key, model) in keys.iter().zip(&models) {
+                let mut fields = Vec::new();
+                if let Some(keys) = model.get("api_keys") {
+                    if !yaml_is_zero(keys) {
+                        fields.push(("api_keys".to_string(), Rendered::Value(keys.clone())));
+                    }
+                }
+                entries.push((key.clone(), Rendered::Object(fields)));
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(Rendered::Object(entries))
+        }
+        // config_channel.go:295 -- `{settings: <the typed settings struct>}`, and the
+        // typed struct is what decides which keys of a channel's settings are secrets.
+        // That mapping is not in the type graph -- the field's own type is RawNode -- so
+        // it comes from `channelSettingsFactory` in the dump.
+        //
+        // An unknown channel type emits `{}`, not `settings: {}`: Go's `newChannelSettings`
+        // returns nil, `GetDecoded` hands back nil, and `settings,omitempty` on a nil
+        // `any` fires. (In practice `InitChannelList` refuses an unknown type before a
+        // save can happen, so this branch is the shape, not a live path.)
+        (Some("Channel"), true) => {
+            // InitChannelList infers Type from the map key when the entry does not say
+            // one; the document reaching here has already been through that.
+            let channel_type = value
+                .get("type")
+                .and_then(Doc::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let Some(settings_schema) = schema.settings_schema(&channel_type) else {
+                return Ok(Rendered::Object(Vec::new()));
+            };
+            let settings = value
+                .get("settings")
+                .cloned()
+                .unwrap_or(Doc::Object(Vec::new()));
+            Ok(Rendered::Object(vec![(
+                "settings".to_string(),
+                render(settings_schema, &settings)?,
+            )]))
+        }
+        // config_struct.go:715 -- a map of name to `{auth_token}`, and a registry appears
+        // only when it has a name *and* a non-empty token. So the default config, which
+        // has two registries and no tokens, writes `registries: {}` -- the key survives
+        // because omitempty saw the two-entry slice, and the map inside is empty.
+        (Some("SkillsRegistriesConfig"), true) => {
+            // The Go type is a slice, but its MarshalJSON writes a map keyed by name, so
+            // a document read back from disk holds a map. Both shapes are accepted: the
+            // name is the key when there is one, and the `name` field otherwise (Go's
+            // UnmarshalJSON copies the key into Name, so the two agree).
+            let items: Vec<(String, Doc)> = match value {
+                Doc::Object(entries) => entries.clone(),
+                Doc::Array(items) => items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.get("name")
+                                .and_then(Doc::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            item.clone(),
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let mut entries: Vec<(String, Rendered)> = Vec::new();
+            for (name, item) in &items {
+                let Some(token) = item.get("auth_token") else {
+                    continue;
+                };
+                if name.is_empty() || yaml_is_zero(token) {
+                    continue;
+                }
+                entries.push((
+                    name.to_string(),
+                    Rendered::Object(vec![(
+                        "auth_token".to_string(),
+                        Rendered::Value(token.clone()),
+                    )]),
+                ));
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(Rendered::Object(entries))
+        }
+        _ => Ok(Rendered::Value(value.clone())),
+    }
+}
+
+/// A value with the projections already applied to it, so rendering does not have to
+/// re-walk the schema.
+enum Rendered {
+    Value(Doc),
+    Object(Vec<(String, Rendered)>),
+    Seq(Vec<Rendered>),
+}
+
+fn emit_entry(out: &mut String, key: &str, level: usize, value: &Rendered) -> Result<(), Error> {
+    let pad = "  ".repeat(level);
     match value {
-        Doc::Object(entries) if entries.is_empty() => {
+        Rendered::Object(entries) if entries.is_empty() => {
             out.push_str(&format!("{pad}{key}: {{}}\n"));
         }
-        Doc::Object(entries) => {
+        Rendered::Object(entries) => {
             out.push_str(&format!("{pad}{key}:\n"));
             for (k, v) in entries {
-                emit_entry(out, &quote_if_needed(k), depth + 1, v);
+                emit_entry(out, &quote_key(k), level + 1, v)?;
             }
         }
-        Doc::Array(items) if items.is_empty() => {
+        Rendered::Value(Doc::Object(entries)) if entries.is_empty() => {
+            out.push_str(&format!("{pad}{key}: {{}}\n"));
+        }
+        Rendered::Value(Doc::Object(entries)) => {
+            // A map reaching here without a schema to render it still has to sort: Go
+            // writes every map through the same ordering, whatever its element type.
+            let mut entries = entries.clone();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str(&format!("{pad}{key}:\n"));
+            for (k, v) in entries {
+                emit_entry(
+                    out,
+                    &quote_key(&scalar_text(&Doc::String(k.clone()))),
+                    level + 1,
+                    &Rendered::Value(v.clone()),
+                )?;
+            }
+        }
+        Rendered::Seq(items) if items.is_empty() => {
             out.push_str(&format!("{pad}{key}: []\n"));
         }
-        Doc::Array(items) => {
+        Rendered::Seq(items) => {
             out.push_str(&format!("{pad}{key}:\n"));
             for item in items {
-                out.push_str(&format!("{}- {}\n", "  ".repeat(depth + 1), scalar(item)));
+                emit_entry(out, "-", level + 1, item)?;
             }
         }
-        other => out.push_str(&format!("{pad}{key}: {}\n", scalar(other))),
+        Rendered::Value(Doc::Array(items)) if items.is_empty() => {
+            out.push_str(&format!("{pad}{key}: []\n"));
+        }
+        Rendered::Value(Doc::Array(items)) => {
+            out.push_str(&format!("{pad}{key}:\n"));
+            for item in items {
+                out.push_str(&format!(
+                    "{}- {}\n",
+                    "  ".repeat(level + 1),
+                    scalar_text(item)
+                ));
+            }
+        }
+        Rendered::Value(other) => out.push_str(&format!("{pad}{key}: {}\n", scalar_text(other))),
     }
+    Ok(())
 }
 
-/// yaml.v3's plain-scalar rule for the keys this file actually holds.
+/// `yaml.v3`'s `isZero`.
 ///
-/// `LongCat-Flash-Thinking:0` is emitted **unquoted**: a colon only needs quoting when
-/// it is followed by a space, and a key that is a `name:index` pair is the common case
-/// here. Quoting it anyway produces the same data and a different byte, which is exactly
-/// the kind of difference this port is graded on.
-fn quote_if_needed(key: &str) -> String {
-    let needs = key.is_empty()
-        || key.contains(": ")
-        || key.starts_with([
-            '-', '?', ':', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`',
-        ])
-        || key.ends_with(':')
-        || key.contains(" #")
-        || key.trim() != key;
-    if needs {
-        format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        key.to_string()
+/// The case that matters is the last one: a struct whose fields are all zero counts as
+/// empty, so `omitempty` removes a whole section. `encoding/json` never does this, which
+/// is why the same field can be `json:"github"` (always written) and `yaml:"github,omitempty"`
+/// (absent from a default config's security file).
+fn yaml_is_zero(value: &Doc) -> bool {
+    match value {
+        Doc::Null => true,
+        Doc::Bool(b) => !*b,
+        Doc::Int(i) => *i == 0,
+        Doc::Float(f) => *f == 0.0,
+        Doc::String(s) => s.is_empty(),
+        Doc::Array(items) => items.iter().all(yaml_is_zero),
+        Doc::Object(entries) => entries.iter().all(|(_, v)| yaml_is_zero(v)),
     }
 }
 
-fn scalar(value: &Doc) -> String {
+/// A scalar as `yaml.v3`'s emitter would write it.
+fn scalar_text(value: &Doc) -> String {
     match value {
-        Doc::String(s) => {
-            if s.is_empty() {
-                "\"\"".to_string()
-            } else if s.contains([':', '#', '\n']) || s.trim() != s {
-                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-            } else {
-                s.clone()
-            }
-        }
+        Doc::Null => "null".to_string(),
         Doc::Bool(b) => b.to_string(),
         Doc::Int(i) => i.to_string(),
         Doc::Float(f) => crate::doc::go_number(*f),
-        Doc::Null => "null".to_string(),
+        Doc::String(s) => emit_string(s),
         Doc::Array(_) | Doc::Object(_) => "{}".to_string(),
+    }
+}
+
+/// Plain style whenever it survives a re-parse, double quotes otherwise.
+///
+/// The rule that makes this a compat question rather than a style choice: a model name
+/// like `LongCat-Flash-Thinking:0` is emitted **unquoted**, because a colon only needs
+/// quoting when a space follows it. Quoting it anyway produces the same data and a
+/// different byte. The mirror case is an email address: `@` is a reserved indicator at
+/// the start of a plain scalar, so `email: @nine.testrun.org` is not YAML at all -- and
+/// a writer that produced it could not read its own output back.
+fn emit_string(s: &str) -> String {
+    if plain_is_safe(s) {
+        s.to_string()
+    } else {
+        format!(
+            "\"{}\"",
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        )
+    }
+}
+
+fn plain_is_safe(s: &str) -> bool {
+    if s.is_empty() || s.trim() != s {
+        return false;
+    }
+    let first = s.chars().next().unwrap_or(' ');
+    // yaml.v3's reserved first characters, plus the two that only matter when a space
+    // or end follows.
+    if "@`'\"{}[],&*#?|<>%".contains(first) {
+        return false;
+    }
+    if matches!(first, '-' | '!' | ':') && (s.len() <= 1 || s[1..].starts_with(' ')) {
+        return false;
+    }
+    if s.contains(": ") || s.contains(" #") || s.contains('\n') || s.contains('\t') {
+        return false;
+    }
+    // A plain scalar that reads as a number, bool, timestamp or null would come back as
+    // the wrong type, so those are quoted.
+    !reads_as_a_non_string(s)
+}
+
+fn reads_as_a_non_string(s: &str) -> bool {
+    if s.eq_ignore_ascii_case("null")
+        || s.eq_ignore_ascii_case("~")
+        || s.eq_ignore_ascii_case("true")
+        || s.eq_ignore_ascii_case("false")
+        || s.eq_ignore_ascii_case("yes")
+        || s.eq_ignore_ascii_case("no")
+        || s.eq_ignore_ascii_case("on")
+        || s.eq_ignore_ascii_case("off")
+    {
+        return true;
+    }
+    s.parse::<f64>().is_ok()
+}
+
+/// A mapping key. Same rule as a scalar, except that a key may end in `:` -- the
+/// `name:index` form is the common case in `model_list`.
+fn quote_key(key: &str) -> String {
+    // Both branches hand the key to `emit_string`, which keeps it plain when libyaml
+    // would emit it plain -- so the question is only whether anything forces quoting.
+    let forced = key.contains(": ")
+        || key.contains(" #")
+        || key.trim() != key
+        || key.is_empty()
+        || key.ends_with(':')
+        || key.starts_with([
+            '-', '?', ':', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`',
+        ]);
+    if forced {
+        emit_string(key)
+    } else {
+        key.to_string()
     }
 }
 
@@ -301,7 +607,7 @@ mod tests {
     #[test]
     fn a_map_of_entries_is_accepted() {
         let sec = parse("model_list:\n    m1:0:\n      zzz: 1\n").expect("map form loads");
-        let models = sec.model_list.expect("model_list present");
+        let models = sec.model_list().expect("model_list present");
         assert!(models.get("m1:0").is_some());
     }
 
@@ -327,40 +633,62 @@ mod tests {
                 "{key}:\n    telegram:\n      settings:\n        bot_token: 123\n"
             ))
             .expect("channels loads");
-            let channels = sec.channels.expect("section present");
+            let channels = sec.channels().expect("section present");
             assert!(channels.get("telegram").is_some(), "{key} not recognised");
         }
     }
 
     #[test]
-    fn an_unknown_section_is_reported_not_dropped() {
-        // The deliberate choice: silently ignoring a section Go would have applied is
-        // the failure this crate cannot afford, so it is loud instead.
-        let err = parse("tools:\n  exec:\n    enabled: true\n").expect_err("unknown section");
-        assert!(matches!(err, Error::SecurityType(_)), "got {err}");
+    fn an_unknown_section_is_ignored_the_way_go_ignores_it() {
+        // `loadSecurityConfig` calls plain `yaml.Unmarshal`, not `UnmarshalStrict`, so a
+        // section the struct does not name is skipped and the file still loads. Refusing
+        // it here would reject a config the shipped binary accepts, which is the one
+        // direction a compat port must not move in.
+        //
+        // `web` and `skills` are NOT in this category -- `Tools` is `yaml:",inline"`, so
+        // Go applies them -- and they are the two sections `apply_security` does not merge
+        // yet. That gap is `docs/DIVERGENCES.md`, not this test.
+        let sec = parse("tools:\n  exec:\n    enabled: true\n").expect("unknown section loads");
+        assert!(sec.channels().is_none(), "and nothing else is read");
+        assert!(sec.model_list().is_none());
+    }
+
+    /// Writes a document through the real config schema.
+    fn write_default(doc: &Doc) -> String {
+        write(doc, &crate::config_schema()).expect("write")
     }
 
     #[test]
     fn a_name_index_key_is_emitted_unquoted() {
-        // The byte-level rule the writer exists to get right.
-        let doc = from_json(r#"{"model_list":{"LongCat-Flash-Thinking:0":{}}}"#).into_doc();
-        assert_eq!(write(&doc), "model_list:\n  LongCat-Flash-Thinking:0: {}\n");
+        // The byte-level rule the writer exists to get right. The document holds the JSON
+        // sequence; the `name:index` map is what the projection makes of it.
+        let doc =
+            from_json(r#"{"model_list":[{"model_name":"LongCat-Flash-Thinking"}]}"#).into_doc();
+        assert_eq!(
+            write_default(&doc),
+            "model_list:\n  LongCat-Flash-Thinking:0: {}\n"
+        );
     }
 
     #[test]
     fn a_key_that_would_be_ambiguous_is_quoted() {
-        assert_eq!(quote_if_needed("a: b"), "\"a: b\"");
-        assert_eq!(quote_if_needed("-lead"), "\"-lead\"");
-        assert_eq!(quote_if_needed("plain:ok"), "plain:ok");
+        assert_eq!(quote_key("a: b"), "\"a: b\"");
+        assert_eq!(quote_key("plain:ok"), "plain:ok");
+        // A leading dash is only an indicator when a space follows it, so libyaml keeps
+        // `-lead` plain. Quoting it would still parse, but it would not be Go's bytes.
+        assert_eq!(quote_key("-lead"), "-lead");
+        assert_eq!(quote_key("- lead"), "\"- lead\"");
     }
 
     #[test]
     fn the_four_sections_are_written_in_order() {
+        // `enabled` is what makes each section non-zero: yaml.v3's omitempty recurses
+        // into a struct, so an all-defaults section really would be dropped.
         let doc = from_json(
-            r#"{"skills":{"registries":{}},"web":{"brave":{}},"model_list":{},"channel_list":{}}"#,
+            r#"{"channel_list":{},"model_list":[],"tools":{"web":{"enabled":true},"skills":{"enabled":true}}}"#,
         )
         .into_doc();
-        let text = write(&doc);
+        let text = write_default(&doc);
         let order: Vec<&str> = text
             .lines()
             .filter(|l| !l.starts_with(' ') && l.contains(':'))

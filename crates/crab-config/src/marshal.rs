@@ -120,7 +120,14 @@ pub fn apply_omit(document: &Doc, schema: &Schema) -> Doc {
                     // keep the data rather than silently dropping it.
                     out.push((
                         key.clone(),
-                        apply_omit(value, &Schema::Scalar { omit: None }),
+                        apply_omit(
+                            value,
+                            &Schema::Scalar {
+                                omit: None,
+                                name: None,
+                                marshaler: false,
+                            },
+                        ),
                     ));
                     continue;
                 };
