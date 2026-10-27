@@ -900,6 +900,36 @@ mod tests {
     }
 
     #[test]
+    fn a_version_that_is_not_an_integer_is_refused_by_name() {
+        // `{"version":"3"}` is the case `unwrap_or(0)` got wrong: filed as v0, the whole
+        // migration ladder ran over the document and `needs_version_bump` was set, so a
+        // config Go refuses came out looking migrated. Go's sentence names the field and
+        // the target type, because the probe decodes into a typed struct.
+        let (_dir, path) = write_temp(r#"{"version":"3"}"#);
+        let err = load(&path, "/home/oracle").expect_err("a string version must be refused");
+        assert!(matches!(err, Error::VersionType(_)), "got {err}");
+        assert_eq!(
+            err.to_string(),
+            "cannot unmarshal string into Go struct field .version of type int"
+        );
+    }
+
+    #[test]
+    fn a_negative_version_is_refused_rather_than_migrated() {
+        // The migration helpers are `if version <= N`, which makes it look as though any
+        // version below CurrentVersion migrates. It does not: `LoadConfig` dispatches on
+        // exact values -- `case 0`, `case 1`, `case 2`, `case CurrentVersion`, `default:`
+        // (config.go:1492-1511) -- so -1 never reaches the ladder and is refused. Measured
+        // rather than inferred, because the two readings disagree and only one is Go.
+        // Pinned here rather than in the corpus: the fixture has no negative-version case
+        // and adding one is Go-side work.
+        let (_dir, path) = write_temp(r#"{"version":-1,"providers":{"openai":{"api_key":"k"}}}"#);
+        let err = load(&path, "/home/oracle").expect_err("a negative version must be refused");
+        assert!(matches!(err, Error::UnsupportedVersion(-1)), "got {err}");
+        assert_eq!(err.to_string(), "unsupported config version: -1");
+    }
+
+    #[test]
     fn an_empty_document_is_refused() {
         // The other half of BUG_VERSION_PROBE_BEFORE_LENGTH: 0 bytes is a syntax error
         // and 2 bytes is defaults. A port that gets the order wrong passes this only by
