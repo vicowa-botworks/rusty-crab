@@ -214,7 +214,7 @@ fn project_scalar(schema: &Schema, stored: Option<&Doc>) -> Option<Doc> {
         // A byte holder takes the bytes as they came; a free `any` takes anything.
         _ if matches!(name, "json.RawMessage" | "RawNode" | "any") => Some(stored.clone()),
         Doc::Bool(b) => matches!(name, "bool").then(|| Doc::Bool(*b)),
-        Doc::String(s) => Some(Doc::String(s.clone())).filter(|_| !is_numeric(name)),
+        Doc::String(s) => (!is_numeric(name)).then_some(Doc::String(s.clone())),
         Doc::Int(v) if is_int_type(name) => Some(Doc::Int(*v)),
         Doc::Int(v) if is_float_type(name) => Some(Doc::Float(*v as f64)),
         Doc::Float(_) if is_int_type(name) => None,
