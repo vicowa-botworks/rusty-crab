@@ -911,6 +911,38 @@ fn merge_over(base: &mut Doc, overlay: &Doc, schema: &Schema) {
             }
             return;
         }
+        // `tools.skills.registries` is a slice that is not a JSON array. Its
+        // `MarshalJSON` writes a name-keyed map and its `UnmarshalJSON` merges each
+        // entry into the one the defaults already carry -- it clones the stored entry
+        // and decodes over the clone -- so a document that names one registry leaves the
+        // others alone *and* leaves the named entry's unstated fields at their defaults.
+        // That is the opposite of both arms below: a plain map replaces its entry whole,
+        // and anything else replaces the value.
+        let registry_elem = match schema {
+            Schema::Slice { elem, .. }
+                if matches!(
+                    **elem,
+                    Schema::Struct {
+                        name: Some("SkillRegistryConfig"),
+                        ..
+                    }
+                ) =>
+            {
+                Some(&**elem)
+            }
+            _ => None,
+        };
+        if let Some(elem) = registry_elem {
+            let overlay_entries = overlay.as_object().expect("checked").clone();
+            let base_entries = base.as_object_mut().expect("checked");
+            for (k, v) in overlay_entries {
+                match base_entries.iter_mut().find(|(bk, _)| *bk == k) {
+                    Some(slot) => merge_over(&mut slot.1, &v, elem),
+                    None => base_entries.push((k, v)),
+                }
+            }
+            return;
+        }
         // A map's entries are allocated fresh, so only the *keys* the document omits
         // come from the defaults.
         if matches!(schema, Schema::Map { .. }) {
