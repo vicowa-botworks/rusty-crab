@@ -35,7 +35,6 @@ use crab_gojson::{compact_html, indent, omit, GoMarshal, ObjectWriter};
 use crab_protocoltypes::unmarshal::{self, DecodeError};
 use crab_protocoltypes::{GoTime, Message};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -181,19 +180,21 @@ impl SessionMeta {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         // Option absorbs the `null` document, which Go unmarshals into a zeroed
         // struct without error.
-        let doc: Option<HashMap<String, Box<serde_json::value::RawValue>>> =
-            serde_json::from_slice(bytes)
-                .map_err(|e| Error::new(format!("memory: decode meta: {e}")))?;
+        // `OrderedFields`, not a map: Go's decoder walks the object in *document* order
+        // and takes the last occurrence of a repeated name, and the fold below relies on
+        // that. A `HashMap` loses the order outright; sorting the keys to make it
+        // deterministic resolves duplicate case variants (`{"key":"a","KEY":"b"}`)
+        // alphabetically where Go resolves them by position. serde_json cannot read an
+        // object into `Vec<(String, T)>` -- "invalid type: map, expected a sequence" --
+        // so the ordering is recovered in the visitor, which keeps `RawValue` rather than
+        // parsing values and so keeps `Scope`'s source bytes.
+        let doc: Option<OrderedFields> = serde_json::from_slice(bytes)
+            .map_err(|e| Error::new(format!("memory: decode meta: {e}")))?;
         let Some(doc) = doc else {
             return Ok(Self::default());
         };
-        // Sorted so a repeated key resolves the same way on every run; Go's decoder
-        // takes the last occurrence, which HashMap's insert already did.
-        let mut names: Vec<&String> = doc.keys().collect();
-        names.sort();
         let mut m = Self::default();
-        for name in names {
-            let raw = &doc[name];
+        for (name, raw) in &doc.0 {
             let name = name.as_str();
             // Case-folded like the decoder in crab-protocoltypes; unknown names
             // are ignored, which is what lets a newer file load here. A repeated
@@ -336,6 +337,12 @@ impl Store {
     /// `AddFullMessage`. Takes the message by mutable reference because Go stamps
     /// `created_at` on the caller's value before encoding it.
     pub fn add_full_message(&self, key: &str, msg: &mut Message) -> Result<()> {
+        // Go takes one `now := time.Now()` at the top of `addMsg` and stamps the
+        // message's `created_at`, the meta's `created_at` and its `updated_at` with that
+        // same instant. Three calls to `now()` produce three different nanoseconds, which
+        // the corpus clock mask hides -- so the divergence is invisible until a fixture
+        // compares two of the three, and then it is a file-byte difference.
+        let now = now();
         if is_transient_thought(msg) {
             // A thought-only assistant message is not persisted at all: no
             // history file, no meta file. `transient_thought_creates_no_files`
@@ -343,7 +350,7 @@ impl Store {
             return Ok(());
         }
         if msg.created_at.is_none() {
-            msg.created_at = Some(now());
+            msg.created_at = Some(now);
         }
 
         let (history_path, meta_path) = self.paths_for(key);
@@ -351,17 +358,22 @@ impl Store {
         // half-written line, and must not create the file either.
         let mut line = Vec::new();
         msg.marshal_go(&mut line)
-            .map_err(|e| Error::new(format!("memory: encode message: {e}")))?;
+            .map_err(|e| Error::new(format!("memory: marshal message: {e}")))?;
         line.push(b'\n');
 
         append_bytes(&history_path, &line)?;
 
         let mut meta = self.read_meta(key)?;
-        if SessionMeta::is_zero(&meta.created_at) {
-            meta.created_at = Some(now());
+        // Go's guard is `meta.Count == 0 && meta.CreatedAt.IsZero()`. The count test is
+        // not redundant with the zero test: a meta written by an older file can carry
+        // `count > 0` with no `created_at` at all, and Go leaves that at year 1 forever
+        // rather than stamping it now. `set_summary_keeps_a_hand_written_created_at`
+        // pins the sibling that genuinely has no count test.
+        if meta.count == 0 && SessionMeta::is_zero(&meta.created_at) {
+            meta.created_at = Some(now);
         }
         meta.count += 1;
-        meta.updated_at = Some(now());
+        meta.updated_at = Some(now);
         self.write_meta(&meta_path, &mut meta, key)
     }
 
@@ -375,21 +387,24 @@ impl Store {
 
     /// `SetHistory`.
     pub fn set_history(&self, key: &str, messages: &[Message]) -> Result<()> {
+        // One instant for the meta pair and every message, as Go's `now := time.Now()`
+        // at the top of `SetHistory` does.
+        let now = now();
         let history = filter_invalid_history(messages);
         let (history_path, meta_path) = self.paths_for(key);
         let mut meta = self.read_meta_file(&meta_path, key)?;
         if SessionMeta::is_zero(&meta.created_at) {
-            meta.created_at = Some(now());
+            meta.created_at = Some(now);
         }
         meta.skip = 0;
         meta.count = history.len() as i64;
-        meta.updated_at = Some(now());
+        meta.updated_at = Some(now);
         self.write_meta(&meta_path, &mut meta, key)?;
 
         let mut stamped = history;
         for msg in &mut stamped {
             if msg.created_at.is_none() {
-                msg.created_at = Some(now());
+                msg.created_at = Some(now);
             }
         }
         self.rewrite_jsonl(&history_path, &stamped)
@@ -452,13 +467,14 @@ impl Store {
 
     /// `SetSummary`.
     pub fn set_summary(&self, key: &str, summary: &str) -> Result<()> {
+        let now = now();
         let (_, meta_path) = self.paths_for(key);
         let mut meta = self.read_meta_file(&meta_path, key)?;
         if SessionMeta::is_zero(&meta.created_at) {
-            meta.created_at = Some(now());
+            meta.created_at = Some(now);
         }
         meta.summary = summary.to_string();
-        meta.updated_at = Some(now());
+        meta.updated_at = Some(now);
         self.write_meta(&meta_path, &mut meta, key)
     }
 
@@ -469,14 +485,15 @@ impl Store {
         scope: Option<Vec<u8>>,
         aliases: Option<Vec<String>>,
     ) -> Result<()> {
+        let now = now();
         let (_, meta_path) = self.paths_for(key);
         let mut meta = self.read_meta_file(&meta_path, key)?;
         meta.scope = scope;
         meta.aliases = normalize_aliases(key, aliases);
         if SessionMeta::is_zero(&meta.created_at) {
-            meta.created_at = Some(now());
+            meta.created_at = Some(now);
         }
-        meta.updated_at = Some(now());
+        meta.updated_at = Some(now);
         self.write_meta(&meta_path, &mut meta, key)
     }
 
@@ -526,7 +543,10 @@ impl Store {
         }
     }
 
-    /// `Close`. Go syncs the directory; there is no handle to close here.
+    /// `Close`. Go's `Close()` is `return nil` -- there is no handle to close here
+    /// either. The directory sync people expect from a `Close` actually happens in
+    /// `WriteFileAtomic`, after each rename, so it is already done by the time this
+    /// returns.
     pub fn close(&self) -> Result<()> {
         Ok(())
     }
@@ -643,12 +663,55 @@ impl Store {
     fn rewrite_jsonl(&self, path: &Path, messages: &[Message]) -> Result<()> {
         let history = filter_invalid_history(messages);
         let mut buf = Vec::new();
-        for msg in &history {
+        // Go numbers the failing message: `memory: marshal message %d`.
+        for (i, msg) in history.iter().enumerate() {
             msg.marshal_go(&mut buf)
-                .map_err(|e| Error::new(format!("memory: encode message: {e}")))?;
+                .map_err(|e| Error::new(format!("memory: marshal message {i}: {e}")))?;
             buf.push(b'\n');
         }
         write_atomic(path, &buf, 0o644)
+    }
+}
+
+/// A JSON object kept as a sequence of name/value pairs, in document order.
+///
+/// `serde_json`'s own map types cannot give this: `HashMap` discards order, and the
+/// `preserve_order` feature would silently reorder every map in every crate that links
+/// `serde_json` -- including `crab-gojson`, whose whole job is Go's map encoding. So the
+/// order is recovered from the `MapAccess`, which serde_json drives in source order, and
+/// values stay `RawValue` so nothing re-serialises them on the way through.
+#[derive(Debug)]
+struct OrderedFields(Vec<(String, Box<serde_json::value::RawValue>)>);
+
+impl<'de> serde::Deserialize<'de> for OrderedFields {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Vec<(String, Box<serde_json::value::RawValue>)>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut fields = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) =
+                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                {
+                    fields.push(entry);
+                }
+                Ok(fields)
+            }
+        }
+
+        deserializer.deserialize_map(Visitor).map(Self)
     }
 }
 
@@ -758,8 +821,23 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         let mut file = opts.open(&tmp)?;
         file.write_all(data)?;
         file.sync_all()?;
+        // Go calls `tmpFile.Chmod(perm)` after the sync. The create mode above is masked
+        // by the process umask -- `umask 007` would leave 0640 where Go writes 0644 -- so
+        // the mode is forced here rather than requested at create.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+        }
         drop(file);
         fs::rename(&tmp, path)?;
+        // Go reopens the directory and syncs it *after* the rename, ignoring any failure
+        // (`if dirFile, err := os.Open(dir); err == nil`). Syncing the file does not make
+        // the rename durable; this does.
+        #[cfg(unix)]
+        if let Ok(dir_file) = fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -774,10 +852,18 @@ fn append_bytes(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        // Go passes 0o644 to `os.OpenFile`. Without it the file is created 0o666 masked
+        // by the umask, so under `umask 002` the session history lands group-writable
+        // where Go's is not. Like Go, this is the create mode and so is umask-masked --
+        // only `write_atomic` forces the mode afterwards.
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o644);
+    }
+    let mut file = opts.open(path)?;
     file.write_all(data)?;
     file.sync_all()?;
     Ok(())
@@ -1468,6 +1554,186 @@ mod tests {
             old,
             "a scripted instant must survive"
         );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_new_history_file_is_not_group_writable() {
+        // Go hands `os.OpenFile` 0o644. With no mode at all the file is created
+        // 0o666 & ~umask, so under `umask 002` -- the default on many distros -- the
+        // whole session history lands group-writable where Go's is not. Asserted as
+        // "no write bit outside the owner, and no bit Go would not set" rather than as
+        // a literal 0644, because the create mode is umask-masked in Go too; the
+        // umask-independent half is the meta, and that is the child test below.
+        let dir = temp_dir("mode-jsonl");
+        let store = Store::new(&dir);
+        store.add_message("agent:main:mode", "user", "hi").unwrap();
+        let (jsonl, meta) = store.paths_for("agent:main:mode");
+
+        let jsonl_mode = mode_of(&jsonl);
+        assert_eq!(
+            jsonl_mode & 0o022,
+            0,
+            "group- or other-writable history: {jsonl_mode:o}"
+        );
+        assert_eq!(
+            jsonl_mode | 0o644,
+            0o644,
+            "bits Go never sets: {jsonl_mode:o}"
+        );
+        assert_eq!(
+            mode_of(&meta),
+            0o644,
+            "the meta is chmodded, not merely created"
+        );
+    }
+
+    #[test]
+    #[ignore = "run through the two `modes_under_umask_*` tests; needs its own process"]
+    fn umask_child() {
+        // The discriminating half, and it needs a umask the parent cannot set for one
+        // thread. The parent says which umask it applied by handing over the two modes Go
+        // would produce under it:
+        //
+        //   * the meta is chmodded *after* the write by `WriteFileAtomic`, so it is 0644
+        //     whatever the umask;
+        //   * the history file only *requests* a create mode, exactly as Go's
+        //     `os.OpenFile` does, so it follows the umask: 0644 & ~umask.
+        //
+        // Under `umask 077` the two must disagree (0600 beside 0644) -- a port that chmods
+        // both, or neither, fails here. Under `umask 002` the history file must still be
+        // 0644, which is what a missing `.mode(0o644)` breaks: 0o666 & ~002 is 0664, a
+        // group-writable session log. That second one is invisible at the ambient umask,
+        // which is why the umask is set rather than read.
+        let expect = |var: &str| -> u32 {
+            u32::from_str_radix(&std::env::var(var).unwrap(), 8)
+                .unwrap_or_else(|e| panic!("{var}: {e}"))
+        };
+        let dir = temp_dir(&format!("mode-{}", expect("CRAB_EXPECT_JSONL")));
+        let store = Store::new(&dir);
+        store.add_message("agent:main:umask", "user", "hi").unwrap();
+        let (jsonl, meta) = store.paths_for("agent:main:umask");
+        assert_eq!(
+            mode_of(&meta),
+            expect("CRAB_EXPECT_META"),
+            "the meta is chmodded, not merely created"
+        );
+        assert_eq!(
+            mode_of(&jsonl),
+            expect("CRAB_EXPECT_JSONL"),
+            "Go's OpenFile mode is umask-masked"
+        );
+    }
+
+    fn modes_under_umask(umask: &str, jsonl: &str, meta: &str) {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "umask {umask} && CRAB_EXPECT_JSONL={jsonl} CRAB_EXPECT_META={meta} exec \
+                 '{}' --ignored --exact --nocapture tests::umask_child",
+                exe.display()
+            ))
+            .output()
+            .expect("sh");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // An ignored test is *filtered out* rather than run, and a filtered-out run exits
+        // 0. Without this the child would prove nothing and the parent would pass -- which
+        // is exactly how the first version of this test passed while running zero tests.
+        assert!(
+            stdout.contains("1 passed"),
+            "umask {umask}: the child did not run the check:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "umask {umask}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn modes_under_umask_077() {
+        modes_under_umask("077", "600", "644");
+    }
+
+    #[test]
+    fn modes_under_umask_002() {
+        // The case the review reproduced: without a create mode the history file lands
+        // 0664 here, and the ambient umask on most machines is 022, where it would not.
+        modes_under_umask("002", "644", "644");
+    }
+
+    #[test]
+    fn one_instant_stamps_the_message_and_the_meta_together() {
+        // Go takes one `now` in `addMsg` and uses it for all three stamps. Three calls
+        // differ in the nanoseconds; the corpus mask hides that today, so nothing but a
+        // unit test says the port kept the single instant.
+        let dir = temp_dir("one-now");
+        let store = Store::new(&dir);
+        store.add_message("agent:main:now", "user", "hi").unwrap();
+        let (jsonl, meta) = store.paths_for("agent:main:now");
+
+        let msg: serde_json::Value = serde_json::from_str(&read(&dir, &file_name(&jsonl))).unwrap();
+        let meta_v: serde_json::Value =
+            serde_json::from_str(&read(&dir, &file_name(&meta))).unwrap();
+        let stamped = msg["created_at"].as_str().unwrap().to_string();
+        assert_eq!(
+            stamped,
+            meta_v["updated_at"].as_str().unwrap(),
+            "one instant"
+        );
+    }
+
+    #[test]
+    fn a_populated_meta_never_gets_a_created_at() {
+        // Go's guard is `meta.Count == 0 && meta.CreatedAt.IsZero()`. A meta with
+        // `count > 0` and no `created_at` therefore stays at year 1 forever; stamping it
+        // here is a file-byte difference the corpus cannot see until a write follows a
+        // raw meta, which no scripted case does yet.
+        let dir = temp_dir("count-guard");
+        let store = Store::new(&dir);
+        let (jsonl, meta_path) = store.paths_for("s1");
+        fs::write(
+            &meta_path,
+            r#"{"key":"s1","count":5,"skip":0,"created_at":"0001-01-01T00:00:00Z","updated_at":"0001-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        store.add_message("s1", "user", "hi").unwrap();
+        let meta_text = fs::read_to_string(&meta_path).unwrap();
+        assert!(
+            meta_text.contains(r#""created_at": "0001-01-01T00:00:00Z""#),
+            "Go leaves the year-1 stamp alone: {meta_text}"
+        );
+        assert!(
+            meta_text.contains(r#""count": 6"#),
+            "the count still moves: {meta_text}"
+        );
+        let _: &Path = jsonl.as_path();
+    }
+
+    #[test]
+    fn duplicate_case_variants_resolve_in_document_order() {
+        // Go's decoder walks the object in source order and takes the last occurrence.
+        // Sorting the field names to make a HashMap deterministic instead resolves
+        // `{"key":...,"KEY":...}` alphabetically, which is a different field.
+        let meta = SessionMeta::decode(br#"{"key":"first","KEY":"second"}"#).unwrap();
+        assert_eq!(meta.key, "second", "document order, not alphabetical");
+
+        let flipped = SessionMeta::decode(br#"{"KEY":"second","key":"first"}"#).unwrap();
+        assert_eq!(
+            flipped.key, "first",
+            "the same two names, reversed, flip the answer"
+        );
+    }
+
+    fn file_name(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
     }
 
     use std::io::Write;

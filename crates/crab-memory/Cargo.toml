@@ -9,8 +9,8 @@ description = "picoclaw's JSONL session store, ported from pkg/memory"
 [dependencies]
 crab-gojson = { path = "../crab-gojson" }
 crab-protocoltypes = { path = "../crab-protocoltypes" }
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 conformance = { path = "../../conformance" }
-serde.workspace = true
