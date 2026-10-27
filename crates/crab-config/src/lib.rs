@@ -566,7 +566,7 @@ fn apply_security(
                 }
                 if let Some(value) = security.document.get(child.json) {
                     if let Some(slot) = target.get_mut_at(child.json) {
-                        merge_filling(slot, value, inner_schema.field(child.json));
+                        merge_filling(slot, value, inner_schema.field(child.json), Keys::Yaml);
                     }
                 }
             }
@@ -588,7 +588,7 @@ fn apply_security(
             continue;
         }
         if let Some(target) = merged.get_mut_at(field.json) {
-            merge_filling(target, value, schema.field(field.json));
+            merge_filling(target, value, schema.field(field.json), Keys::Yaml);
         }
     }
 
@@ -853,7 +853,7 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
             let fields = config_schema
                 .settings_schema(&channel_type)
                 .or_else(|| config_schema.settings_schema(&name));
-            merge_filling(&mut merged, settings, fields);
+            merge_filling(&mut merged, settings, fields, Keys::Json);
             channel.set("settings", merged);
         }
         // Everything else in the entry is dropped, and not by a schema check: every base
@@ -890,7 +890,28 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
 /// `None` is not "no schema found", it is "this node has no schema to consult": a channel
 /// type `channelSettingsFactory` does not know decodes into `map[string]any`, which accepts
 /// every key. Callers that pass `None` therefore keep everything.
-fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
+/// Which tag family decides whether a key the security file names is readable at this node.
+///
+/// The two are not interchangeable, and the difference is a decode that happens twice:
+///
+/// * [`Keys::Yaml`] is the normal one. `.security.yml` is decoded by `yaml.v3` into typed
+///   structs, so a field tagged `yaml:"-"` is invisible to it -- which is how Go keeps a
+///   secrets file from setting `tools.web.brave.max_results` (`config.go:896`) or any of a
+///   channel's base fields. Reading the JSON list instead sets values the shipped binary
+///   silently ignores, and the user's file then says one thing and their running config
+///   another.
+/// * [`Keys::Json`] applies inside a channel's `settings`. That node is never decoded by
+///   the yaml decoder: `Channel` stores it as a `RawNode` and `InitChannelList` decodes it
+///   into the typed struct through JSON, so only `json` tags are in force there. Measured:
+///   `media_group_delay_ms` is `yaml:"-"` (`config.go:550`) and a security file still sets
+///   it to 1234, while `max_results` at the same depth in the file is dropped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keys {
+    Yaml,
+    Json,
+}
+
+fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>, keys: Keys) {
     let (Some(base_entries), Some(overlay_entries)) = (base.as_object_mut(), overlay.as_object())
     else {
         // Not an object on both sides, so there is nothing to fill: the security value
@@ -902,7 +923,13 @@ fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
     let overlay_entries = overlay_entries.clone();
     for (k, v) in &overlay_entries {
         let child = fields.and_then(|schema| schema.field(k));
-        if fields.is_some() && child.is_none() {
+        let readable = match keys {
+            Keys::Json => child.is_some(),
+            Keys::Yaml => fields
+                .map(|schema| schema.yaml_fields().iter().any(|f| f.json == *k))
+                .unwrap_or(true),
+        };
+        if fields.is_some() && !readable {
             // Not a field of the target type. Go's yaml decode has no place for it and
             // moves on; the JSON path would have refused the same key. `None` means the
             // target has no schema to consult -- a type the factory does not know, which
@@ -910,7 +937,7 @@ fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
             continue;
         }
         match base_entries.iter_mut().find(|(bk, _)| bk == k) {
-            Some(slot) => merge_filling(&mut slot.1, v, child),
+            Some(slot) => merge_filling(&mut slot.1, v, child, keys),
             None => base_entries.push((k.clone(), v.clone())),
         }
     }
