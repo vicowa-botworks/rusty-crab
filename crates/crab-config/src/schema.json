@@ -1,0 +1,1832 @@
+{
+ "kind": "struct",
+ "fields": {
+  "agents": {
+   "kind": "struct",
+   "fields": {
+    "defaults": {
+     "kind": "struct",
+     "fields": {
+      "allow_read_outside_workspace": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "context_manager": {
+       "kind": "scalar",
+       "name": "string",
+       "omit": "omitempty"
+      },
+      "context_manager_config": {
+       "kind": "scalar",
+       "name": "json.RawMessage",
+       "omit": "omitempty"
+      },
+      "context_window": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "image_model": {
+       "kind": "scalar",
+       "name": "string",
+       "omit": "omitempty"
+      },
+      "image_model_fallbacks": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string",
+       "omit": "omitempty"
+      },
+      "llm_retry_backoff_secs": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "max_llm_retries": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "max_media_size": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "max_parallel_turns": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "max_tokens": {
+       "kind": "scalar",
+       "name": "int"
+      },
+      "max_tool_iterations": {
+       "kind": "scalar",
+       "name": "int"
+      },
+      "model_fallbacks": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string",
+       "omit": "omitempty"
+      },
+      "model_name": {
+       "kind": "scalar",
+       "name": "string"
+      },
+      "provider": {
+       "kind": "scalar",
+       "name": "string"
+      },
+      "restrict_to_workspace": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "routing": {
+       "kind": "struct",
+       "fields": {
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "light_model": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "threshold": {
+         "kind": "scalar",
+         "name": "float64"
+        }
+       },
+       "name": "RoutingConfig",
+       "omit": "omitempty"
+      },
+      "split_on_marker": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "steering_mode": {
+       "kind": "scalar",
+       "name": "string",
+       "omit": "omitempty"
+      },
+      "subturn": {
+       "kind": "struct",
+       "fields": {
+        "concurrency_timeout_sec": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "default_timeout_minutes": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "default_token_budget": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "max_concurrent": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "max_depth": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "SubTurnConfig"
+      },
+      "summarize_message_threshold": {
+       "kind": "scalar",
+       "name": "int"
+      },
+      "summarize_token_percent": {
+       "kind": "scalar",
+       "name": "int"
+      },
+      "temperature": {
+       "kind": "scalar",
+       "name": "float64",
+       "omit": "omitempty"
+      },
+      "tool_feedback": {
+       "kind": "struct",
+       "fields": {
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_args_length": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "separate_messages": {
+         "kind": "scalar",
+         "name": "bool"
+        }
+       },
+       "name": "ToolFeedbackConfig",
+       "omit": "omitempty"
+      },
+      "turn_profile": {
+       "kind": "struct",
+       "fields": {
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "history": {
+         "kind": "struct",
+         "fields": {
+          "allow": {
+           "kind": "slice",
+           "elem": {
+            "kind": "scalar",
+            "name": "string"
+           },
+           "name": "[]string",
+           "omit": "omitempty"
+          },
+          "mode": {
+           "kind": "scalar",
+           "name": "string",
+           "omit": "omitempty"
+          }
+         },
+         "name": "TurnProfileBlock",
+         "omit": "omitempty"
+        },
+        "skills": {
+         "kind": "struct",
+         "fields": {
+          "allow": {
+           "kind": "slice",
+           "elem": {
+            "kind": "scalar",
+            "name": "string"
+           },
+           "name": "[]string",
+           "omit": "omitempty"
+          },
+          "mode": {
+           "kind": "scalar",
+           "name": "string",
+           "omit": "omitempty"
+          }
+         },
+         "name": "TurnProfileBlock",
+         "omit": "omitempty"
+        },
+        "system_prompt": {
+         "kind": "struct",
+         "fields": {
+          "allow": {
+           "kind": "slice",
+           "elem": {
+            "kind": "scalar",
+            "name": "string"
+           },
+           "name": "[]string",
+           "omit": "omitempty"
+          },
+          "mode": {
+           "kind": "scalar",
+           "name": "string",
+           "omit": "omitempty"
+          }
+         },
+         "name": "TurnProfileBlock",
+         "omit": "omitempty"
+        },
+        "tools": {
+         "kind": "struct",
+         "fields": {
+          "allow": {
+           "kind": "slice",
+           "elem": {
+            "kind": "scalar",
+            "name": "string"
+           },
+           "name": "[]string",
+           "omit": "omitempty"
+          },
+          "mode": {
+           "kind": "scalar",
+           "name": "string",
+           "omit": "omitempty"
+          }
+         },
+         "name": "TurnProfileBlock",
+         "omit": "omitempty"
+        }
+       },
+       "name": "TurnProfileConfig",
+       "omit": "omitempty"
+      },
+      "workspace": {
+       "kind": "scalar",
+       "name": "string"
+      }
+     },
+     "name": "AgentDefaults"
+    },
+    "dispatch": {
+     "kind": "struct",
+     "fields": {
+      "rules": {
+       "kind": "slice",
+       "elem": {
+        "kind": "struct",
+        "fields": {
+         "agent": {
+          "kind": "scalar",
+          "name": "string"
+         },
+         "name": {
+          "kind": "scalar",
+          "name": "string",
+          "omit": "omitempty"
+         },
+         "session_dimensions": {
+          "kind": "slice",
+          "elem": {
+           "kind": "scalar",
+           "name": "string"
+          },
+          "name": "[]string",
+          "omit": "omitempty"
+         },
+         "when": {
+          "kind": "struct",
+          "fields": {
+           "account": {
+            "kind": "scalar",
+            "name": "string",
+            "omit": "omitempty"
+           },
+           "channel": {
+            "kind": "scalar",
+            "name": "string",
+            "omit": "omitempty"
+           },
+           "chat": {
+            "kind": "scalar",
+            "name": "string",
+            "omit": "omitempty"
+           },
+           "mentioned": {
+            "kind": "scalar",
+            "name": "bool",
+            "omit": "omitempty"
+           },
+           "sender": {
+            "kind": "scalar",
+            "name": "string",
+            "omit": "omitempty"
+           },
+           "space": {
+            "kind": "scalar",
+            "name": "string",
+            "omit": "omitempty"
+           },
+           "topic": {
+            "kind": "scalar",
+            "name": "string",
+            "omit": "omitempty"
+           }
+          },
+          "name": "DispatchSelector"
+         }
+        },
+        "name": "DispatchRule"
+       },
+       "name": "[]DispatchRule",
+       "omit": "omitempty"
+      }
+     },
+     "name": "DispatchConfig",
+     "omit": "omitempty"
+    },
+    "list": {
+     "kind": "slice",
+     "elem": {
+      "kind": "struct",
+      "fields": {
+       "default": {
+        "kind": "scalar",
+        "name": "bool",
+        "omit": "omitempty"
+       },
+       "id": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "model": {
+        "kind": "struct",
+        "fields": {
+         "fallbacks": {
+          "kind": "slice",
+          "elem": {
+           "kind": "scalar",
+           "name": "string"
+          },
+          "name": "[]string",
+          "omit": "omitempty"
+         },
+         "primary": {
+          "kind": "scalar",
+          "name": "string",
+          "omit": "omitempty"
+         }
+        },
+        "name": "AgentModelConfig",
+        "omit": "omitempty"
+       },
+       "name": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "skills": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string",
+        "omit": "omitempty"
+       },
+       "subagents": {
+        "kind": "struct",
+        "fields": {
+         "allow_agents": {
+          "kind": "slice",
+          "elem": {
+           "kind": "scalar",
+           "name": "string"
+          },
+          "name": "[]string",
+          "omit": "omitempty"
+         },
+         "model": {
+          "kind": "struct",
+          "fields": {
+           "fallbacks": {
+            "kind": "slice",
+            "elem": {
+             "kind": "scalar",
+             "name": "string"
+            },
+            "name": "[]string",
+            "omit": "omitempty"
+           },
+           "primary": {
+            "kind": "scalar",
+            "name": "string",
+            "omit": "omitempty"
+           }
+          },
+          "name": "AgentModelConfig",
+          "omit": "omitempty"
+         }
+        },
+        "name": "SubagentsConfig",
+        "omit": "omitempty"
+       },
+       "workspace": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "AgentConfig"
+     },
+     "name": "[]AgentConfig",
+     "omit": "omitempty"
+    }
+   },
+   "name": "AgentsConfig"
+  },
+  "build_info": {
+   "kind": "struct",
+   "fields": {
+    "build_time": {
+     "kind": "scalar",
+     "name": "string"
+    },
+    "git_commit": {
+     "kind": "scalar",
+     "name": "string"
+    },
+    "go_version": {
+     "kind": "scalar",
+     "name": "string"
+    },
+    "version": {
+     "kind": "scalar",
+     "name": "string"
+    }
+   },
+   "name": "BuildInfo",
+   "omit": "omitempty"
+  },
+  "channel_list": {
+   "kind": "map",
+   "elem": {
+    "kind": "struct",
+    "fields": {
+     "allow_from": {
+      "kind": "slice",
+      "elem": {
+       "kind": "scalar",
+       "name": "string"
+      },
+      "name": "[]string",
+      "omit": "omitempty"
+     },
+     "enabled": {
+      "kind": "scalar",
+      "name": "bool"
+     },
+     "group_trigger": {
+      "kind": "struct",
+      "fields": {
+       "mention_only": {
+        "kind": "scalar",
+        "name": "bool",
+        "omit": "omitempty"
+       },
+       "prefixes": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "GroupTriggerConfig",
+      "omit": "omitempty"
+     },
+     "placeholder": {
+      "kind": "struct",
+      "fields": {
+       "enabled": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "text": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "PlaceholderConfig",
+      "omit": "omitempty"
+     },
+     "reasoning_channel_id": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "settings": {
+      "kind": "scalar",
+      "name": "json.RawMessage",
+      "omit": "omitzero"
+     },
+     "type": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "typing": {
+      "kind": "struct",
+      "fields": {
+       "enabled": {
+        "kind": "scalar",
+        "name": "bool",
+        "omit": "omitempty"
+       }
+      },
+      "name": "TypingConfig",
+      "omit": "omitempty"
+     }
+    },
+    "name": "Channel"
+   },
+   "name": "map[string]*Channel"
+  },
+  "devices": {
+   "kind": "struct",
+   "fields": {
+    "enabled": {
+     "kind": "scalar",
+     "name": "bool"
+    },
+    "monitor_usb": {
+     "kind": "scalar",
+     "name": "bool"
+    }
+   },
+   "name": "DevicesConfig"
+  },
+  "events": {
+   "kind": "struct",
+   "fields": {
+    "logging": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "exclude": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string",
+       "omit": "omitempty"
+      },
+      "include": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string",
+       "omit": "omitempty"
+      },
+      "include_payload": {
+       "kind": "scalar",
+       "name": "bool",
+       "omit": "omitempty"
+      },
+      "min_severity": {
+       "kind": "scalar",
+       "name": "string",
+       "omit": "omitempty"
+      }
+     },
+     "name": "EventLoggingConfig",
+     "omit": "omitempty"
+    }
+   },
+   "name": "EventsConfig",
+   "omit": "omitempty"
+  },
+  "evolution": {
+   "kind": "struct",
+   "fields": {
+    "cold_path_times": {
+     "kind": "slice",
+     "elem": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "name": "[]string",
+     "omit": "omitempty"
+    },
+    "cold_path_trigger": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    },
+    "enabled": {
+     "kind": "scalar",
+     "name": "bool",
+     "omit": "omitempty"
+    },
+    "min_case_count": {
+     "kind": "scalar",
+     "name": "int",
+     "omit": "omitempty"
+    },
+    "min_success_rate": {
+     "kind": "scalar",
+     "name": "float64",
+     "omit": "omitempty"
+    },
+    "min_success_ratio": {
+     "kind": "scalar",
+     "name": "float64",
+     "omit": "omitempty"
+    },
+    "min_task_count": {
+     "kind": "scalar",
+     "name": "int",
+     "omit": "omitempty"
+    },
+    "mode": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    },
+    "state_dir": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    }
+   },
+   "name": "EvolutionConfig",
+   "omit": "omitempty"
+  },
+  "gateway": {
+   "kind": "struct",
+   "fields": {
+    "host": {
+     "kind": "scalar",
+     "name": "string"
+    },
+    "hot_reload": {
+     "kind": "scalar",
+     "name": "bool"
+    },
+    "log_level": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    },
+    "port": {
+     "kind": "scalar",
+     "name": "int"
+    }
+   },
+   "name": "GatewayConfig"
+  },
+  "heartbeat": {
+   "kind": "struct",
+   "fields": {
+    "enabled": {
+     "kind": "scalar",
+     "name": "bool"
+    },
+    "interval": {
+     "kind": "scalar",
+     "name": "int"
+    }
+   },
+   "name": "HeartbeatConfig"
+  },
+  "hooks": {
+   "kind": "struct",
+   "fields": {
+    "builtins": {
+     "kind": "map",
+     "elem": {
+      "kind": "struct",
+      "fields": {
+       "config": {
+        "kind": "scalar",
+        "name": "json.RawMessage",
+        "omit": "omitempty"
+       },
+       "enabled": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "priority": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       }
+      },
+      "name": "BuiltinHookConfig"
+     },
+     "name": "map[string]BuiltinHookConfig",
+     "omit": "omitempty"
+    },
+    "defaults": {
+     "kind": "struct",
+     "fields": {
+      "approval_timeout_ms": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "interceptor_timeout_ms": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "observer_timeout_ms": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      }
+     },
+     "name": "HookDefaultsConfig",
+     "omit": "omitempty"
+    },
+    "enabled": {
+     "kind": "scalar",
+     "name": "bool"
+    },
+    "processes": {
+     "kind": "map",
+     "elem": {
+      "kind": "struct",
+      "fields": {
+       "command": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string",
+        "omit": "omitempty"
+       },
+       "dir": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       },
+       "enabled": {
+        "kind": "scalar",
+        "name": "bool"
+       },
+       "env": {
+        "kind": "map",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "map[string]string",
+        "omit": "omitempty"
+       },
+       "intercept": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string",
+        "omit": "omitempty"
+       },
+       "observe": {
+        "kind": "slice",
+        "elem": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "name": "[]string",
+        "omit": "omitempty"
+       },
+       "priority": {
+        "kind": "scalar",
+        "name": "int",
+        "omit": "omitempty"
+       },
+       "transport": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "ProcessHookConfig"
+     },
+     "name": "map[string]ProcessHookConfig",
+     "omit": "omitempty"
+    }
+   },
+   "name": "HooksConfig",
+   "omit": "omitempty"
+  },
+  "isolation": {
+   "kind": "struct",
+   "fields": {
+    "enabled": {
+     "kind": "scalar",
+     "name": "bool",
+     "omit": "omitempty"
+    },
+    "expose_paths": {
+     "kind": "slice",
+     "elem": {
+      "kind": "struct",
+      "fields": {
+       "mode": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "source": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "target": {
+        "kind": "scalar",
+        "name": "string",
+        "omit": "omitempty"
+       }
+      },
+      "name": "ExposePath"
+     },
+     "name": "[]ExposePath",
+     "omit": "omitempty"
+    }
+   },
+   "name": "IsolationConfig",
+   "omit": "omitempty"
+  },
+  "model_list": {
+   "kind": "slice",
+   "elem": {
+    "kind": "struct",
+    "fields": {
+     "api_base": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "api_keys": {
+      "kind": "slice",
+      "elem": {
+       "kind": "struct",
+       "name": "SecureString",
+       "omit": "omitzero"
+      },
+      "name": "[]*SecureString",
+      "omit": "omitzero"
+     },
+     "auth_method": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "connect_mode": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "custom_headers": {
+      "kind": "map",
+      "elem": {
+       "kind": "scalar",
+       "name": "string"
+      },
+      "name": "map[string]string",
+      "omit": "omitempty"
+     },
+     "enabled": {
+      "kind": "scalar",
+      "name": "bool",
+      "omit": "omitempty"
+     },
+     "extra_body": {
+      "kind": "map",
+      "elem": {
+       "kind": "scalar",
+       "name": "any"
+      },
+      "name": "map[string]any",
+      "omit": "omitempty"
+     },
+     "fallbacks": {
+      "kind": "slice",
+      "elem": {
+       "kind": "scalar",
+       "name": "string"
+      },
+      "name": "[]string",
+      "omit": "omitempty"
+     },
+     "max_tokens_field": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "model": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "model_name": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "provider": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "proxy": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "request_timeout": {
+      "kind": "scalar",
+      "name": "int",
+      "omit": "omitempty"
+     },
+     "rpm": {
+      "kind": "scalar",
+      "name": "int",
+      "omit": "omitempty"
+     },
+     "streaming": {
+      "kind": "struct",
+      "fields": {
+       "enabled": {
+        "kind": "scalar",
+        "name": "bool",
+        "omit": "omitempty"
+       }
+      },
+      "name": "ModelStreamingConfig",
+      "omit": "omitzero"
+     },
+     "thinking_level": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "tool_schema_transform": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "user_agent": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     },
+     "workspace": {
+      "kind": "scalar",
+      "name": "string",
+      "omit": "omitempty"
+     }
+    },
+    "name": "ModelConfig"
+   },
+   "name": "[]*ModelConfig"
+  },
+  "session": {
+   "kind": "struct",
+   "fields": {
+    "dimensions": {
+     "kind": "slice",
+     "elem": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "name": "[]string",
+     "omit": "omitempty"
+    },
+    "dm_scope": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    },
+    "identity_links": {
+     "kind": "map",
+     "elem": {
+      "kind": "slice",
+      "elem": {
+       "kind": "scalar",
+       "name": "string"
+      },
+      "name": "[]string"
+     },
+     "name": "map[string][]string",
+     "omit": "omitempty"
+    }
+   },
+   "name": "SessionConfig",
+   "omit": "omitempty"
+  },
+  "tools": {
+   "kind": "struct",
+   "fields": {
+    "allow_read_paths": {
+     "kind": "slice",
+     "elem": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "name": "[]string"
+    },
+    "allow_write_paths": {
+     "kind": "slice",
+     "elem": {
+      "kind": "scalar",
+      "name": "string"
+     },
+     "name": "[]string"
+    },
+    "append_file": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "cron": {
+     "kind": "struct",
+     "fields": {
+      "allow_command": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "command_allowed_remotes": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string"
+      },
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "exec_timeout_minutes": {
+       "kind": "scalar",
+       "name": "int"
+      }
+     },
+     "name": "CronToolsConfig"
+    },
+    "edit_file": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "exec": {
+     "kind": "struct",
+     "fields": {
+      "allow_remote": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "custom_allow_patterns": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string"
+      },
+      "custom_deny_patterns": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string"
+      },
+      "enable_deny_patterns": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "timeout_seconds": {
+       "kind": "scalar",
+       "name": "int"
+      }
+     },
+     "name": "ExecConfig"
+    },
+    "filter_min_length": {
+     "kind": "scalar",
+     "name": "int"
+    },
+    "filter_sensitive_data": {
+     "kind": "scalar",
+     "name": "bool"
+    },
+    "find_skills": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "i2c": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "install_skill": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "list_dir": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "load_image": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "mcp": {
+     "kind": "struct",
+     "fields": {
+      "discovery": {
+       "kind": "struct",
+       "fields": {
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_search_results": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "ttl": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "use_bm25": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "use_regex": {
+         "kind": "scalar",
+         "name": "bool"
+        }
+       },
+       "name": "ToolDiscoveryConfig"
+      },
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "max_inline_text_chars": {
+       "kind": "scalar",
+       "name": "int",
+       "omit": "omitempty"
+      },
+      "servers": {
+       "kind": "map",
+       "elem": {
+        "kind": "struct",
+        "fields": {
+         "args": {
+          "kind": "slice",
+          "elem": {
+           "kind": "scalar",
+           "name": "string"
+          },
+          "name": "[]string",
+          "omit": "omitempty"
+         },
+         "command": {
+          "kind": "scalar",
+          "name": "string"
+         },
+         "deferred": {
+          "kind": "scalar",
+          "name": "bool",
+          "omit": "omitempty"
+         },
+         "enabled": {
+          "kind": "scalar",
+          "name": "bool"
+         },
+         "env": {
+          "kind": "map",
+          "elem": {
+           "kind": "scalar",
+           "name": "string"
+          },
+          "name": "map[string]string",
+          "omit": "omitempty"
+         },
+         "env_file": {
+          "kind": "scalar",
+          "name": "string",
+          "omit": "omitempty"
+         },
+         "headers": {
+          "kind": "map",
+          "elem": {
+           "kind": "scalar",
+           "name": "string"
+          },
+          "name": "map[string]string",
+          "omit": "omitempty"
+         },
+         "type": {
+          "kind": "scalar",
+          "name": "string",
+          "omit": "omitempty"
+         },
+         "url": {
+          "kind": "scalar",
+          "name": "string",
+          "omit": "omitempty"
+         }
+        },
+        "name": "MCPServerConfig"
+       },
+       "name": "map[string]MCPServerConfig",
+       "omit": "omitempty"
+      }
+     },
+     "name": "MCPConfig"
+    },
+    "media_cleanup": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "interval_minutes": {
+       "kind": "scalar",
+       "name": "int"
+      },
+      "max_age_minutes": {
+       "kind": "scalar",
+       "name": "int"
+      }
+     },
+     "name": "MediaCleanupConfig"
+    },
+    "message": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "media_enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "MessageToolsConfig"
+    },
+    "read_file": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "max_read_file_size": {
+       "kind": "scalar",
+       "name": "int"
+      },
+      "mode": {
+       "kind": "scalar",
+       "name": "string"
+      }
+     },
+     "name": "ReadFileToolConfig"
+    },
+    "send_file": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "send_tts": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "serial": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "skills": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "github": {
+       "kind": "struct",
+       "fields": {
+        "base_url": {
+         "kind": "scalar",
+         "name": "string",
+         "omit": "omitempty"
+        },
+        "proxy": {
+         "kind": "scalar",
+         "name": "string",
+         "omit": "omitempty"
+        },
+        "token": {
+         "kind": "struct",
+         "name": "SecureString",
+         "omit": "omitzero"
+        }
+       },
+       "name": "SkillsGithubConfig"
+      },
+      "max_concurrent_searches": {
+       "kind": "scalar",
+       "name": "int"
+      },
+      "registries": {
+       "kind": "slice",
+       "elem": {
+        "kind": "struct",
+        "fields": {
+         "auth_token": {
+          "kind": "struct",
+          "name": "SecureString",
+          "omit": "omitzero"
+         },
+         "base_url": {
+          "kind": "scalar",
+          "name": "string"
+         },
+         "enabled": {
+          "kind": "scalar",
+          "name": "bool"
+         },
+         "name": {
+          "kind": "scalar",
+          "name": "string",
+          "omit": "omitempty"
+         }
+        },
+        "name": "SkillRegistryConfig"
+       },
+       "name": "[]*SkillRegistryConfig"
+      },
+      "search_cache": {
+       "kind": "struct",
+       "fields": {
+        "max_size": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "ttl_seconds": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "SearchCacheConfig"
+      }
+     },
+     "name": "SkillsToolsConfig"
+    },
+    "spawn": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "spawn_status": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "spi": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "subagent": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "web": {
+     "kind": "struct",
+     "fields": {
+      "baidu_search": {
+       "kind": "struct",
+       "fields": {
+        "api_key": {
+         "kind": "struct",
+         "name": "SecureString",
+         "omit": "omitzero"
+        },
+        "base_url": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "BaiduSearchConfig"
+      },
+      "brave": {
+       "kind": "struct",
+       "fields": {
+        "api_keys": {
+         "kind": "slice",
+         "elem": {
+          "kind": "struct",
+          "name": "SecureString",
+          "omit": "omitzero"
+         },
+         "name": "[]*SecureString",
+         "omit": "omitzero"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "BraveConfig"
+      },
+      "duckduckgo": {
+       "kind": "struct",
+       "fields": {
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "DuckDuckGoConfig"
+      },
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "fetch_limit_bytes": {
+       "kind": "scalar",
+       "name": "int64",
+       "omit": "omitempty"
+      },
+      "format": {
+       "kind": "scalar",
+       "name": "string",
+       "omit": "omitempty"
+      },
+      "gemini": {
+       "kind": "struct",
+       "fields": {
+        "api_key": {
+         "kind": "struct",
+         "name": "SecureString",
+         "omit": "omitzero"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "model": {
+         "kind": "scalar",
+         "name": "string"
+        }
+       },
+       "name": "GeminiSearchConfig"
+      },
+      "glm_search": {
+       "kind": "struct",
+       "fields": {
+        "api_key": {
+         "kind": "struct",
+         "name": "SecureString",
+         "omit": "omitzero"
+        },
+        "base_url": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        },
+        "search_engine": {
+         "kind": "scalar",
+         "name": "string"
+        }
+       },
+       "name": "GLMSearchConfig"
+      },
+      "kagi": {
+       "kind": "struct",
+       "fields": {
+        "api_keys": {
+         "kind": "slice",
+         "elem": {
+          "kind": "struct",
+          "name": "SecureString",
+          "omit": "omitzero"
+         },
+         "name": "[]*SecureString",
+         "omit": "omitzero"
+        },
+        "base_url": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "KagiConfig"
+      },
+      "perplexity": {
+       "kind": "struct",
+       "fields": {
+        "api_keys": {
+         "kind": "slice",
+         "elem": {
+          "kind": "struct",
+          "name": "SecureString",
+          "omit": "omitzero"
+         },
+         "name": "[]*SecureString",
+         "omit": "omitzero"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "PerplexityConfig"
+      },
+      "prefer_native": {
+       "kind": "scalar",
+       "name": "bool"
+      },
+      "private_host_whitelist": {
+       "kind": "slice",
+       "elem": {
+        "kind": "scalar",
+        "name": "string"
+       },
+       "name": "[]string",
+       "omit": "omitempty"
+      },
+      "provider": {
+       "kind": "scalar",
+       "name": "string",
+       "omit": "omitempty"
+      },
+      "proxy": {
+       "kind": "scalar",
+       "name": "string",
+       "omit": "omitempty"
+      },
+      "searxng": {
+       "kind": "struct",
+       "fields": {
+        "base_url": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "SearXNGConfig"
+      },
+      "sogou": {
+       "kind": "struct",
+       "fields": {
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "SogouConfig"
+      },
+      "tavily": {
+       "kind": "struct",
+       "fields": {
+        "api_keys": {
+         "kind": "slice",
+         "elem": {
+          "kind": "struct",
+          "name": "SecureString",
+          "omit": "omitzero"
+         },
+         "name": "[]*SecureString",
+         "omit": "omitzero"
+        },
+        "base_url": {
+         "kind": "scalar",
+         "name": "string"
+        },
+        "enabled": {
+         "kind": "scalar",
+         "name": "bool"
+        },
+        "max_results": {
+         "kind": "scalar",
+         "name": "int"
+        }
+       },
+       "name": "TavilyConfig"
+      }
+     },
+     "name": "WebToolsConfig"
+    },
+    "web_fetch": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    },
+    "write_file": {
+     "kind": "struct",
+     "fields": {
+      "enabled": {
+       "kind": "scalar",
+       "name": "bool"
+      }
+     },
+     "name": "ToolConfig"
+    }
+   },
+   "name": "ToolsConfig"
+  },
+  "version": {
+   "kind": "scalar",
+   "name": "int"
+  },
+  "voice": {
+   "kind": "struct",
+   "fields": {
+    "echo_transcription": {
+     "kind": "scalar",
+     "name": "bool"
+    },
+    "elevenlabs_api_key": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    },
+    "model_name": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    },
+    "tts_model_name": {
+     "kind": "scalar",
+     "name": "string",
+     "omit": "omitempty"
+    }
+   },
+   "name": "VoiceConfig"
+  }
+ },
+ "name": "Config"
+}

@@ -6,6 +6,7 @@ members = [
     "crates/crab-memory",
     "crates/crab-protocoltypes",
     "crates/crab-tokenizer",
+    "crates/crab-config",
 ]
 
 [workspace.package]
