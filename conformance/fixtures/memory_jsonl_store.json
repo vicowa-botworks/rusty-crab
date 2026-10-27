@@ -2,11 +2,11 @@
   "schema": "rusty-crab-conformance/1",
   "generator": "cmd/oracle",
   "source_repo": "github.com/sipeed/picoclaw",
-  "source_commit": "df0d5b5500f01b7dad2ab7f8542442fb4ae66fc1",
+  "source_commit": "49d649eac690e1c7a9d1ef788bc8140e37103d81",
   "seed": 24301,
   "seam": "pkg/memory.JSONLStore",
   "note": "input.ops is a script run against a fresh store in an empty directory; expected is {files, results}; a case that must fail adds error and still records files and results, because for a refusal the directory is the assertion. results lists only the queries that SUCCEEDED: the failing op contributes no entry, because whatever a Go call returns alongside an error is a convention about Go (a nil slice, a zero struct) and not a property of the store, so grading it would fail a correct port. files maps each file the store created to its exact contents, with any RFC3339 timestamp replaced by \u003ctime\u003e because the value is wall-clock; the timestamp format itself is pinned byte for byte by the protocoltypes fixture. A session key becomes sanitizeKey(key)+\".jsonl\" and the same stem +\".meta.json\", where sanitizeKey replaces only ':', '/' and '\\\\' with '_' and nothing else: a key with a newline in it produces a filename with a newline in it, and ':' and '/' name the same file. The .jsonl is one compact json.Marshal per message plus LF with no trailing blank line, HTML-escaped like every Go encoding; the .meta.json is json.MarshalIndent with two spaces and no trailing newline, keys in declaration order (key, summary, skip, count, created_at, updated_at), then scope and aliases only when non-empty. scope is a json.RawMessage but is not copied through untouched: MarshalIndent re-indents it to the enclosing document and re-escapes it, so a scope of {\"q\":\"\u003cb\u003e \u0026\"} comes out of the file with \\u003c and \\u0026; a stored literal null is emitted as null and is not omitted, because it is non-empty bytes; a scope that is not valid JSON is refused when the metadata is encoded. An assistant message with blank content and non-blank reasoning_content and no tool calls, media, attachments or tool_call_id is transient: it is never appended, so a session holding only one creates no files at all, and one already on disk is filtered on read. skip counts raw non-blank lines including ones that fail to decode, so a torn final line is dropped but still consumes a slot, and meta.count is that same raw count and so can exceed the number of messages GetHistory returns. A corrupt line is skipped rather than fatal, but a corrupt .meta.json is fatal to GetHistory, because the skip offset comes from it and defaulting it to zero would replay truncated history. Unknown JSON members are ignored in both files; CRLF endings and a missing final newline both read. TruncateHistory only moves the skip offset and never touches the .jsonl; Compact is the only operation that rewrites it and is a no-op when skip is 0. SetHistory filters transient thoughts, stamps any missing created_at and zeroes skip. ListSessions is driven by the .meta.json files in directory order and reports the canonical key from each, so a key with ':' is listed with its ':' even though its file uses '_'; a meta file that does not decode, or whose key is empty, is not listed, and an orphan .jsonl is invisible. Three ops put files on disk without the store writing them. write_raw and write_raw_meta replace a session's .jsonl or .meta.json by key, and resolve that key to a path by asking the store which file it maps to -- never by recomputing the sanitiser -- and they refuse a key with no session on disk rather than creating one, because a harness that manufactures the thing a case is named for cannot pin its absence. write_file drops a literal file name into the directory with no store involvement at all, which is the only way to script a state the store cannot produce: an orphan .jsonl with no metadata. Files and query results share one clock rule: a timestamp at or after the generator started is the store's own and becomes \u003ctime\u003e, an earlier one was scripted by the case and is recorded byte-exact, because the only field in a .jsonl line that ever varies is created_at and hiding it would hide RFC3339Nano fraction trimming and the local offset with it.",
-  "case_count": 79,
+  "case_count": 95,
   "cases": [
     {
       "name": "name_plain",
@@ -4105,6 +4105,1224 @@
               "aliases": null,
               "count": 1,
               "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_moves_the_alias_history",
+      "input": {
+        "ops": [
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "content": "reply",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "assistant"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          },
+          {
+            "op": "list_all"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n{\"role\":\"assistant\",\"content\":\"reply\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 2,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n{\"role\":\"assistant\",\"content\":\"reply\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 2,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"a1\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 2,
+            "value": true
+          },
+          {
+            "op": "get_meta",
+            "op_index": 3,
+            "value": {
+              "aliases": [
+                "a1"
+              ],
+              "count": 2,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          },
+          {
+            "op": "get_history",
+            "op_index": 4,
+            "value": [
+              {
+                "attachments": null,
+                "content": "from alias",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              },
+              {
+                "attachments": null,
+                "content": "reply",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "assistant",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          },
+          {
+            "op": "list_all",
+            "op_index": 5,
+            "value": [
+              "a1",
+              "s1"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_refused_when_canonical_has_content",
+      "input": {
+        "ops": [
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "content": "mine",
+            "key": "s1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          },
+          {
+            "key": "a1",
+            "op": "get_history"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"mine\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 2,
+            "value": false
+          },
+          {
+            "op": "get_meta",
+            "op_index": 3,
+            "value": {
+              "aliases": null,
+              "count": 1,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          },
+          {
+            "op": "get_history",
+            "op_index": 4,
+            "value": [
+              {
+                "attachments": null,
+                "content": "mine",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          },
+          {
+            "op": "get_history",
+            "op_index": 5,
+            "value": [
+              {
+                "attachments": null,
+                "content": "from alias",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_refused_when_canonical_has_only_a_summary",
+      "input": {
+        "ops": [
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "key": "s1",
+            "op": "set_summary",
+            "summary": "already summarised"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"already summarised\",\n  \"skip\": 0,\n  \"count\": 0,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 2,
+            "value": false
+          },
+          {
+            "op": "get_meta",
+            "op_index": 3,
+            "value": {
+              "aliases": null,
+              "count": 0,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "already summarised",
+              "updated_at": "\u003ctime\u003e"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_refused_when_alias_has_nothing",
+      "input": {
+        "ops": [
+          {
+            "content": "",
+            "name": "s1.jsonl",
+            "op": "write_file"
+          },
+          {
+            "aliases": [
+              "ghost"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "op": "list_all"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "s1.jsonl": ""
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": false
+          },
+          {
+            "op": "list_all",
+            "op_index": 2,
+            "value": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_carries_only_the_alias_summary",
+      "input": {
+        "ops": [
+          {
+            "key": "a1",
+            "op": "set_summary",
+            "summary": "alias summary"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"alias summary\",\n  \"skip\": 0,\n  \"count\": 0,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"alias summary\",\n  \"skip\": 0,\n  \"count\": 0,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"a1\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": true
+          },
+          {
+            "op": "get_meta",
+            "op_index": 2,
+            "value": {
+              "aliases": [
+                "a1"
+              ],
+              "count": 0,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "alias summary",
+              "updated_at": "\u003ctime\u003e"
+            }
+          },
+          {
+            "op": "get_history",
+            "op_index": 3,
+            "value": []
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_creates_the_canonical_session",
+      "input": {
+        "ops": [
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          },
+          {
+            "op": "list_all"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"a1\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": true
+          },
+          {
+            "op": "get_meta",
+            "op_index": 2,
+            "value": {
+              "aliases": [
+                "a1"
+              ],
+              "count": 1,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          },
+          {
+            "op": "list_all",
+            "op_index": 3,
+            "value": [
+              "a1",
+              "s1"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_reindents_the_scope_like_marshaljson",
+      "input": {
+        "ops": [
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": "{\"q\":\"\u003cb\u003e \u0026 \\\"x\\\"\"}"
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"scope\": {\n    \"q\": \"\\u003cb\\u003e \\u0026 \\\"x\\\"\"\n  },\n  \"aliases\": [\n    \"a1\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": true
+          },
+          {
+            "op": "get_meta",
+            "op_index": 2,
+            "value": {
+              "aliases": [
+                "a1"
+              ],
+              "count": 1,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": "{\n    \"q\": \"\\u003cb\\u003e \\u0026 \\\"x\\\"\"\n  }",
+              "skip": 0,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_normalizes_the_alias_list",
+      "input": {
+        "ops": [
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "a1",
+              "a1",
+              "",
+              "   ",
+              "s1",
+              "a2"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"a1\",\n    \"a2\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": true
+          },
+          {
+            "op": "get_meta",
+            "op_index": 2,
+            "value": {
+              "aliases": [
+                "a1",
+                "a2"
+              ],
+              "count": 1,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_first_alias_with_content_wins",
+      "input": {
+        "ops": [
+          {
+            "content": "one",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "content": "two",
+            "key": "a2",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "a1",
+              "a2"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          },
+          {
+            "key": "a2",
+            "op": "get_history"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"one\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "a2.jsonl": "{\"role\":\"user\",\"content\":\"two\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a2.meta.json": "{\n  \"key\": \"a2\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"one\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"a1\",\n    \"a2\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 2,
+            "value": true
+          },
+          {
+            "op": "get_history",
+            "op_index": 3,
+            "value": [
+              {
+                "attachments": null,
+                "content": "one",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          },
+          {
+            "op": "get_history",
+            "op_index": 4,
+            "value": [
+              {
+                "attachments": null,
+                "content": "two",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_skips_the_legacy_main_alias",
+      "input": {
+        "ops": [
+          {
+            "content": "shared fallback",
+            "key": "agent:main:main",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "agent:main:main",
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "agent:main:main",
+            "op": "get_history"
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          },
+          {
+            "op": "list_all"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "agent_main_main.jsonl": "{\"role\":\"user\",\"content\":\"shared fallback\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "agent_main_main.meta.json": "{\n  \"key\": \"agent:main:main\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"agent:main:main\",\n    \"a1\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 2,
+            "value": true
+          },
+          {
+            "op": "get_history",
+            "op_index": 3,
+            "value": [
+              {
+                "attachments": null,
+                "content": "shared fallback",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          },
+          {
+            "op": "get_history",
+            "op_index": 4,
+            "value": [
+              {
+                "attachments": null,
+                "content": "from alias",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          },
+          {
+            "op": "list_all",
+            "op_index": 5,
+            "value": [
+              "a1",
+              "agent:main:main",
+              "s1"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_does_not_skip_a_four_part_main_key",
+      "input": {
+        "ops": [
+          {
+            "content": "channel history",
+            "key": "agent:sales:direct:main",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "agent:sales:direct:main"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "agent_sales_direct_main.jsonl": "{\"role\":\"user\",\"content\":\"channel history\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "agent_sales_direct_main.meta.json": "{\n  \"key\": \"agent:sales:direct:main\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"channel history\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"agent:sales:direct:main\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": true
+          },
+          {
+            "op": "get_history",
+            "op_index": 2,
+            "value": [
+              {
+                "attachments": null,
+                "content": "channel history",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_skips_the_opaque_main_alias",
+      "input": {
+        "ops": [
+          {
+            "content": "shared fallback",
+            "key": "sk_v1_6d9217fe77c7f11d9cc992aabe81a2d09604e9c48babbda8fdad3791f9c19f3b",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "sk_v1_6d9217fe77c7f11d9cc992aabe81a2d09604e9c48babbda8fdad3791f9c19f3b",
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "sk_v1_6d9217fe77c7f11d9cc992aabe81a2d09604e9c48babbda8fdad3791f9c19f3b",
+            "op": "get_history"
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"sk_v1_6d9217fe77c7f11d9cc992aabe81a2d09604e9c48babbda8fdad3791f9c19f3b\",\n    \"a1\"\n  ]\n}",
+          "sk_v1_6d9217fe77c7f11d9cc992aabe81a2d09604e9c48babbda8fdad3791f9c19f3b.jsonl": "{\"role\":\"user\",\"content\":\"shared fallback\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "sk_v1_6d9217fe77c7f11d9cc992aabe81a2d09604e9c48babbda8fdad3791f9c19f3b.meta.json": "{\n  \"key\": \"sk_v1_6d9217fe77c7f11d9cc992aabe81a2d09604e9c48babbda8fdad3791f9c19f3b\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 2,
+            "value": true
+          },
+          {
+            "op": "get_history",
+            "op_index": 3,
+            "value": [
+              {
+                "attachments": null,
+                "content": "shared fallback",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          },
+          {
+            "op": "get_history",
+            "op_index": 4,
+            "value": [
+              {
+                "attachments": null,
+                "content": "from alias",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_does_not_skip_an_unrelated_opaque_key",
+      "input": {
+        "ops": [
+          {
+            "content": "channel history",
+            "key": "sk_v1_8e65cca330e372195a0efd30b9f109b65204b7cca49558a7f971b918695aa82a",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "sk_v1_8e65cca330e372195a0efd30b9f109b65204b7cca49558a7f971b918695aa82a"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"channel history\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"sk_v1_8e65cca330e372195a0efd30b9f109b65204b7cca49558a7f971b918695aa82a\"\n  ]\n}",
+          "sk_v1_8e65cca330e372195a0efd30b9f109b65204b7cca49558a7f971b918695aa82a.jsonl": "{\"role\":\"user\",\"content\":\"channel history\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "sk_v1_8e65cca330e372195a0efd30b9f109b65204b7cca49558a7f971b918695aa82a.meta.json": "{\n  \"key\": \"sk_v1_8e65cca330e372195a0efd30b9f109b65204b7cca49558a7f971b918695aa82a\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": true
+          },
+          {
+            "op": "get_history",
+            "op_index": 2,
+            "value": [
+              {
+                "attachments": null,
+                "content": "channel history",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_carries_only_the_truncated_tail",
+      "input": {
+        "ops": [
+          {
+            "content": "one",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "content": "two",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "assistant"
+          },
+          {
+            "content": "three",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "keep_last": 1,
+            "key": "a1",
+            "op": "truncate"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "a1",
+            "op": "get_meta"
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          },
+          {
+            "key": "s1",
+            "op": "get_history"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"one\",\"created_at\":\"\u003ctime\u003e\"}\n{\"role\":\"assistant\",\"content\":\"two\",\"created_at\":\"\u003ctime\u003e\"}\n{\"role\":\"user\",\"content\":\"three\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 2,\n  \"count\": 3,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"three\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"a1\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 4,
+            "value": true
+          },
+          {
+            "op": "get_meta",
+            "op_index": 5,
+            "value": {
+              "aliases": null,
+              "count": 3,
+              "created_at": "\u003ctime\u003e",
+              "key": "a1",
+              "scope": null,
+              "skip": 2,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          },
+          {
+            "op": "get_meta",
+            "op_index": 6,
+            "value": {
+              "aliases": [
+                "a1"
+              ],
+              "count": 1,
+              "created_at": "\u003ctime\u003e",
+              "key": "s1",
+              "scope": null,
+              "skip": 0,
+              "summary": "",
+              "updated_at": "\u003ctime\u003e"
+            }
+          },
+          {
+            "op": "get_history",
+            "op_index": 7,
+            "value": [
+              {
+                "attachments": null,
+                "content": "three",
+                "created_at": "\u003ctime\u003e",
+                "media": null,
+                "model_name": "",
+                "prompt_layer": "",
+                "prompt_slot": "",
+                "prompt_source": "",
+                "reasoning_content": "",
+                "role": "user",
+                "system_parts": null,
+                "tool_call_id": "",
+                "tool_calls": null
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_refused_on_a_blank_key",
+      "input": {
+        "ops": [
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "op": "list_all"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 1,
+            "value": false
+          },
+          {
+            "op": "list_all",
+            "op_index": 2,
+            "value": [
+              "a1"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "promote_alias_keeps_a_hand_written_created_at",
+      "input": {
+        "ops": [
+          {
+            "content": "",
+            "name": "s1.jsonl",
+            "op": "write_file"
+          },
+          {
+            "content": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 0,\n  \"created_at\": \"2020-01-02T03:04:05Z\",\n  \"updated_at\": \"2020-01-02T03:04:05Z\"\n}",
+            "name": "s1.meta.json",
+            "op": "write_file"
+          },
+          {
+            "content": "from alias",
+            "key": "a1",
+            "op": "add_simple",
+            "role": "user"
+          },
+          {
+            "aliases": [
+              "a1"
+            ],
+            "key": "s1",
+            "op": "promote_alias",
+            "scope": null
+          },
+          {
+            "key": "s1",
+            "op": "get_meta"
+          }
+        ]
+      },
+      "expected": {
+        "files": {
+          "a1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "a1.meta.json": "{\n  \"key\": \"a1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"\u003ctime\u003e\",\n  \"updated_at\": \"\u003ctime\u003e\"\n}",
+          "s1.jsonl": "{\"role\":\"user\",\"content\":\"from alias\",\"created_at\":\"\u003ctime\u003e\"}\n",
+          "s1.meta.json": "{\n  \"key\": \"s1\",\n  \"summary\": \"\",\n  \"skip\": 0,\n  \"count\": 1,\n  \"created_at\": \"2020-01-02T03:04:05Z\",\n  \"updated_at\": \"\u003ctime\u003e\",\n  \"aliases\": [\n    \"a1\"\n  ]\n}"
+        },
+        "results": [
+          {
+            "op": "promote_alias",
+            "op_index": 3,
+            "value": true
+          },
+          {
+            "op": "get_meta",
+            "op_index": 4,
+            "value": {
+              "aliases": [
+                "a1"
+              ],
+              "count": 1,
+              "created_at": {
+                "nanos": 0,
+                "offset_seconds": 0,
+                "unix_seconds": 1577934245
+              },
               "key": "s1",
               "scope": null,
               "skip": 0,

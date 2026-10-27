@@ -3,7 +3,7 @@
 //! This is the on-disk half of the port that users notice: a session file written
 //! by picoclaw's Go build has to be readable by this one, and a file written here
 //! has to be readable by Go. `conformance/fixtures/memory_jsonl_store.json` pins
-//! that -- 78 scripts of store calls whose expectation is the *directory* left
+//! that -- 95 scripts of store calls whose expectation is the *directory* left
 //! behind, every file's exact bytes plus every query's result.
 //!
 //! Three things about the Go store are load-bearing and none of them are obvious
@@ -23,13 +23,21 @@
 //!   enclosing document, so `{"chat":  1}` lands as `"chat": 1` with `\u003c` for
 //!   `<` and its members at four spaces under a two-space meta. See
 //!   [`crab_gojson::indent`].
+//! * **Promotion takes the alias's numbers, not the canonical's.**
+//!   [`Store::promote_alias_history`] sets `count` from the *alias history's* length
+//!   and `skip` to 0, while reading the alias from its *own* `skip` -- so a
+//!   truncated alias contributes its retained tail and nothing more. It is also the
+//!   only op that refuses based on what the destination already holds, and a summary
+//!   alone counts as content there.
 //!
 //! Concurrency is the one deliberate simplification. Go guards each session with
 //! one of 64 read-write locks and the directory listing with a mutex; this module
 //! is single-threaded and takes no lock, because the conformance harness runs one
 //! script at a time. A runtime that shares a [`Store`] across threads needs the
 //! locks added back -- the file-level atomicity (`write` then `rename`) is
-//! implemented, the in-process exclusion is not.
+//! implemented, the in-process exclusion is not. Promotion is the op that will want
+//! them most: Go takes both keys at once with `lockSessionPair`, in key order to
+//! avoid inverting against a concurrent promotion in the other direction.
 
 use crab_gojson::{compact_html, indent, omit, GoMarshal, ObjectWriter};
 use crab_protocoltypes::unmarshal::{self, DecodeError};
@@ -497,6 +505,151 @@ impl Store {
         self.write_meta(&meta_path, &mut meta, key)
     }
 
+    /// `PromoteAliasHistory`.
+    ///
+    /// The only op that moves a history from one session key to another: an empty
+    /// canonical session adopts the history of the first of its aliases that has
+    /// any. The `bool` is the answer to "did it promote", and `false` with no error
+    /// is a normal outcome -- the corpus records it as a query value because
+    /// "refused" and "errored" are different expectations that the directory alone
+    /// cannot always separate.
+    ///
+    /// Go guards the pair with `lockSessionPair`. This crate takes no lock at all
+    /// (module comment), so the pair-lock is as unimplemented as every other lock
+    /// here rather than being the one place a mutex appears.
+    pub fn promote_alias_history(
+        &self,
+        session_key: &str,
+        scope: Option<Vec<u8>>,
+        aliases: Option<Vec<String>>,
+    ) -> Result<bool> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return Ok(false);
+        }
+
+        // Normalized before the loop, which is what makes two things in the helper
+        // redundant rather than load-bearing: the second `normalize_aliases` on the
+        // stored list (idempotent), and the unconditional summary assignment (a
+        // canonical with a summary is refused before the assignment is reached).
+        // Both were injected as faults and both regenerate byte-identical.
+        let Some(aliases) = normalize_aliases(session_key, aliases) else {
+            return Ok(false);
+        };
+        for alias in &aliases {
+            if is_main_session_alias(alias) {
+                continue;
+            }
+            match self.promote_alias_history_locked(session_key, alias, scope.as_deref(), &aliases)
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
+    }
+
+    /// `promoteAliasHistoryLocked`. The order of the two writes is Go's: the
+    /// history is rewritten first, then the meta, and a meta failure rolls the
+    /// history back to its exact previous bytes.
+    fn promote_alias_history_locked(
+        &self,
+        session_key: &str,
+        alias: &str,
+        scope: Option<&[u8]>,
+        aliases: &[String],
+    ) -> Result<bool> {
+        let mut canonical_meta = self.read_meta(session_key)?;
+        if self.session_has_visible_content(session_key, &canonical_meta)? {
+            return Ok(false);
+        }
+
+        let alias_meta = self.read_meta(alias)?;
+        // From the alias's own `skip`: promotion moves the *retained tail* of a
+        // truncated alias, and resurrecting already-summarised messages into the
+        // canonical history is the divergence this line prevents.
+        let (alias_history_path, _) = self.paths_for(alias);
+        let alias_history = self.read_messages(&alias_history_path, alias_meta.skip)?;
+        let alias_summary = alias_meta.summary.trim().to_string();
+        if alias_history.is_empty() && alias_summary.is_empty() {
+            return Ok(false);
+        }
+
+        let (previous_jsonl, had_previous_jsonl) = self.read_raw_jsonl(session_key)?;
+
+        // One instant for both stamps, as Go's single `now := time.Now()` does.
+        // `created_at` is guarded by the zero test alone -- no count test, so this
+        // is the `set_summary` family, not `add_message`'s.
+        let now = now();
+        if SessionMeta::is_zero(&canonical_meta.created_at) {
+            canonical_meta.created_at = Some(now);
+        }
+        canonical_meta.scope = scope.map(<[u8]>::to_vec);
+        canonical_meta.aliases = normalize_aliases(session_key, Some(aliases.to_vec()));
+        canonical_meta.skip = 0;
+        canonical_meta.count = alias_history.len() as i64;
+        canonical_meta.updated_at = Some(now);
+        if !alias_summary.is_empty() {
+            canonical_meta.summary = alias_summary;
+        }
+
+        let (history_path, meta_path) = self.paths_for(session_key);
+        self.rewrite_jsonl(&history_path, &alias_history)?;
+        if let Err(e) = self.write_meta(&meta_path, &mut canonical_meta, session_key) {
+            // Fidelity, not coverage: this rollback cannot be reached through the
+            // public API, because every way of making `write_meta` refuse makes the
+            // `read_meta` at the top of this function refuse first. The corpus says
+            // so on the `promote_alias` cases rather than leaving the gap silent.
+            if let Err(rollback) =
+                self.restore_raw_jsonl(session_key, &previous_jsonl, had_previous_jsonl)
+            {
+                return Err(Error::new(format!(
+                    "memory: write promoted meta: {e} (rollback jsonl: {rollback})"
+                )));
+            }
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// `sessionHasVisibleContentLocked`. A summary counts as content even with zero
+    /// messages, which is why `promote_alias_refused_when_canonical_has_only_a_summary`
+    /// exists.
+    fn session_has_visible_content(&self, key: &str, meta: &SessionMeta) -> Result<bool> {
+        if !meta.summary.trim().is_empty() {
+            return Ok(true);
+        }
+        let (history_path, _) = self.paths_for(key);
+        Ok(!self.read_messages(&history_path, meta.skip)?.is_empty())
+    }
+
+    /// `readRawJSONL`: the file's exact bytes, plus whether it was there at all.
+    /// The second half matters -- rolling back a session that had no history file
+    /// means removing it, not writing an empty one.
+    fn read_raw_jsonl(&self, key: &str) -> Result<(Vec<u8>, bool)> {
+        let (history_path, _) = self.paths_for(key);
+        match fs::read(&history_path) {
+            Ok(data) => Ok((data, true)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Vec::new(), false)),
+            Err(e) => Err(Error::new(format!("memory: read jsonl: {e}"))),
+        }
+    }
+
+    /// `restoreRawJSONL`. The exact previous bytes, not a re-encode.
+    fn restore_raw_jsonl(&self, key: &str, data: &[u8], existed: bool) -> Result<()> {
+        let (history_path, _) = self.paths_for(key);
+        if !existed {
+            return match fs::remove_file(&history_path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(Error::new(format!("memory: remove jsonl rollback: {e}"))),
+            };
+        }
+        write_atomic(&history_path, data, 0o644)
+            .map_err(|e| Error::new(format!("memory: restore jsonl rollback: {e}")))
+    }
+
     /// `GetSessionMeta`.
     pub fn get_session_meta(&self, key: &str) -> Result<SessionMeta> {
         let (_, meta_path) = self.paths_for(key);
@@ -762,6 +915,51 @@ pub fn filter_invalid_history(messages: &[Message]) -> Vec<Message> {
 
 /// `normalizeAliases`: trim each alias, drop the blanks and the duplicates, and
 /// collapse an empty result to nil so `omitempty` hides the field.
+/// `isMainSessionAlias`. Two shapes name the shared fallback session: the legacy
+/// `agent:<agent>:main`, and the opaque `sk_v1_<sha256>` of exactly that string for
+/// three capitalisations of `main`.
+///
+/// The part count is the load-bearing half. `agent:sales:main` *is* a fallback and
+/// must never be swallowed into a per-channel session; `agent:sales:direct:main`
+/// only looks like one and must still promote. Go expresses this as
+/// `len(strings.SplitN(alias, ":", 4)) == 3`, which is exactly two colons in the
+/// whole key -- so `agent::main` matches too, odd as that reads. Both directions
+/// are pinned by the corpus, because a one-sided case cannot tell "filter missing"
+/// from "filter too broad".
+fn is_main_session_alias(alias: &str) -> bool {
+    if alias.is_empty() {
+        return false;
+    }
+    if alias.starts_with("agent:") && alias.ends_with(":main") && alias.matches(':').count() == 2 {
+        return true;
+    }
+    // Matched by digest, not by shape: a port that hashes the wrong string fails
+    // in only one direction, so `promote_alias_skips_the_opaque_main_alias` and
+    // `promote_alias_does_not_skip_an_unrelated_opaque_key` pin it from both sides.
+    if alias.starts_with("sk_v1_") {
+        for agent_id in ["main", "Main", "MAIN"] {
+            if opaque_main_alias(agent_id) == alias {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `"sk_v1_"` plus the lowercase hex SHA-256 of `agent:<agent_id>:main`, the form
+/// picoclaw writes when it stopped putting the agent id in the key in the clear.
+fn opaque_main_alias(agent_id: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(format!("agent:{agent_id}:main").as_bytes());
+    let mut hex = String::with_capacity(6 + 64);
+    hex.push_str("sk_v1_");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 fn normalize_aliases(canonical: &str, aliases: Option<Vec<String>>) -> Option<Vec<String>> {
     let list = aliases?;
     if list.is_empty() {
@@ -1479,6 +1677,39 @@ mod tests {
             .unwrap();
         assert_eq!(store.get_session_meta("s2").unwrap().aliases, None);
         assert!(!read(&dir, "s2.meta.json").contains("aliases"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The meta-failure rollback is unreachable through the public API -- every way
+    /// of making `write_meta` refuse makes the `read_meta` at the top of
+    /// `promote_alias_history_locked` refuse first -- so the corpus cannot pin it and
+    /// says so on the `promote_alias` cases. These assertions are the reason the code
+    /// is tested rather than dead: "there was no history file" and "there was an
+    /// empty one" are the distinction a naive port collapses, and collapsing it
+    /// deletes a session's history instead of restoring it.
+    #[test]
+    fn the_rollback_distinguishes_absent_from_empty() {
+        let dir = temp_dir("rollback");
+        let store = Store::new(&dir);
+
+        let (bytes, existed) = store.read_raw_jsonl("s1").unwrap();
+        assert!(!existed, "a fresh session has no history file");
+        assert!(bytes.is_empty());
+        store.restore_raw_jsonl("s1", &bytes, existed).unwrap();
+        assert!(
+            !dir.join("s1.jsonl").exists(),
+            "rolling back an absent file must not create one"
+        );
+
+        // A session that had one gets its exact bytes back, torn line included: the
+        // rollback restores what was on disk, not a re-encode of what parsed.
+        let torn = "{\"role\":\"user\"}\nnot json\n";
+        fs::write(dir.join("s1.jsonl"), torn).unwrap();
+        let (bytes, existed) = store.read_raw_jsonl("s1").unwrap();
+        assert!(existed);
+        fs::write(dir.join("s1.jsonl"), "overwritten").unwrap();
+        store.restore_raw_jsonl("s1", &bytes, existed).unwrap();
+        assert_eq!(read(&dir, "s1.jsonl"), torn, "byte for byte");
         fs::remove_dir_all(&dir).ok();
     }
 
