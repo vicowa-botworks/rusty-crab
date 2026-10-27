@@ -40,6 +40,7 @@ mod defaults;
 mod doc;
 mod marshal;
 mod schema;
+mod skills;
 mod yaml;
 
 pub use defaults::{assert_table_shape, default_config, BUILTIN_MODEL_COUNT, TOP_LEVEL_KEYS};
@@ -445,6 +446,10 @@ fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Err
                 continue;
             };
             for child in inner_schema.yaml_fields() {
+                if child.json == "skills" {
+                    // Two passes of its own, neither of them a merge: see [`skills`].
+                    continue;
+                }
                 if let Some(value) = security.document.get(child.json) {
                     if let Some(slot) = target.get_mut_at(child.json) {
                         merge_filling(slot, value);
@@ -472,6 +477,8 @@ fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Err
             merge_filling(target, value);
         }
     }
+
+    skills::apply(merged, security);
 
     Ok(())
 }
