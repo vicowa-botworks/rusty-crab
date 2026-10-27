@@ -240,18 +240,20 @@ fn is_go_zero(schema: &Schema, value: &Doc) -> bool {
     }
 }
 
-/// The config file's bytes: `json.MarshalIndent(cfg, "", "  ")` plus the trailing
-/// newline `SaveConfig` writes.
+/// The config file's bytes: exactly `json.MarshalIndent(cfg, "", "  ")`, and nothing
+/// more. `SaveConfig` hands those bytes straight to `fileutil.WriteFileAtomic`, so there
+/// is no trailing newline -- unlike the `.security.yml`, where `yaml.Marshal` does end
+/// its output with one. A port that "helpfully" terminates the file leaves every saved
+/// config one byte longer than the shipped binary's, and the next load's recorded bytes
+/// never match.
 ///
 /// The omit rules are applied here rather than by the caller, because in Go they are
 /// not a step anyone can skip — they are the marshaller.
 pub fn config_file(document: &Doc, schema: &Schema) -> Result<String, crate::Error> {
     let marshalled = apply_session_shadow(apply_omit(document, schema));
-    let mut text = marshalled
+    marshalled
         .to_indented_json()
-        .map_err(|e| crate::Error::Io(e.to_string()))?;
-    text.push('\n');
-    Ok(text)
+        .map_err(|e| crate::Error::Io(e.to_string()))
 }
 
 /// The loaded value: the same marshal, compact.
@@ -351,15 +353,23 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_indented_with_two_spaces_and_a_trailing_newline() {
+    fn the_file_is_indented_with_two_spaces_and_no_trailing_newline() {
         let schema = config_schema();
         let document = doc(r#"{"version":3,"isolation":{}}"#);
         let text = config_file(&document, &schema).expect("marshals");
         assert!(text.starts_with("{\n  \"version\": 3,\n"), "got {text:?}");
+        // `SaveConfig` writes `data, err := json.MarshalIndent(cfg, "", "  ")` straight to
+        // `os.WriteFile`, and `MarshalIndent` appends nothing. This test used to assert the
+        // opposite -- a newline is what a writer author from habit adds, and nothing in the
+        // corpus said otherwise until a case recorded a whole file byte for byte. Every
+        // config.json the shipped binary has written is one byte shorter than this crate
+        // used to produce, which matters because `MakeBackup` copies the file and a
+        // round-trip through a port that pads is not byte-stable.
         assert!(
-            text.ends_with("}\n"),
-            "SaveConfig writes a trailing newline"
+            !text.ends_with('\n'),
+            "Go writes no trailing newline: {text:?}"
         );
+        assert!(text.ends_with('}'), "got {text:?}");
     }
 
     #[test]

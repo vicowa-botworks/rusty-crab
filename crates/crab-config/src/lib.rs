@@ -39,6 +39,7 @@ mod channels;
 mod defaults;
 mod doc;
 mod marshal;
+mod multikey;
 mod schema;
 mod skills;
 mod yaml;
@@ -49,7 +50,8 @@ pub use marshal::{apply_omit, apply_session_shadow, config_file, loaded_value};
 pub use schema::{config_schema, unknown_fields, validate_against, Schema};
 pub use yaml::{parse as parse_security, to_name_index, write as write_security, Security};
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// The config schema version this build writes and migrates up to.
 ///
@@ -160,6 +162,13 @@ pub struct Config {
     /// decides whether a save raises it. Go's `SaveConfig` mutates the struct it is
     /// handed, so the loaded value and the saved file disagree on purpose.
     pub needs_version_bump: bool,
+    /// Positions in `model_list` that `expandMultiKeyModels` created, the port's version
+    /// of Go's per-entry `isVirtual` flag. `SaveConfig` drops exactly these, so the file
+    /// keeps one entry per model while the loaded value carries one per key.
+    ///
+    /// It lives here rather than in the document because a marker key would be a field
+    /// the schema does not have, and the loader's own validator refuses those.
+    pub virtual_models: Vec<usize>,
 }
 
 impl Config {
@@ -177,24 +186,28 @@ impl Config {
 ///
 /// ## What this loader does not do yet
 ///
-/// The Go loader is a long pipeline and this crate implements the front of it. Four
-/// stages are deliberately absent, and a caller must know that rather than assume the
-/// load is complete:
+/// The whole fixture replays byte for byte, which is a stronger claim than "the stages
+/// are ported" and a weaker one than "the loader is complete". What is missing below is
+/// missing because **no recorded case reaches it**, not because it was measured and found
+/// equal -- so a green replay says nothing about any of it:
 ///
-/// * `env.Parse` and the `PICOCLAW_*` compat shims. The corpus runs with that
-///   environment cleared, so they are inert for every recorded case -- but a real
-///   process is not, and this loader would silently differ from Go there.
-/// * `InitChannelList`: inferring `type` from the map key, refusing an unregistered
-///   type, the singleton constraints, and -- the part the corpus actually sees -- decoding
-///   each channel's `settings` into the typed struct for that type, so the loaded value
-///   carries every field of e.g. `TelegramSettings` rather than the keys the file happened
-///   to mention. That is why four of the fifteen replayable config cases are listed in
-///   `tests/conformance.rs` as known gaps; the per-type field lists are already in the
-///   schema dump as `settings_schemas`.
-/// * `expandMultiKeyModels`: a model with two `api_keys` becomes two entries, the
-///   second named `name__key_1`, and the copy carries only the fields the Go function
-///   lists -- `enabled` among those it drops.
-/// * `ValidateModelList` and `ValidateTurnProfile`.
+/// * `env.Parse` and the `PICOCLAW_*` compat shims. The corpus runs with the environment
+///   cleared, so they are inert for every recorded case -- but a real process is not, and
+///   this loader would silently differ from Go there. Recorded in
+///   `docs/DIVERGENCES.md` with the three variables it reads.
+/// * `ValidateModelList` and `ValidateTurnProfile`. Both refuse a config rather than
+///   change one, and the corpus records no refusal for either, so a port that omits them
+///   accepts files the shipped binary rejects.
+/// * `validateSingletonChannels` and `validateChannelStreamingConfig`, the two validators
+///   at the end of `InitChannelList`. The singleton registry is Go-side data the schema
+///   dump does not carry, which is why closing this needs a Go-side decision and not only
+///   Rust work. Also recorded in `docs/DIVERGENCES.md`.
+///
+/// Everything the fixture does reach is here: the version dispatch and the ladder, the
+/// migration's own security pre-merge ([`load_config_map`]), the decode and its unknown
+/// field refusal, the security file including both skills passes,
+/// `channels::init_channel_list`, `multikey::expand`, the session scope, and the
+/// persistence a migration owes the disk ([`make_backup`] and the deferred [`save`]).
 ///
 /// The security file *is* read, because leaving it out would load a config whose secrets
 /// are in the wrong place. `channels`/`channel_list` and `model_list` are merged. The
@@ -224,6 +237,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
             return Ok(Config {
                 document: default_config(home),
                 needs_version_bump: false,
+                virtual_models: Vec::new(),
             })
         }
         Err(e) => return Err(Error::Io(e.to_string())),
@@ -255,11 +269,39 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         return Ok(Config {
             document: default_config(home),
             needs_version_bump: false,
+            virtual_models: Vec::new(),
         });
     }
 
+    // The security file is read here, before the ladder, because the migration arms ask
+    // for it first -- see [`load_config_map`]. It is read once and used twice: as raw
+    // material for the ladder, and again below as the ordinary security pass.
+    let security_path = path.with_file_name(SECURITY_FILE);
+    let security_text = match std::fs::read_to_string(&security_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Error::Io(format!("failed to read security config: {e}"))),
+    };
+
     let document = match version {
-        0..=2 => migrate(document, version),
+        0..=2 => {
+            // `case 0..=2` does not migrate config.json. It calls `loadConfigMap(path)`,
+            // which reads config.json *and* `.security.yml`, merges them, and hands the
+            // result to the ladder. The difference is not cosmetic: the security file's
+            // `channel_list` entries arrive as ordinary JSON, so `ChannelsConfig`
+            // decodes them as **new** channels and each one replaces its default --
+            // `group_trigger`, `typing` and `placeholder` and all. Loading the same
+            // security file at the current version merges into the defaults instead,
+            // because that path goes through `Channel.UnmarshalYAML`. It is the one place
+            // in this crate where the same two files produce two different configs
+            // depending on a version number, and `migrate_backs_up_both_files` is the
+            // case that says so.
+            let input = match &security_text {
+                Some(text) => load_config_map(&document, &yaml::parse(text)?.document)?,
+                None => document,
+            };
+            migrate(input, version)
+        }
         CURRENT_VERSION => document,
         other => return Err(Error::UnsupportedVersion(other)),
     };
@@ -269,6 +311,13 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // two passes over the document, not one.
     validate_against(&document, &config_schema())
         .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
+    // The settings each channel carried *in the file*, before defaults are merged under
+    // it. `Channel.Settings` is a `RawNode`, and a RawNode only ever holds what the file
+    // said -- the defaults live in the typed struct, which is a separate slot. The
+    // security merge deep-merges into the RawNode, so reproducing it needs the file's
+    // settings and not the defaults-filled ones. See [`apply_security_channels`].
+    let file_channel_settings = stored_channel_settings(&document);
+
     let mut merged = default_config(home);
     merge_over(&mut merged, &document, &config_schema());
 
@@ -281,14 +330,9 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // the one place a silent fallback points the wrong way: it does not load a slightly
     // staler config, it loads one that believes nothing is configured and then writes
     // that belief back on the next save.
-    let security_path = path.with_file_name(SECURITY_FILE);
-    match std::fs::read_to_string(&security_path) {
-        Ok(text) => {
-            let security = yaml::parse(&text)?;
-            apply_security(&mut merged, &security)?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Io(format!("failed to read security config: {e}"))),
+    if let Some(text) = &security_text {
+        let security = yaml::parse(text)?;
+        apply_security(&mut merged, &security, &file_channel_settings)?;
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before
@@ -297,14 +341,42 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // fields the file left out appear and the keys come back in declaration order.
     channels::init_channel_list(&mut merged, &config_schema())?;
 
+    // `expandMultiKeyModels`, in Go's position: after the channel list, before the
+    // session scope. It is the only stage that changes the *number* of model entries, so
+    // it has to run after the security file has put the keys in and before anything reads
+    // the list's length.
+    let virtual_models = multikey::expand(&mut merged, &config_schema());
+
     // The last two stages of LoadConfig, and the reason a loaded config can carry a
     // dm_scope the file never mentioned.
     apply_dm_scope(&mut merged);
 
-    Ok(Config {
+    let migrated = version < CURRENT_VERSION;
+    let mut config = Config {
         document: merged,
-        needs_version_bump: version < CURRENT_VERSION,
-    })
+        needs_version_bump: migrated,
+        virtual_models,
+    };
+
+    // A migration is not only in memory. Each `case 0..=2` arm of `LoadConfig` runs
+    // `MakeBackup(path)` and then `defer SaveConfig(path, cfg)`, so loading a v0 file on
+    // a real machine leaves four files behind: the two backups and the two rewritten
+    // configs. The defer is what makes the written file the *fully* loaded one -- it runs
+    // after the security merge, `InitChannelList` and the model expansion, not just after
+    // the ladder -- which is why this sits at the end of `load` rather than at the
+    // version switch.
+    //
+    // It also mutates the config the caller gets: `SaveConfig` raises `version` through
+    // the same pointer, so a migrated load reports `version: 3` in the loaded value even
+    // though the file said 0. Skipping the write is not a silent difference either -- the
+    // next start would migrate the same file again.
+    if migrated {
+        let path = path.to_path_buf();
+        make_backup(&path)?;
+        save(&path, &mut config, home)?;
+    }
+
+    Ok(config)
 }
 
 /// `SessionConfig.ApplyDmScope` then `DeriveDmScope` (config.go:360 and :380).
@@ -410,7 +482,11 @@ fn type_word(value: &Doc) -> &'static str {
 ///
 /// Per field, not per entry: the file decodes into a `Config` the JSON pass has already
 /// populated, so an entry replaces the fields it names and leaves the rest alone.
-fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Error> {
+fn apply_security(
+    merged: &mut Doc,
+    security: &yaml::Security,
+    file_channel_settings: &BTreeMap<String, Doc>,
+) -> Result<(), Error> {
     let schema = schema::config_schema();
 
     if let Some(models) = security.model_list() {
@@ -423,12 +499,44 @@ fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Err
         let Doc::Object(entries) = models else {
             return Ok(());
         };
-        let wanted = yaml::to_name_index(list);
-        for (key, value) in entries {
-            if let Some(position) = wanted.iter().position(|k| k == key) {
-                merge_filling(&mut list[position], value);
-            } else if let Doc::Object(_) = value {
-                list.push(value.clone());
+        // `SecureModelList.UnmarshalYAML` (config_struct.go:326) walks the models the
+        // JSON loader produced and asks the security map for each one's `name:index` key,
+        // falling back to the bare name for a file written before the index was added.
+        // Two things follow, and the port had both of them wrong until a migration case
+        // caught them:
+        //
+        // * **An entry naming no model is ignored, not appended.** The loop is over
+        //   `*v`, not over the map, so a leftover `m1:0` in a `.security.yml` whose config
+        //   now lists only `m2` contributes nothing -- and the next save, which writes
+        //   from the model list, drops it. Appending it instead invents a model with an
+        //   empty name, which then marshals as the key `:0` and reappears forever.
+        // * **Only `api_keys` is taken.** `m.APIKeys = sec.APIKeys` is a field
+        //   assignment, so every other key inside the security entry is decoded and
+        //   discarded. Merging the whole entry would let the secrets file set a model's
+        //   `provider` or `rpm`, which the shipped binary cannot do.
+        //
+        // The assignment is also unconditional when the entry exists: a matching entry
+        // with no `api_keys` clears the model's keys rather than leaving them alone.
+        let keys = yaml::to_name_index(list);
+        for (position, key) in keys.iter().enumerate() {
+            let name = list[position]
+                .get("model_name")
+                .and_then(Doc::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let source = entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .or_else(|| entries.iter().find(|(k, _)| *k == name))
+                .map(|(_, value)| value);
+            let Some(source) = source else { continue };
+            let secrets = source
+                .get("api_keys")
+                .cloned()
+                .unwrap_or_else(|| Doc::Array(Vec::new()));
+            match list[position].get_mut_at("api_keys") {
+                Some(slot) => *slot = secrets,
+                None => list[position].set("api_keys", secrets),
             }
         }
     }
@@ -469,7 +577,7 @@ fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Err
                 .get("channel_list")
                 .or_else(|| security.document.get("channels"));
             if let (Some(source), Some(target)) = (source, merged.get_mut_at("channel_list")) {
-                merge_filling(target, source);
+                apply_security_channels(target, source, file_channel_settings);
             }
             continue;
         }
@@ -481,6 +589,267 @@ fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Err
     skills::apply(merged, security);
 
     Ok(())
+}
+
+/// What `loadConfigMap` (migration.go:429) builds: config.json and `.security.yml`
+/// merged as plain data, before any typed decoding and before the migration ladder.
+///
+/// Two rewrites happen on the way, both because the security file is written by the YAML
+/// encoder and read back here as if it were the config:
+///
+/// * `web` and `skills` are fields of the **tools** section, but the security file writes
+///   them at the top level. They are lifted into a `tools` key, and the legacy `skills`
+///   spelling is rewritten into `registries` on the way -- `clawhub` becomes a registry,
+///   and a `github` map is copied into `registries.github` with `token` *duplicated* as
+///   `auth_token` rather than moved. That duplicate is why the loaded value shows a
+///   legacy token twice, once masked and once in plaintext; see [`skills`].
+/// * `model_list` cannot be merged as data at all: the config holds an array, the
+///   security file a `name:index` map. The array wins and the map is consumed into it,
+///   contributing each model's `api_keys` and nothing else, then deleted -- merging the
+///   two as maps would replace the array with a map and lose every model.
+///
+/// Everything else merges with the security file winning, which is what makes a
+/// migration see a different document than the file on disk.
+fn load_config_map(config: &Doc, security: &Doc) -> Result<Doc, Error> {
+    let mut m1 = config.clone();
+    let mut m2 = security.clone();
+
+    if let Doc::Object(entries) = &mut m2 {
+        let present = |key: &str| {
+            entries
+                .iter()
+                .any(|(k, v)| k == key && !matches!(v, Doc::Null))
+        };
+        if present("web") || present("skills") {
+            let mut tools: Vec<(String, Doc)> = Vec::new();
+            for key in ["web", "skills"] {
+                if let Some(position) = entries.iter().position(|(k, _)| k == key) {
+                    let (_, value) = entries.remove(position);
+                    let mut value = value;
+                    if key == "skills" {
+                        legacy_skills_as_registries(&mut value);
+                    }
+                    tools.push((key.to_string(), value));
+                }
+            }
+            // `m2["tools"] = m3` assigns, so a `tools` section in the security file is
+            // replaced by the two lifted keys rather than extended by them.
+            match entries.iter_mut().find(|(k, _)| k == "tools") {
+                Some(slot) => slot.1 = Doc::Object(tools),
+                None => entries.push(("tools".to_string(), Doc::Object(tools))),
+            }
+        }
+    }
+
+    merge_model_list_into_array(&mut m1, &mut m2)?;
+    if let Doc::Object(entries) = &mut m2 {
+        entries.retain(|(k, _)| k != "model_list");
+    }
+
+    Ok(merge_maps(&m1, &m2))
+}
+
+/// Rewrites the legacy `skills` spelling in place into the `registries` shape.
+fn legacy_skills_as_registries(skills: &mut Doc) {
+    let Doc::Object(entries) = skills else { return };
+    if let Some((_, clawhub)) = entries.iter().find(|(k, _)| k == "clawhub").cloned() {
+        upsert(
+            entries,
+            "registries",
+            Doc::Object(vec![("clawhub".to_string(), clawhub)]),
+        );
+        entries.retain(|(k, _)| k != "clawhub");
+    }
+    let github = entries
+        .iter()
+        .find(|(k, _)| k == "github")
+        .and_then(|(_, v)| v.as_object())
+        .cloned();
+    if let Some(github) = github {
+        let mut registry = github;
+        if let Some((_, token)) = registry.iter().find(|(k, _)| k == "token").cloned() {
+            // A copy, not a move: `token` stays, which is why a legacy token reaches the
+            // loaded value twice -- masked under `auth_token` and in plaintext under
+            // `token`. Renaming it here would be the tempting fix and would diverge.
+            upsert(&mut registry, "auth_token", token);
+        }
+        let mut registries = entries
+            .iter()
+            .find(|(k, _)| k == "registries")
+            .and_then(|(_, v)| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        upsert(&mut registries, "github", Doc::Object(registry));
+        upsert(entries, "registries", Doc::Object(registries));
+    }
+}
+
+/// Folds the security file's `name:index` model map into the config's model array.
+///
+/// Only `api_keys` crosses over, and only onto a model whose indexed key -- or, for the
+/// first model of a name, its bare name -- the file names. An entry naming no model is
+/// logged and dropped. A model with no `model_name` is a hard failure, because the map
+/// key cannot be derived without it.
+///
+/// The map is then removed from the security side entirely. Leaving it there would let
+/// the data merge replace the array with a map, and every model but the keys would go.
+fn merge_model_list_into_array(m1: &mut Doc, m2: &mut Doc) -> Result<(), Error> {
+    let models = match m1.get_mut_at("model_list") {
+        Some(Doc::Array(items)) => items.clone(),
+        _ => return Ok(()),
+    };
+    let security_models = match m2.get_mut_at("model_list") {
+        Some(Doc::Object(entries)) => entries.clone(),
+        _ => return Ok(()),
+    };
+
+    let mut indexed: Vec<(String, usize)> = Vec::new();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (position, model) in models.iter().enumerate() {
+        let name = match model.get("model_name").and_then(Doc::as_str) {
+            Some(name) => name.to_string(),
+            None => {
+                return Err(Error::Malformed(
+                    "model_name is required in model_list".to_string(),
+                ))
+            }
+        };
+        let count = counts.get(&name).copied().unwrap_or(0);
+        indexed.push((format!("{name}:{count}"), position));
+        if count == 0 {
+            indexed.push((name.clone(), position));
+        }
+        counts.insert(name, count + 1);
+    }
+
+    let mut models = models;
+    for (key, entry) in &security_models {
+        let Some((_, position)) = indexed.iter().find(|(k, _)| k == key) else {
+            continue;
+        };
+        let Some(keys) = entry.get("api_keys").cloned() else {
+            continue;
+        };
+        if let Some(slot) = models[*position].get_mut_at("api_keys") {
+            *slot = keys;
+        } else {
+            models[*position].set("api_keys", keys);
+        }
+    }
+
+    if let Some(slot) = m1.get_mut_at("model_list") {
+        *slot = Doc::Array(models);
+    }
+    if let Some(Doc::Object(entries)) = m2.get_mut_at("model_list") {
+        entries.clear();
+    }
+    Ok(())
+}
+
+/// Go's `mergeMap`: nested maps merge recursively, and anything else the source holds
+/// replaces what the destination holds.
+fn merge_maps(destination: &Doc, source: &Doc) -> Doc {
+    let (Doc::Object(base), Doc::Object(overlay)) = (destination, source) else {
+        return source.clone();
+    };
+    let mut out = base.clone();
+    for (key, value) in overlay {
+        match out.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = merge_maps(&slot.1, value),
+            None => out.push((key.clone(), value.clone())),
+        }
+    }
+    Doc::Object(out)
+}
+
+/// The `settings` each channel carried in the config file itself, keyed by channel name.
+///
+/// This exists because a channel's settings are stored twice over in Go and only one of
+/// the copies is what the file said. `Channel.Settings` is a `RawNode`, and a `RawNode`
+/// holds exactly the nodes decoded into it; the defaults live in the unexported typed
+/// struct, which is a different slot and is what `Channel.MarshalJSON` emits once
+/// `InitChannelList` has run. The security file merges into the `RawNode`.
+///
+/// So the merge cannot read the document it is handed. By the time the security file is
+/// applied, `merge_over` has already filled the document with defaults, and merging into
+/// *that* produces the defaults plus the secrets file's keys. Go produces the file's keys
+/// plus the secrets file's keys, and the two differ on every field the config left out --
+/// which is most of them, since the settings structs are large and configs are short.
+/// Capturing the pre-merge values here is the only way to see the file's own settings
+/// again.
+///
+/// An empty `settings: {}` is recorded as absent rather than as `{}`. `Channel
+/// ::UnmarshalYAML` drops the typed struct the moment any settings node arrives,
+/// *including an empty one*, so "the file mentioned settings" and "the file mentioned
+/// nothing" are the same state, and both mean the loaded channel has no settings at all.
+/// Go writes that empty map into every `.security.yml`, so it is the ordinary case rather
+/// than an edge.
+fn stored_channel_settings(document: &Doc) -> BTreeMap<String, Doc> {
+    let mut out = BTreeMap::new();
+    let Some(entries) = document.get("channel_list").and_then(Doc::as_object) else {
+        return out;
+    };
+    for (name, channel) in entries {
+        if let Some(settings) = channel.get("settings") {
+            out.insert(name.clone(), settings.clone());
+        }
+    }
+    out
+}
+
+/// Merges the security file's `channel_list` section into the loaded one, per entry.
+///
+/// `ChannelsConfig.UnmarshalYAML` (:411) walks the file's entries and calls
+/// `Channel.UnmarshalYAML` on each, which decodes into a copy of what is already there --
+/// so the entry's keys merge rather than replace. One key is different, and it is the one
+/// that decides what a saved config looks like:
+///
+/// `settings` lands in a `RawNode`, whose `UnmarshalYAML` (:115) deep-merges into
+/// **the raw bytes the file carried**, not into the defaults -- because the defaults are
+/// not in that slot. Then `Channel.UnmarshalYAML` does `if len(b.Settings) > 0 {
+/// b.extend = nil }`: any settings node at all, *even an empty* `{}`, throws away the
+/// decoded typed struct. `InitChannelList` later rebuilds it from the raw node, so what
+/// comes back is the zero value of every field the merge did not name.
+///
+/// That is why a config that has been saved once comes back with `group_trigger: {}` and
+/// `typing: {}` where a fresh one has `mention_only: true` and `enabled: true`: Go writes
+/// `settings: {}` for every channel into every `.security.yml`, and the next load reads
+/// that empty node as "no settings", not as "keep the defaults". Merging the security
+/// node into the defaults-filled document -- the obvious reading -- keeps every default
+/// and matches Go on no saved config at all.
+fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTreeMap<String, Doc>) {
+    let (Some(entries), Some(channels)) = (source.as_object(), target.as_object_mut()) else {
+        return;
+    };
+    for (name, value) in entries.clone() {
+        let position = match channels.iter().position(|(k, _)| k == &name) {
+            Some(position) => position,
+            // `newBC := &Channel{}` then `node.Decode`: a zero channel, so no default
+            // ever enters it and its settings are exactly the node's.
+            None => {
+                channels.push((name.clone(), Doc::Object(Vec::new())));
+                channels.len() - 1
+            }
+        };
+        let channel = &mut channels[position].1;
+        if let Some(settings) = value.get("settings") {
+            let mut merged = file_settings
+                .get(&name)
+                .cloned()
+                .unwrap_or(Doc::Object(Vec::new()));
+            merge_filling(&mut merged, settings);
+            channel.set("settings", merged);
+        }
+        for (key, child) in value.as_object().cloned().unwrap_or_default() {
+            if key == "settings" {
+                continue;
+            }
+            match channel.get_mut_at(&key) {
+                Some(slot) => merge_filling(slot, &child),
+                None => channel.set(&key, child.clone()),
+            }
+        }
+    }
 }
 
 /// Like [`merge_over`], but a key the schema does not know is dropped instead of added.
@@ -543,15 +912,145 @@ pub fn save(path: &Path, cfg: &mut Config, _home: &str) -> Result<Vec<String>, E
         cfg.document.set("version", Doc::Int(CURRENT_VERSION));
     }
 
+    // `SaveConfig` swaps in the non-virtual model list *first*, then writes the security
+    // file, then marshals the document, and restores the original on a defer. So the
+    // entries the loader invented are absent from **both** files while the `fallbacks`
+    // that point at them are kept in the config. Getting the order wrong is subtle and
+    // expensive: writing the security file from the unfiltered list records
+    // `m1__key_1:0: {api_keys: [sk-2]}`, and the next load then finds a model the user
+    // never wrote and merges a secret under it.
+    let filtered = hide_virtual_models(cfg);
+
     let schema = schema::config_schema();
     let security_path = path.with_file_name(SECURITY_FILE);
     let security = yaml::write(&cfg.document, &schema)?;
     write_atomic(&security_path, &security)?;
 
     let document = marshal::config_file(&cfg.document, &schema)?;
+    restore_model_list(cfg, filtered);
     write_atomic(path, &document)?;
 
     Ok(vec![security, document])
+}
+
+/// Removes the loader-created `model_list` entries and hands back what was taken, so the
+/// caller can put them back. Out-of-range positions are ignored: the flag is positional,
+/// and a caller that shrank the list since loading is not a reason to panic.
+fn hide_virtual_models(cfg: &mut Config) -> Vec<(usize, Doc)> {
+    let mut taken = Vec::new();
+    if cfg.virtual_models.is_empty() {
+        return taken;
+    }
+    let Some(list) = cfg
+        .document
+        .get_mut_at("model_list")
+        .and_then(Doc::as_array_mut)
+    else {
+        return taken;
+    };
+    let mut sorted = cfg.virtual_models.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    for position in sorted.into_iter().rev() {
+        if position < list.len() {
+            taken.push((position, list.remove(position)));
+        }
+    }
+    taken.reverse();
+    taken
+}
+
+/// Puts [`hide_virtual_models`] back, in the order they were taken.
+fn restore_model_list(cfg: &mut Config, taken: Vec<(usize, Doc)>) {
+    if taken.is_empty() {
+        return;
+    }
+    let Some(list) = cfg
+        .document
+        .get_mut_at("model_list")
+        .and_then(Doc::as_array_mut)
+    else {
+        return;
+    };
+    for (position, entry) in taken {
+        list.insert(position.min(list.len()), entry);
+    }
+}
+
+/// `MakeBackup` (config.go:1637): copy the config, and the security file beside it, to
+/// `<name>.<YYYYMMDD>.bak`.
+///
+/// Three things about it are load-bearing and none of them are obvious from the name:
+///
+/// * **A missing config is not an error and makes no backup.** `os.IsNotExist` returns
+///   nil before the suffix is even computed, so loading a config that is not there leaves
+///   the directory exactly as it was.
+/// * **The suffix is a date, not a timestamp**, so a second load on the same day
+///   overwrites the first backup rather than adding a second file. Two loads on two days
+///   leave two files, which is why the corpus masks the eight digits: the case would
+///   otherwise disagree with itself across midnight.
+/// * **The security file is backed up under the same suffix**, and only when it exists.
+///   Its absence is normal -- a config from before the split has no secrets file -- and
+///   refusing for it would break every such config on first migration.
+fn make_backup(path: &Path) -> Result<(), Error> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let suffix = format!(".{}.bak", today());
+    copy_file(path, &PathBuf::from(format!("{}{suffix}", path.display())))?;
+    let security = path.with_file_name(SECURITY_FILE);
+    if security.exists() {
+        copy_file(
+            &security,
+            &PathBuf::from(format!("{}{suffix}", security.display())),
+        )?;
+    }
+    Ok(())
+}
+
+/// Today, as Go's `time.Now().Format(".20060102.bak")` reads it: the local calendar date,
+/// no time, no separator.
+fn today() -> String {
+    // Days since the Unix epoch, then civil-from-days. Done in the crate rather than via
+    // a date dependency: the port has no chrono, and this is the only place a calendar
+    // date is needed.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    // Go's time.Now() is local; the corpus clears the environment, so TZ is UTC here and
+    // in the generator, which is what makes the masked digits comparable at all.
+    let days = secs.div_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}{month:02}{day:02}")
+}
+
+/// Howard Hinnant's `civil_from_days`: the inverse of `days_from_civil`, no tables.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// `fileutil.CopyFile`: the bytes, at mode 0600.
+fn copy_file(from: &Path, to: &Path) -> Result<(), Error> {
+    let bytes = std::fs::read(from)
+        .map_err(|e| Error::Io(format!("failed to create config backup: {e}")))?;
+    std::fs::write(to, bytes)
+        .map_err(|e| Error::Io(format!("failed to create config backup: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// `fileutil.WriteFileAtomic`: write beside the target, then rename over it.
