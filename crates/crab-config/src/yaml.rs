@@ -448,7 +448,7 @@ fn emit_entry(out: &mut String, key: &str, level: usize, value: &Rendered) -> Re
         Rendered::Seq(items) => {
             out.push_str(&format!("{pad}{key}:\n"));
             for item in items {
-                emit_entry(out, "-", level + 1, item)?;
+                emit_seq_item(out, level + 1, item)?;
             }
         }
         Rendered::Value(Doc::Array(items)) if items.is_empty() => {
@@ -457,15 +457,77 @@ fn emit_entry(out: &mut String, key: &str, level: usize, value: &Rendered) -> Re
         Rendered::Value(Doc::Array(items)) => {
             out.push_str(&format!("{pad}{key}:\n"));
             for item in items {
-                out.push_str(&format!(
-                    "{}- {}\n",
-                    "  ".repeat(level + 1),
-                    scalar_text(item)
-                ));
+                emit_seq_item(out, level + 1, &Rendered::Value(item.clone()))?;
             }
         }
         Rendered::Value(other) => out.push_str(&format!("{pad}{key}: {}\n", scalar_text(other))),
     }
+    Ok(())
+}
+
+/// One element of a sequence.
+///
+/// This is not `emit_entry` with the key `"-"`, which is what it looks like it could be and
+/// is what it was. That route formats a scalar as `key: value`, so `api_keys: [bk]` came out
+/// as `-: bk` -- valid YAML, but a mapping with an empty key rather than the string `bk`,
+/// and the next load then reads back a list of one map. `yaml.v3` puts the dash on the
+/// element itself: `- bk` for a scalar, and for a map the **first key rides the dash** with
+/// the rest aligned under it, which is exactly one indent level deeper -- the same width as
+/// `- `, which is why splicing the dash into the first line's padding is enough and no
+/// second rendering mode is needed.
+fn emit_seq_item(out: &mut String, level: usize, item: &Rendered) -> Result<(), Error> {
+    let pad = "  ".repeat(level);
+    let dash = format!("{pad}- ");
+    let mut buf = String::new();
+    let rendered_entries = match item {
+        Rendered::Object(entries) if entries.is_empty() => return emit_line(out, &dash, "{}"),
+        Rendered::Object(entries) => {
+            for (k, v) in entries.iter() {
+                emit_entry(&mut buf, &quote_key(k), level + 1, v)?;
+            }
+            true
+        }
+        Rendered::Value(Doc::Object(entries)) if entries.is_empty() => {
+            return emit_line(out, &dash, "{}")
+        }
+        Rendered::Value(Doc::Object(entries)) => {
+            for (k, v) in entries {
+                emit_entry(
+                    &mut buf,
+                    &quote_key(k),
+                    level + 1,
+                    &Rendered::Value(v.clone()),
+                )?;
+            }
+            true
+        }
+        Rendered::Seq(inner) if inner.is_empty() => return emit_line(out, &dash, "[]"),
+        Rendered::Value(Doc::Array(inner)) if inner.is_empty() => {
+            return emit_line(out, &dash, "[]")
+        }
+        Rendered::Value(other) => return emit_line(out, &dash, &scalar_text(other)),
+        other => {
+            // A nested sequence has no key to ride the dash, so it becomes an anonymous
+            // block one level in -- what `yaml.v3` does for a sequence of sequences.
+            emit_entry(&mut buf, "", level + 1, other)?;
+            true
+        }
+    };
+    if !rendered_entries {
+        return emit_line(out, &dash, "{}");
+    }
+    match buf.strip_prefix(&format!("{pad}  ")) {
+        Some(rest) => {
+            out.push_str(&dash);
+            out.push_str(rest);
+        }
+        None => out.push_str(&buf),
+    }
+    Ok(())
+}
+
+fn emit_line(out: &mut String, prefix: &str, body: &str) -> Result<(), Error> {
+    out.push_str(&format!("{prefix}{body}\n"));
     Ok(())
 }
 

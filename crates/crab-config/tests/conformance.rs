@@ -135,6 +135,7 @@ fn run_script(case: &str, ops: &[Op]) -> Value {
                     document,
                     needs_version_bump: false,
                     virtual_models: Vec::new(),
+                    secure_tokens: Vec::new(),
                 });
             }
             "write_file" => {

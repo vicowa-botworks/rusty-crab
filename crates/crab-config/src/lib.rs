@@ -169,6 +169,11 @@ pub struct Config {
     /// It lives here rather than in the document because a marker key would be a field
     /// the schema does not have, and the loader's own validator refuses those.
     pub virtual_models: Vec<usize>,
+    /// The real `auth_token` behind each `tools.skills.registries` entry, which the
+    /// document holds masked because that is what `MarshalJSON` emits. Only `save` reads
+    /// it: the security file is the YAML rendering, where `SecureString` answers with the
+    /// value rather than the placeholder. See [`skills`].
+    pub secure_tokens: Vec<(String, String)>,
 }
 
 impl Config {
@@ -238,6 +243,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
                 document: default_config(home),
                 needs_version_bump: false,
                 virtual_models: Vec::new(),
+                secure_tokens: Vec::new(),
             })
         }
         Err(e) => return Err(Error::Io(e.to_string())),
@@ -270,6 +276,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
             document: default_config(home),
             needs_version_bump: false,
             virtual_models: Vec::new(),
+            secure_tokens: Vec::new(),
         });
     }
 
@@ -321,18 +328,16 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     let mut merged = default_config(home);
     merge_over(&mut merged, &document, &config_schema());
 
-    // The security file, read after the document and merged into it. Its absence is
-    // normal -- a config written before the split has none -- and its presence is what
-    // makes a loaded config differ from the file it came from.
-    // The security file. Absent is normal -- a config written before the split has none
+    // The security file, read after the document and merged into it. Absent is normal -- a config written before the split has none
     // -- but any *other* read failure is fatal. `if let Ok(..)` here would treat EACCES
     // or invalid UTF-8 as "no secrets file" and carry on with default secrets, which is
     // the one place a silent fallback points the wrong way: it does not load a slightly
     // staler config, it loads one that believes nothing is configured and then writes
     // that belief back on the next save.
+    let mut secure_tokens = Vec::new();
     if let Some(text) = &security_text {
         let security = yaml::parse(text)?;
-        apply_security(&mut merged, &security, &file_channel_settings)?;
+        secure_tokens = apply_security(&mut merged, &security, &file_channel_settings)?;
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before
@@ -356,6 +361,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         document: merged,
         needs_version_bump: migrated,
         virtual_models,
+        secure_tokens,
     };
 
     // A migration is not only in memory. Each `case 0..=2` arm of `LoadConfig` runs
@@ -486,7 +492,7 @@ fn apply_security(
     merged: &mut Doc,
     security: &yaml::Security,
     file_channel_settings: &BTreeMap<String, Doc>,
-) -> Result<(), Error> {
+) -> Result<Vec<(String, String)>, Error> {
     let schema = schema::config_schema();
 
     if let Some(models) = security.model_list() {
@@ -494,10 +500,10 @@ fn apply_security(
         // entries the file mentions are touched, and a key naming an entry that is not
         // there is added, because Go's map decode creates it.
         let Some(list) = merged.get_mut_at("model_list").and_then(Doc::as_array_mut) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let Doc::Object(entries) = models else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         // `SecureModelList.UnmarshalYAML` (config_struct.go:326) walks the models the
         // JSON loader produced and asks the security map for each one's `name:index` key,
@@ -586,9 +592,7 @@ fn apply_security(
         }
     }
 
-    skills::apply(merged, security);
-
-    Ok(())
+    Ok(skills::apply(merged, security))
 }
 
 /// What `loadConfigMap` (migration.go:429) builds: config.json and `.security.yml`
@@ -821,6 +825,7 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
     let (Some(entries), Some(channels)) = (source.as_object(), target.as_object_mut()) else {
         return;
     };
+    let config_schema = schema::config_schema();
     for (name, value) in entries.clone() {
         let position = match channels.iter().position(|(k, _)| k == &name) {
             Some(position) => position,
@@ -837,7 +842,17 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
                 .get(&name)
                 .cloned()
                 .unwrap_or(Doc::Object(Vec::new()));
-            merge_filling(&mut merged, settings);
+            // The channel's own `type` decides which struct its settings decode into, and
+            // for a channel the file never named that is the default's type -- which is
+            // why this reads the merged document rather than the map key.
+            let channel_type = channel
+                .get("type")
+                .and_then(Doc::as_str)
+                .map_or_else(|| name.clone(), str::to_string);
+            let fields = config_schema
+                .settings_schema(&channel_type)
+                .or_else(|| config_schema.settings_schema(&name));
+            merge_settings(&mut merged, settings, fields);
             channel.set("settings", merged);
         }
         for (key, child) in value.as_object().cloned().unwrap_or_default() {
@@ -848,6 +863,38 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
                 Some(slot) => merge_filling(slot, &child),
                 None => channel.set(&key, child.clone()),
             }
+        }
+    }
+}
+
+/// [`merge_filling`] for a channel's `settings` node, validated against the struct that
+/// channel type decodes into.
+///
+/// The shared check asks the **top-level** `Config` schema about a key at every depth. That
+/// is right for the two sections it was written for and wrong here: `media_group_delay_ms` is
+/// a field of `TelegramSettings`, not of `Config`, so the shared check dropped it and the
+/// security file's value never reached the typed decode -- the channel came back with the
+/// zero the file's entry had already forced, and a port that ignored the security file's
+/// settings entirely recorded the same bytes.
+///
+/// In Go the node is a `yaml.Node`, arbitrary by declaration, so the field list has to come
+/// from the struct the factory picks for the type. A type `channelSettingsFactory` does not
+/// know decodes into `map[string]any`, which accepts everything -- hence `None` meaning
+/// "keep it all" rather than "keep nothing".
+fn merge_settings(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
+    let (Some(base_entries), Some(overlay_entries)) = (base.as_object_mut(), overlay.as_object())
+    else {
+        *base = overlay.clone();
+        return;
+    };
+    for (k, v) in overlay_entries.clone() {
+        let child = fields.and_then(|schema| schema.field(&k));
+        if fields.is_some() && child.is_none() {
+            continue;
+        }
+        match base_entries.iter_mut().find(|(bk, _)| bk == &k) {
+            Some(slot) => merge_settings(&mut slot.1, &v, child),
+            None => base_entries.push((k, v)),
         }
     }
 }
@@ -920,17 +967,74 @@ pub fn save(path: &Path, cfg: &mut Config, _home: &str) -> Result<Vec<String>, E
     // `m1__key_1:0: {api_keys: [sk-2]}`, and the next load then finds a model the user
     // never wrote and merges a secret under it.
     let filtered = hide_virtual_models(cfg);
+    let masked = unmask_registry_tokens(cfg);
 
     let schema = schema::config_schema();
     let security_path = path.with_file_name(SECURITY_FILE);
     let security = yaml::write(&cfg.document, &schema)?;
     write_atomic(&security_path, &security)?;
+    remask_registry_tokens(cfg, masked);
 
     let document = marshal::config_file(&cfg.document, &schema)?;
     restore_model_list(cfg, filtered);
     write_atomic(path, &document)?;
 
     Ok(vec![security, document])
+}
+
+/// Swaps the real `auth_token` into every registry the loader recorded a token for, and
+/// hands back what was there, so the caller can put the placeholders back.
+///
+/// The document is the JSON rendering, where `SkillRegistryConfig.MarshalJSON` writes the
+/// literal `[NOT_HERE]` for that key -- which is exactly what the loaded value must show. The
+/// security file is the *other* rendering: `yaml.Marshal` asks `SecureString` itself and gets
+/// the value. Writing the file straight from the document therefore records a placeholder in
+/// the one file whose entire purpose is holding the secret, and the next load then reads back
+/// a registry whose token is the string `[NOT_HERE]`.
+fn unmask_registry_tokens(cfg: &mut Config) -> Vec<(String, String)> {
+    let mut previous = Vec::new();
+    let Some(registries) = cfg
+        .document
+        .get_mut_at("tools")
+        .and_then(|tools| tools.get_mut_at("skills"))
+        .and_then(|skills| skills.get_mut_at("registries"))
+        .and_then(Doc::as_object_mut)
+    else {
+        return previous;
+    };
+    for (name, token) in &cfg.secure_tokens {
+        let Some(entry) = registries.iter_mut().find(|(key, _)| key == name) else {
+            continue;
+        };
+        if let Some(slot) = entry.1.get_mut_at("auth_token") {
+            // Always the placeholder -- `to_doc` is the only writer of this key -- so
+            // reading it back as text is exact rather than a lossy coercion.
+            previous.push((name.clone(), slot.as_str().unwrap_or_default().to_string()));
+            *slot = Doc::String(token.clone());
+        }
+    }
+    previous
+}
+
+/// The inverse of [`unmask_registry_tokens`], run before `config.json` is marshalled.
+fn remask_registry_tokens(cfg: &mut Config, previous: Vec<(String, String)>) {
+    let Some(registries) = cfg
+        .document
+        .get_mut_at("tools")
+        .and_then(|tools| tools.get_mut_at("skills"))
+        .and_then(|skills| skills.get_mut_at("registries"))
+        .and_then(Doc::as_object_mut)
+    else {
+        return;
+    };
+    for (name, value) in previous {
+        if let Some(entry) = registries.iter_mut().find(|(key, _)| key == &name) {
+            if let Some(slot) = entry.1.get_mut_at("auth_token") {
+                *slot = Doc::String(value);
+            }
+        }
+    }
+    let _ = cfg;
 }
 
 /// Removes the loader-created `model_list` entries and hands back what was taken, so the

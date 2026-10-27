@@ -170,15 +170,25 @@ fn scalar_text(node: &Doc) -> String {
 }
 
 /// Applies both passes to a document the JSON loader already settled.
-pub fn apply(merged: &mut Doc, security: &Security) {
+///
+/// Hands back the `auth_token` each surviving registry really holds. The document cannot
+/// carry it: `SkillRegistryConfig.MarshalJSON` writes the literal `[NOT_HERE]` for that key,
+/// and the port's document *is* the JSON rendering, so the secret has nowhere to live once
+/// the pass is done. `saveSecurityConfig` writes the other rendering -- `yaml.Marshal` asks
+/// `SecureString` itself, which answers with the value -- so the one file whose entire purpose
+/// is holding secrets would otherwise record a placeholder. Go keeps the real value in the
+/// struct and masks only at marshal time; with the document standing in for the struct, the
+/// mask has to be undone by the save path from this list. Same reason `Config::virtual_models`
+/// exists: state the loader knows and the document cannot hold.
+pub fn apply(merged: &mut Doc, security: &Security) -> Vec<(String, String)> {
     let Some(file_skills) = security.document.get("skills") else {
-        return;
+        return Vec::new();
     };
     let Some(target) = merged
         .get_mut_at("tools")
         .and_then(|tools| tools.get_mut_at("skills"))
     else {
-        return;
+        return Vec::new();
     };
 
     // The registries the document already carries, in the shape Go holds them.
@@ -266,8 +276,14 @@ pub fn apply(merged: &mut Doc, security: &Security) {
         }
     }
 
+    let tokens: Vec<(String, String)> = registries
+        .iter()
+        .filter(|(_, registry)| !registry.auth_token.is_empty())
+        .map(|(name, registry)| (name.clone(), registry.auth_token.clone()))
+        .collect();
+
     if registries.is_empty() {
-        return;
+        return tokens;
     }
     let mut out: Vec<(String, Doc)> = registries
         .iter()
@@ -282,6 +298,7 @@ pub fn apply(merged: &mut Doc, security: &Security) {
             None => entries.push(("registries".to_string(), Doc::Object(out))),
         }
     }
+    tokens
 }
 
 fn lookup<'a>(list: &'a [(String, Registry)], name: &str) -> Option<&'a Registry> {
