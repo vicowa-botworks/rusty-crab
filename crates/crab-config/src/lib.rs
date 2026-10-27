@@ -318,13 +318,6 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // two passes over the document, not one.
     validate_against(&document, &config_schema())
         .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
-    // The settings each channel carried *in the file*, before defaults are merged under
-    // it. `Channel.Settings` is a `RawNode`, and a RawNode only ever holds what the file
-    // said -- the defaults live in the typed struct, which is a separate slot. The
-    // security merge deep-merges into the RawNode, so reproducing it needs the file's
-    // settings and not the defaults-filled ones. See [`apply_security_channels`].
-    let file_channel_settings = stored_channel_settings(&document);
-
     let mut merged = default_config(home);
     merge_over(&mut merged, &document, &config_schema());
 
@@ -337,7 +330,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     let mut secure_tokens = Vec::new();
     if let Some(text) = &security_text {
         let security = yaml::parse(text)?;
-        secure_tokens = apply_security(&mut merged, &security, &file_channel_settings)?;
+        secure_tokens = apply_security(&mut merged, &security)?;
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before
@@ -491,7 +484,6 @@ fn type_word(value: &Doc) -> &'static str {
 fn apply_security(
     merged: &mut Doc,
     security: &yaml::Security,
-    file_channel_settings: &BTreeMap<String, Doc>,
 ) -> Result<Vec<(String, String)>, Error> {
     let schema = schema::config_schema();
 
@@ -583,7 +575,7 @@ fn apply_security(
                 .get("channel_list")
                 .or_else(|| security.document.get("channels"));
             if let (Some(source), Some(target)) = (source, merged.get_mut_at("channel_list")) {
-                apply_security_channels(target, source, file_channel_settings);
+                apply_security_channels(target, source);
             }
             continue;
         }
@@ -789,25 +781,6 @@ fn merge_maps(destination: &Doc, source: &Doc) -> Doc {
 /// Capturing the pre-merge values here is the only way to see the file's own settings
 /// again.
 ///
-/// An empty `settings: {}` is recorded as absent rather than as `{}`. `Channel
-/// ::UnmarshalYAML` drops the typed struct the moment any settings node arrives,
-/// *including an empty one*, so "the file mentioned settings" and "the file mentioned
-/// nothing" are the same state, and both mean the loaded channel has no settings at all.
-/// Go writes that empty map into every `.security.yml`, so it is the ordinary case rather
-/// than an edge.
-fn stored_channel_settings(document: &Doc) -> BTreeMap<String, Doc> {
-    let mut out = BTreeMap::new();
-    let Some(entries) = document.get("channel_list").and_then(Doc::as_object) else {
-        return out;
-    };
-    for (name, channel) in entries {
-        if let Some(settings) = channel.get("settings") {
-            out.insert(name.clone(), settings.clone());
-        }
-    }
-    out
-}
-
 /// Merges the security file's `channel_list` section into the loaded one, per entry.
 ///
 /// `ChannelsConfig.UnmarshalYAML` (:411) walks the file's entries and calls
@@ -816,24 +789,31 @@ fn stored_channel_settings(document: &Doc) -> BTreeMap<String, Doc> {
 /// that decides what a saved config looks like:
 ///
 /// `settings` lands in a `RawNode`, whose `UnmarshalYAML` (:115) deep-merges into
-/// **the raw bytes the file carried**, not into the defaults -- because the defaults are
-/// not in that slot. Then `Channel.UnmarshalYAML` does `if len(b.Settings) > 0 {
-/// b.extend = nil }`: any settings node at all, *even an empty* `{}`, throws away the
-/// decoded typed struct. `InitChannelList` later rebuilds it from the raw node, so what
-/// comes back is the zero value of every field the merge did not name.
+/// **whatever that channel slot already holds**. The seed is therefore the channel as it
+/// stands after the config document, and that is where the two files part company: a
+/// channel the *config file* names is a fresh map element (`encoding/json` allocates one
+/// per key), so its slot holds the file's node and the security entry merges into the
+/// file's zeros; a channel only the defaults name keeps its default node, so the same
+/// entry merges into the defaults. `security_settings_apply_to_a_channel_the_config_names`
+/// records the first (`media_group_delay_ms: 1234` on a channel whose other settings are
+/// zero), `security_channel_list_entry_merges_into_the_default` the second (`port: 9999`
+/// beside a default `host` the security file never mentioned). Seeding from the file's
+/// settings alone -- what this function did first -- gets the second one wrong and shows
+/// `host: ""`, and no case written against `discord` can see it, because discord's default
+/// settings are an empty map.
 ///
-/// That is why a config that has been saved once comes back with `group_trigger: {}` and
+/// Then `Channel.UnmarshalYAML` does `if len(b.Settings) > 0 { b.extend = nil }`: any
+/// settings node at all, *even an empty* `{}`, throws away the decoded typed struct.
+/// `InitChannelList` later rebuilds it from the raw node into a **fresh** zero struct
+/// (`newChannelSettings`), so what comes back is the merged node and nothing else. That is
+/// why a config that has been saved once comes back with `group_trigger: {}` and
 /// `typing: {}` where a fresh one has `mention_only: true` and `enabled: true`: Go writes
 /// `settings: {}` for every channel into every `.security.yml`, and the next load reads
-/// that empty node as "no settings", not as "keep the defaults". Merging the security
-/// node into the defaults-filled document -- the obvious reading -- keeps every default
-/// and matches Go on no saved config at all.
-fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTreeMap<String, Doc>) {
+/// that empty node as "no settings", not as "keep the defaults".
+fn apply_security_channels(target: &mut Doc, source: &Doc) {
     let (Some(entries), Some(channels)) = (source.as_object(), target.as_object_mut()) else {
         return;
     };
-    let config_schema = schema::config_schema();
-    let channel_schema = config_schema.field("channel_list").and_then(Schema::elem);
     for (name, value) in entries.clone() {
         let position = match channels.iter().position(|(k, _)| k == &name) {
             Some(position) => position,
@@ -846,8 +826,8 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
         };
         let channel = &mut channels[position].1;
         if let Some(settings) = value.get("settings") {
-            let mut merged = file_settings
-                .get(&name)
+            let mut merged = channel
+                .get("settings")
                 .cloned()
                 .unwrap_or(Doc::Object(Vec::new()));
             // No schema here, deliberately. `Channel` keeps `settings` as a `RawNode`, so
@@ -871,7 +851,6 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
         // `isValidChannelType` rejects `mychan`. A port that copies the entry's other keys
         // accepts a file the shipped binary refuses -- and silently turns a secrets file
         // into a way to enable a channel, which is not what it is for.
-        let _ = channel_schema;
     }
 }
 
