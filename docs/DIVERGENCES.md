@@ -105,3 +105,25 @@ this file as long as observable behaviour is identical. They belong in
 - Closes with: the singleton registry and the streaming rules carried in the dump (the same
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
+
+### `crates/crab-config` loads a non-mapping skills value Go refuses
+
+- Go: `applyLegacySkillsSecurityNode` (`pkg/config/security.go:124`) decodes every value in
+  the security file's `skills` mapping into a `SkillRegistryConfig`, and that decoder
+  decodes into a `map[string]any`. A scalar or sequence there is a decode failure, so
+  `skills: {github: ghp_direct}` is a config the shipped binary will not load.
+- Rust: `skills::apply` answers a non-mapping node by ignoring it, so the file loads.
+- Why: the one corpus case in this area, `security_a_scalar_under_registries_loads_unchanged`,
+  pins the file that *does* load -- `registries` is skipped by name before the decode, which
+  is the only reason it survives. No case pins a non-`registries` key holding a scalar, so
+  refusing now would be writing an error path against bytes nobody recorded, including which
+  diagnostic wins when several keys are wrong.
+- Blast radius: a hand-edited `.security.yml` with a typo that puts a token where a registry
+  mapping belongs loads under the port with the token dropped, and is refused by the shipped
+  binary. Nothing is silently rewritten -- the file is simply accepted that should not be --
+  but it is the class of divergence that turns a rejected config into a running one.
+- Closes with: one corpus case per shape (scalar, sequence) under a legacy skills key, then
+  an error type on this pass. The `registries` skip itself stays unpinnable until then: with
+  the skip removed this port still replays green, because it never reaches the refusal the
+  skip exists to avoid.
+- Recorded: 2026-10-27.

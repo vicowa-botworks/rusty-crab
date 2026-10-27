@@ -28,6 +28,29 @@
 //! renders as a name-keyed object because `SkillsRegistriesConfig.MarshalJSON` builds a
 //! `map[string]SkillRegistryConfig` -- so the order entries were added in is not
 //! observable, only their contents.
+//!
+//! ## What the corpus cannot see
+//!
+//! Injecting faults into this module and replaying the config seam leaves three that no
+//! case fails. Two are equivalent and one is a gap in this port, and the three should not
+//! be remembered as the same kind of thing:
+//!
+//! * **Writing `auth_token` over one that is already set** is equivalent, because every
+//!   `SecureString` marshals to the same `[NOT_HERE]`. No document can tell "kept the
+//!   stored token" from "replaced it with the legacy one"; only the file that `save`
+//!   writes back could, and `save` is not ported yet.
+//! * **Letting the file's `github.token` win over one already in config.json** is the
+//!   same equivalence seen from the other field: both are invisible in the loaded value
+//!   (see `marshal`'s SecureString rule) and both qualify the registry identically.
+//! * **Dropping the `registries` skip is a gap, not an equivalent.** Go refuses a file
+//!   whose legacy skills value is not a mapping -- `valueNode.Decode` into a
+//!   `SkillRegistryConfig` decodes into a `map[string]any`, and a scalar is not one. This
+//!   module answers a non-mapping node by ignoring it, so it loads a file the shipped
+//!   binary rejects. `security_a_scalar_under_registries_loads_unchanged` pins the
+//!   behaviour *with* the skip, which is why the fault still replays green: the port
+//!   never reaches the refusal the skip exists to avoid. Recorded in
+//!   `docs/DIVERGENCES.md` rather than fixed here, because refusing needs an error type
+//!   on this pass and no case yet pins which diagnostic wins.
 
 use crate::doc::Doc;
 use crate::yaml::Security;
