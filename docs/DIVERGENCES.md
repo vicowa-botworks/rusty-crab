@@ -45,38 +45,6 @@ package, a module split that does not match a directory -- are not divergences i
 this file as long as observable behaviour is identical. They belong in
 `ARCHITECTURE.md`, next to the reason.
 
-### `crates/crab-config` drops the `web` section of `.security.yml`
-
-- Go: `loadSecurityConfig` unmarshals the whole file into `Config`, and `Tools` is tagged
-  `yaml:",inline"`, so a top-level `web:` in the security file lands on `tools.web` and
-  overrides the JSON config. `saveSecurityConfig` writes the section whenever a search
-  provider has an API key, so it is present in most real files -- and it is present even
-  when empty, because the writer emits every provider.
-- Rust: `yaml::parse` accepts the section and `apply_security` does not read it, so it is
-  parsed and then discarded. Its sibling `skills:` **is** applied now (see the two skills
-  entries below); `web` is the one that remains.
-- Why the asymmetry is the right shape rather than half a job: `skills` is observable
-  through a load, because `SkillRegistryConfig.MarshalJSON` hand-builds its output and
-  re-emits the registries into the loaded value. `web` is not. Every field under it that
-  could carry a key is a `SecureStrings`, and `SecureStrings.IsZero` reports true for any
-  caller but the YAML encoder, so `encoding/json` never writes one -- a security file's
-  `web.brave.api_keys` leaves the loaded value **byte-identical** to no security file at
-  all. A case added for it would structurally be unable to see its own subject.
-- Why not refuse it instead: that was the first behaviour, and it was the wrong direction
-  -- refusing makes the loader reject a file the shipped binary loads, and the failure
-  lands on every install that has ever saved a search key. Ignoring is the smaller
-  divergence and it is visible here rather than in a user's running agent.
-- Blast radius: an install that keeps a web-search key in `.security.yml` gets a config
-  where that key is absent at the point the port reports the loaded value, so a search
-  tool that works under Go reports "not configured" under the port. Secrets are not
-  leaked or written anywhere new -- they are read and dropped. The gap becomes observable
-  the moment `save` is compared, because the merge is what decides what gets written back
-  into `tools.web`.
-- Closes with: `apply_security` growing the section, in the same step as the `save` cases
-  that can witness it. The schema dump already carries the field list, so no Go-side work
-  is needed -- a corpus case is, and it has to be a save case.
-- Recorded: 2026-10-26, #5; narrowed to `web` on 2026-10-27 once `skills` landed.
-
 ### `crates/crab-config` does not apply the Telegram streaming env-compat shims
 
 - Go: `applyTelegramStreamingEnvCompat` (`pkg/config/config_channel.go:768`) runs inside

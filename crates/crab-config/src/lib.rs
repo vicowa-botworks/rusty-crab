@@ -566,7 +566,7 @@ fn apply_security(
                 }
                 if let Some(value) = security.document.get(child.json) {
                     if let Some(slot) = target.get_mut_at(child.json) {
-                        merge_filling(slot, value);
+                        merge_filling(slot, value, inner_schema.field(child.json));
                     }
                 }
             }
@@ -588,7 +588,7 @@ fn apply_security(
             continue;
         }
         if let Some(target) = merged.get_mut_at(field.json) {
-            merge_filling(target, value);
+            merge_filling(target, value, schema.field(field.json));
         }
     }
 
@@ -826,6 +826,7 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
         return;
     };
     let config_schema = schema::config_schema();
+    let channel_schema = config_schema.field("channel_list").and_then(Schema::elem);
     for (name, value) in entries.clone() {
         let position = match channels.iter().position(|(k, _)| k == &name) {
             Some(position) => position,
@@ -852,59 +853,44 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
             let fields = config_schema
                 .settings_schema(&channel_type)
                 .or_else(|| config_schema.settings_schema(&name));
-            merge_settings(&mut merged, settings, fields);
+            merge_filling(&mut merged, settings, fields);
             channel.set("settings", merged);
         }
-        for (key, child) in value.as_object().cloned().unwrap_or_default() {
-            if key == "settings" {
-                continue;
-            }
-            match channel.get_mut_at(&key) {
-                Some(slot) => merge_filling(slot, &child),
-                None => channel.set(&key, child.clone()),
-            }
-        }
+        // Everything else in the entry is dropped, and not by a schema check: every base
+        // field of `Channel` is tagged `yaml:"-"` (config_channel.go:224-231), so the yaml
+        // decoder never reads `enabled`, `type`, `allow_from` or the rest. A security file
+        // can say exactly one thing about a channel, which is its settings.
+        //
+        // That is what makes an entry under an unknown name a refusal rather than a new
+        // telegram channel: `type` in the entry is ignored, `InitChannelList` infers the
+        // type from the map key because the struct's is empty (config_channel.go:738), and
+        // `isValidChannelType` rejects `mychan`. A port that copies the entry's other keys
+        // accepts a file the shipped binary refuses -- and silently turns a secrets file
+        // into a way to enable a channel, which is not what it is for.
+        let _ = channel_schema;
     }
 }
 
-/// [`merge_filling`] for a channel's `settings` node, validated against the struct that
-/// channel type decodes into.
-///
-/// The shared check asks the **top-level** `Config` schema about a key at every depth. That
-/// is right for the two sections it was written for and wrong here: `media_group_delay_ms` is
-/// a field of `TelegramSettings`, not of `Config`, so the shared check dropped it and the
-/// security file's value never reached the typed decode -- the channel came back with the
-/// zero the file's entry had already forced, and a port that ignored the security file's
-/// settings entirely recorded the same bytes.
-///
-/// In Go the node is a `yaml.Node`, arbitrary by declaration, so the field list has to come
-/// from the struct the factory picks for the type. A type `channelSettingsFactory` does not
-/// know decodes into `map[string]any`, which accepts everything -- hence `None` meaning
-/// "keep it all" rather than "keep nothing".
-fn merge_settings(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
-    let (Some(base_entries), Some(overlay_entries)) = (base.as_object_mut(), overlay.as_object())
-    else {
-        *base = overlay.clone();
-        return;
-    };
-    for (k, v) in overlay_entries.clone() {
-        let child = fields.and_then(|schema| schema.field(&k));
-        if fields.is_some() && child.is_none() {
-            continue;
-        }
-        match base_entries.iter_mut().find(|(bk, _)| bk == &k) {
-            Some(slot) => merge_settings(&mut slot.1, &v, child),
-            None => base_entries.push((k, v)),
-        }
-    }
-}
-
-/// Like [`merge_over`], but a key the schema does not know is dropped instead of added.
+/// The security file's walk: like [`merge_over`], but a key the **target's own** schema
+/// cannot place is dropped rather than added.
 ///
 /// That is the whole difference between the two passes: the JSON document is validated
 /// before it is merged, so an unknown key there is a refusal; the security file is not
 /// validated, so an unknown key there is nothing at all.
-fn merge_filling(base: &mut Doc, overlay: &Doc) {
+///
+/// `fields` is the schema of the node being merged *into*, and it has to be threaded from
+/// the caller. Asking the top-level `Config` schema instead -- which is what this function
+/// did at every depth until a save case caught it -- is right for nothing below the root:
+/// `brave` is a field of `WebSearchConfig`, `media_group_delay_ms` of `TelegramSettings`,
+/// and neither is a field of `Config`, so both were dropped and the security file's values
+/// never reached the typed decode. The failure is quiet in the worst way: the channel came
+/// back with the zero its own entry had already forced, which is exactly what a port that
+/// ignored the security file entirely records.
+///
+/// `None` is not "no schema found", it is "this node has no schema to consult": a channel
+/// type `channelSettingsFactory` does not know decodes into `map[string]any`, which accepts
+/// every key. Callers that pass `None` therefore keep everything.
+fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) {
     let (Some(base_entries), Some(overlay_entries)) = (base.as_object_mut(), overlay.as_object())
     else {
         // Not an object on both sides, so there is nothing to fill: the security value
@@ -913,16 +899,18 @@ fn merge_filling(base: &mut Doc, overlay: &Doc) {
         *base = overlay.clone();
         return;
     };
-    let schema = schema::config_schema();
     let overlay_entries = overlay_entries.clone();
     for (k, v) in &overlay_entries {
-        if schema.field(k).is_none() && !matches!(k.as_str(), "settings" | "api_keys") {
+        let child = fields.and_then(|schema| schema.field(k));
+        if fields.is_some() && child.is_none() {
             // Not a field of the target type. Go's yaml decode has no place for it and
-            // moves on; the JSON path would have refused the same key.
+            // moves on; the JSON path would have refused the same key. `None` means the
+            // target has no schema to consult -- a type the factory does not know, which
+            // decodes into map[string]any and therefore accepts everything.
             continue;
         }
         match base_entries.iter_mut().find(|(bk, _)| bk == k) {
-            Some(slot) => merge_filling(&mut slot.1, v),
+            Some(slot) => merge_filling(&mut slot.1, v, child),
             None => base_entries.push((k.clone(), v.clone())),
         }
     }
