@@ -70,6 +70,7 @@ sides unambiguously.
 | Rust crate | Go package |
 |---|---|
 | `crab-tokenizer` | `pkg/tokenizer` |
+| `crab-protocoltypes` | `pkg/providers/protocoltypes` |
 | `crab-gojson` | Go's `encoding/json` — standard library, not a picoclaw package |
 
 Deviations from one-to-one need a reason written next to them. `crab-gojson` is
@@ -117,9 +118,16 @@ Port the buffer sizes, since they are usually the backpressure design.
 
 ## Where to start
 
-`crates/crab-tokenizer` is done and is the template: a Go-side generator, a
-committed corpus, a replay test, and unit tests that explain the traps. The next
-candidates are the other compat surfaces, in the order the oracle suite covers
-them — `providers/protocoltypes` (wire types), the memory JSONL store, then
-`pkg/config` — because those are the ones where a silent divergence damages users
-without ever failing a test.
+Two crates are done and are the template: `crab-tokenizer` (arithmetic and
+byte/rune tallies) and `crab-protocoltypes` (a serialisation surface). Each has a
+Go-side generator, a committed corpus, a replay test, and unit tests that explain
+the traps.
+
+They fail differently, which is why both are worth having as precedents. A
+tokenizer divergence is a wrong number that is invisible until a context window
+overflows. A wire-type divergence is a byte that a provider still accepts and that
+only the *next release* notices, when it reads back a session file the old port
+wrote. The second kind is the one no test catches without an oracle.
+
+Next, in the order the oracle suite covers them: the memory JSONL store, then
+`pkg/config`. Both are stored formats, so both are wire-type-shaped problems.
