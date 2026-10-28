@@ -19,6 +19,16 @@
 //! struct, and the corpus case that saves an empty `isolation` is what keeps that
 //! reading honest.
 //!
+//! ## `omitzero` is not the whole story for a secret
+//!
+//! `token,omitzero` over a `SecureString` and `api_keys,omitzero` over a `SecureStrings`
+//! are dropped from the JSON rendering even when they are full. Neither the option nor
+//! emptiness decides that: both types implement `MarshalJSON` and return **nil bytes**,
+//! and encoding/json omits a field when its Marshaler does that, without consulting the
+//! tag. The dump carries the type name at every one of them, so the pass drops them by
+//! name. This is the stage that keeps `sk-1` out of `config.json` while
+//! `.security.yml` carries it, and the reason no recorded loaded value contains a secret.
+//!
 //! ## `session` is omitted by code, not by a tag
 //!
 //! `Config.MarshalJSON` builds an anonymous struct that declares
@@ -131,6 +141,18 @@ pub fn apply_omit(document: &Doc, schema: &Schema) -> Doc {
                     ));
                     continue;
                 };
+                if matches!(child.name(), Some("SecureString") | Some("SecureStrings")) {
+                    // Go's `SecureString`/`SecureStrings` `MarshalJSON` returns nil bytes,
+                    // and encoding/json omits a field outright when its Marshaler does
+                    // that -- the tag never gets asked. So a secret never reaches
+                    // config.json, and never appears in the marshalled loaded value, which
+                    // is why the corpus records no secret anywhere and why a load-side case
+                    // cannot witness the security merge. The yaml half is the other story:
+                    // `yaml:"token,omitempty"` is an ordinary field to yaml.v3, so
+                    // `.security.yml` carries the value. See `docs/ARCHITECTURE.md` on
+                    // loader side-state.
+                    continue;
+                }
                 if is_dropped_by_omit(child, value) {
                     continue;
                 }
@@ -347,6 +369,43 @@ mod tests {
         assert!(
             session.get("dm_scope").is_none(),
             "an empty string is dropped"
+        );
+    }
+
+    #[test]
+    fn a_secure_field_is_dropped_however_full_it_is() {
+        // `api_keys` is `json:"api_keys,omitzero"` over a non-empty `SecureStrings`, so
+        // `omitempty`'s rule would keep it and Go does not: the Marshaler returns nil
+        // bytes and encoding/json omits the field before the tag matters. The fixture's
+        // `save_writes_both_halves` records a config.json with no `api_keys` key at all
+        // while its `.security.yml` carries `sk-1`, and the same pair is what the loader
+        // puts in the document -- so this is the only stage standing between a secret and
+        // the file that is not the secrets file.
+        let schema = config_schema();
+        let document = doc(
+            r#"{"version":3,"model_list":[{"model_name":"m1","api_keys":["sk-1"]}],
+                "tools":{"skills":{"github":{"token":"ghp_1"}}}}"#,
+        );
+        let out = apply_omit(&document, &schema);
+        let model = out
+            .get("model_list")
+            .and_then(Doc::as_array)
+            .and_then(|items| items.first())
+            .expect("the model is kept");
+        assert_eq!(
+            model.get("model_name").and_then(Doc::as_str),
+            Some("m1"),
+            "the entry itself is not what is dropped"
+        );
+        assert!(
+            model.get("api_keys").is_none(),
+            "SecureStrings never reaches the JSON rendering"
+        );
+        assert!(
+            out.path(&["tools", "skills", "github"])
+                .and_then(|g| g.get("token"))
+                .is_none(),
+            "nor does SecureString"
         );
     }
 
