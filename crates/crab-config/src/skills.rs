@@ -259,8 +259,6 @@ pub fn apply(merged: &mut Doc, security: &Security) -> Result<Vec<(String, Strin
     }
 
     // The deprecated `github.token`, which the yaml pass sets and the legacy pass reads.
-    // It is invisible in the loaded value -- `SecureString` marshals to nothing there --
-    // and its only observable effect is the registry it fills in below.
     //
     // The file's value *replaces* the document's whenever the key is present, and that
     // includes replacing it with nothing: pass 1 is `yaml.Unmarshal(data, cfg)`, and yaml
@@ -271,12 +269,39 @@ pub fn apply(merged: &mut Doc, security: &Security) -> Result<Vec<(String, Strin
     // document's token, while `security_github_file_token_absent_keeps_the_documents` shows
     // an absent key keeping it. Fill-only would pass both of the obvious cases and fail
     // exactly that pair.
+    //
+    // The assignment therefore has to land on the document, not just on this local. It used
+    // to be read and dropped, on the reasoning that the field is invisible in the loaded
+    // value -- which is true, `SecureString` marshals to nothing there, and `config.json`
+    // shows `github: {}` whichever token is in force. But `saveSecurityConfig` marshals the
+    // same typed field through yaml, where `yaml:"token,omitempty"` is writable, so
+    // `.security.yml` reports the *effective* token. Keeping the document's copy there is
+    // how the port wrote `token: ghp_doc` under a registry whose real token is `ghp_file`:
+    // one file with two answers about the same credential. Pinned by
+    // `security_registry_token_save_splits_masked_and_real`.
     let mut github_token = target
         .path(&["github", "token"])
         .map(scalar_text)
         .unwrap_or_default();
     if let Some(token) = file_skills.path(&["github", "token"]) {
         github_token = scalar_text(token);
+        match target.get_mut_at("github") {
+            // Clearing is a removal rather than an empty string: `omitempty` drops the key
+            // on both renderings, and writing `""` would put a key in the document that
+            // neither file can show.
+            Some(github) if github_token.is_empty() => {
+                github.remove("token");
+            }
+            Some(github) => github.set("token", Doc::String(github_token.clone())),
+            None if github_token.is_empty() => {}
+            None => target.set(
+                "github",
+                Doc::Object(vec![(
+                    "token".to_string(),
+                    Doc::String(github_token.clone()),
+                )]),
+            ),
+        }
     }
 
     // Pass 2 -- every other key in the file's `skills` mapping is a registry.
