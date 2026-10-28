@@ -77,6 +77,29 @@ this file as long as observable behaviour is identical. They belong in
   day it does, and this entry goes with it.
 - Recorded: 2026-10-26, #5; mechanism corrected 2026-10-28, #11.
 
+### The version probe's error has no preview block
+
+- Go: the version probe (`config.go:1311`, `json.Unmarshal` into
+  `struct { Version int }`) hands its error to `wrapJSONError` (`diagnostics.go:64`), which
+  for an `UnmarshalTypeError` returns the summary line *and*, when the offset lands on a
+  non-blank line, a second block: `   1 | {"version":"3"}` and a caret under the offending
+  column, dimmed and colour-bolded when `diagnosticsUseColor()` says the stream is a
+  terminal.
+- Rust: `version_type_diagnostic` returns the summary line only. The line, the column, the
+  field name, the expected type and the value word (`string`, `bool`, `number 3.5`) all
+  match; the preview is absent.
+- Why: the preview is a rendering decision, not a decoding one -- it depends on whether
+  stderr is a TTY, and on `trimDiagnosticLine`'s windowing around the caret. The corpus
+  records no error text at all (a failing case adds `error_op_index` and nothing else), so
+  there is nothing to pin it against and everything to get wrong.
+- Blast radius: anyone printing the error sees one line instead of two-then-two, and anyone
+  pattern-matching the *first* line is unaffected. `DiagnosticSummary` in Go strips the
+  preview for logs, so the summary the port does reproduce is the half Go treats as the
+  message.
+- Closes with: a preview renderer in `crab-config` plus a TTY probe, if anything ever needs
+  the two-line form. Nothing in the port prints config errors today.
+- Recorded: 2026-10-28, #11.
+
 ### A migrated document's security file is merged as data, and only its `model_list` half is ported
 
 - Go: `LoadConfig` calls `loadSecurityConfig` only for a document already at

@@ -14,13 +14,12 @@
 //! survives `omitempty` while `github` does not, and that `registries` is an empty map
 //! because the emptiness test saw a two-entry slice.
 //!
-//! The loader half is the mirror image, and it is a fact about Go's bytes rather than a
-//! claim this crate currently satisfies: the secrets that file carries are *invisible* in
+//! The loader half is the mirror image: the secrets that file carries are *invisible* in
 //! the value a config loads to, because `SecureString`/`SecureStrings` marshal to nothing.
 //! A case that compares loaded values therefore cannot tell a security merge that worked
 //! from one that never ran -- which is why the corpus's security cases grade a `save`, and
 //! why `go_records_no_secrets_in_the_loaded_value` pins the rule from the recorded
-//! expectation while naming the stage that still leaves this crate on the other side of it.
+//! expectation and from this crate's own rendering.
 
 use std::fs;
 use std::path::Path;
@@ -187,16 +186,21 @@ fn go_records_no_secrets_in_the_loaded_value() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::write(dir.path().join("config.json"), original).expect("seed config.json");
     let value = loaded(dir.path());
-    // Not `assert_eq!(value, want_value)`, and not an absence claim about this crate: four
+    // This crate now lands on the same side of the rule as Go, for the one part of the
+    // document the SecureString family touches. Not `assert_eq!(value, want_value)`: three
     // unported stages still show in the whole document -- `InitChannelList`, the telegram
-    // values `defaults.rs` adds, the SecureString family (which is why the loaded value
-    // here *does* still carry `api_keys`), and `expandMultiKeyModels`. The conformance
-    // harness compares these same values with exactly those stages stripped, per case, and
-    // fails if any of them stops being the explanation.
+    // values `defaults.rs` adds, and `expandMultiKeyModels` -- and the conformance harness
+    // compares these same values with exactly those stages stripped, per case.
     assert!(
-        value.contains("sk-1"),
-        "this crate is still on the wrong side of that rule, and KNOWN_LOAD_GAPS says so: \
+        !value.contains("sk-1"),
+        "the port drops a secret from the JSON rendering the way Go's nil MarshalJSON does: \
          {value}"
+    );
+    let produced: Value = serde_json::from_str(&value).expect("the loaded value is JSON");
+    assert!(
+        produced["model_list"][0].get("api_keys").is_none(),
+        "absent from this crate's rendering too, not empty and not masked: {}",
+        produced["model_list"][0]
     );
 
     // Re-saving *Go's own pair* has to give Go's bytes back. Not asserted: that the pair

@@ -343,26 +343,17 @@ const KNOWN_LOAD_GAPS: &[(&str, &[&str])] = &[
     ("save_writes_the_document", &["channel_settings"]),
     ("save_bumps_an_old_version", &["channel_settings"]),
     ("session_omitted_when_empty", &["channel_settings"]),
-    (
-        "migrate_backs_up_both_files",
-        &["channel_settings", "model_api_keys"],
-    ),
+    ("migrate_backs_up_both_files", &["channel_settings"]),
     (
         "unparseable_security_file_is_refused",
-        &["channel_settings", "model_api_keys"],
+        &["channel_settings"],
     ),
     (
         "security_entry_replaces_the_json_model",
-        &["channel_settings", "model_api_keys"],
+        &["channel_settings"],
     ),
-    (
-        "security_seq_form_is_refused",
-        &["channel_settings", "model_api_keys"],
-    ),
-    (
-        "save_writes_both_halves",
-        &["channel_settings", "model_api_keys"],
-    ),
+    ("security_seq_form_is_refused", &["channel_settings"]),
+    ("save_writes_both_halves", &["channel_settings"]),
     (
         "virtual_key_models_are_written_back_once",
         &["channel_settings", "model_list"],
@@ -392,17 +383,6 @@ fn strip_gap(label: &str, value: &mut Value) {
                         for key in ["settings", "typing", "placeholder"] {
                             fields.remove(key);
                         }
-                    }
-                }
-            }
-        }
-        // The SecureString family must marshal to nothing at all, so a model's `api_keys`
-        // belongs in `.security.yml` and never in the loaded value.
-        "model_api_keys" => {
-            if let Some(models) = value.get_mut("model_list").and_then(Value::as_array_mut) {
-                for model in models {
-                    if let Some(fields) = model.as_object_mut() {
-                        fields.remove("api_keys");
                     }
                 }
             }
