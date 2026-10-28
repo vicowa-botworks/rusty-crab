@@ -207,14 +207,16 @@ impl Config {
 /// * `ValidateModelList` and `ValidateTurnProfile`.
 ///
 /// The security file *is* read, because leaving it out would load a config whose secrets
-/// are in the wrong place. `channels`/`channel_list` and `model_list` are merged. The
-/// other two sections Go applies -- `web` and `skills`, which reach `tools.web` and
-/// `tools.skills` through `Tools`' `yaml:",inline"` -- are reached and then dropped, which
-/// is a divergence and is recorded in `docs/DIVERGENCES.md` with its real mechanism: the
-/// inline branch runs, and `merge_filling` refuses the key because it asks the root schema
-/// what is a field. Refusing them instead was the
+/// are in the wrong place. `channels`/`channel_list` and `model_list` are merged, and
+/// `skills` is applied by [`skills::apply`] -- the legacy lift and both registry passes,
+/// which is what the `tools.skills` half of the loaded value is pinned against.
+///
+/// One section Go applies is still dropped: `web`, which reaches `tools.web` through
+/// `Tools`' `yaml:",inline"`. That is a divergence and is recorded in `docs/DIVERGENCES.md`
+/// with its real mechanism: the inline branch runs, and `merge_filling` refuses the key
+/// because it asks the root schema what is a field. Refusing both sections instead was the
 /// earlier behaviour and it was worse: every `.security.yml` the shipped binary has ever
-/// written carries both, so refusing made the loader reject the normal case. A key the
+/// written carries them, so refusing made the loader reject the normal case. A key the
 /// struct does not name at all is ignored, because `loadSecurityConfig` calls plain
 /// `yaml.Unmarshal` and not `UnmarshalStrict`.
 ///

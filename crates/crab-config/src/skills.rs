@@ -188,10 +188,12 @@ impl Registry {
 /// A null is the one shape that never reaches `UnmarshalYAML` at all: yaml.v3 short-circuits
 /// `!!null` for a type with a custom unmarshaler and zeroes the target, so `fromRaw` is
 /// never called and the `SecureString` stays empty. Printing the node would give `"null"`,
-/// which is a credential -- `security_legacy_null_token_creates_no_credential` and
-/// `security_legacy_empty_token_creates_no_credential` pin the registry existing with no
-/// `auth_token` key at all. Numbers are the opposite case: `42` and `1.5` are both printed
-/// scalars, so both create one.
+/// which is a credential. `a_null_or_empty_legacy_token_creates_no_credential` pins the
+/// registry existing with no `auth_token` key at all; the corpus cases of the same shape
+/// (`security_legacy_null_token_creates_no_credential`,
+/// `security_legacy_empty_token_creates_no_credential`) exist only at picoclaw `origin/main`,
+/// so until the fixture moves the unit test is the whole pin. Numbers are the opposite case:
+/// `42` and `1.5` are both printed scalars, so both create one.
 fn scalar_text(node: &Doc) -> String {
     match node {
         Doc::String(s) => s.clone(),
@@ -206,14 +208,24 @@ fn scalar_text(node: &Doc) -> String {
 
 /// Applies both passes to a document the JSON loader already settled.
 pub fn apply(merged: &mut Doc, security: &Security) {
-    let Some(file_skills) = security.document.get("skills") else {
-        return;
-    };
     let Some(target) = merged
         .get_mut_at("tools")
         .and_then(|tools| tools.get_mut_at("skills"))
     else {
         return;
+    };
+
+    // The gate is the *document*, not the security file. Go runs `SkillsRegistriesConfig`'s
+    // decoder whenever `tools.skills.registries` is there to decode, and the file only decides
+    // whether the two merge passes below run; returning here when the file has no `skills`
+    // section made whether `config.json` is normalised depend on whether an unrelated file
+    // happens to exist -- and the common install has no `.security.yml` at all.
+    let file_skills = match security.document.get("skills") {
+        Some(node @ Doc::Object(_)) => Some(node),
+        // A non-mapping `skills` value is the divergence recorded under "loads a non-mapping
+        // skills value Go refuses": no pass below can read it, and the doc-side rebuild still
+        // runs, which is the half that has nothing to do with the file.
+        _ => None,
     };
 
     // The registries the document already carries, in the shape Go holds them.
@@ -241,7 +253,8 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     // decodes element 1. Reading only the mapping form silently leaves such a registry at
     // its defaults -- a different config rather than a refused one, which is worse than the
     // refusals this pass does raise.
-    for (name, node) in registry_nodes(file_skills.get("registries")) {
+    let file_registries = file_skills.map(|f| registry_nodes(f.get("registries")));
+    for (name, node) in file_registries.as_deref().unwrap_or(&[]) {
         let name = name.trim();
         if name.is_empty() {
             continue;
@@ -258,12 +271,15 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     // The file's value *replaces* the document's whenever the key is present with a value,
     // and that includes replacing it with nothing: pass 1 is `yaml.Unmarshal(data, cfg)`, and
     // yaml decodes a struct field into the existing value, so `SecureString.UnmarshalYAML`
-    // assigns whatever the node holds. `security_github_file_token_empty_overwrites_the_documents`
-    // is the only case that can see the difference -- with both sides non-empty the mask
-    // renders `[NOT_HERE]` either way -- and it shows `token: ""` in the file removing the
-    // document's token, while `security_github_file_token_absent_keeps_the_documents` shows
-    // an absent key keeping it. Fill-only would pass both of the obvious cases and fail
-    // exactly that pair.
+    // assigns whatever the node holds. The difference is only visible when one side is empty
+    // -- with both sides non-empty the mask renders `[NOT_HERE]` either way -- and it is
+    // pinned here by `the_files_github_token_replaces_the_documents` and
+    // `a_null_leaves_a_credential_the_document_already_holds`. The two corpus cases that name
+    // the pair exactly, `security_github_file_token_empty_overwrites_the_documents` and
+    // `security_github_file_token_absent_keeps_the_documents`, are not in this repo's fixture
+    // yet (they are at picoclaw `origin/main`), so the unit tests are the whole pin until the
+    // fixture moves. Fill-only would pass both of the obvious cases and fail exactly that
+    // pair.
     //
     // A null is the third state, and it belongs with "absent", not with "empty": yaml
     // short-circuits `!!null` before the unmarshaler, so the field keeps the document's value
@@ -274,14 +290,14 @@ pub fn apply(merged: &mut Doc, security: &Security) {
         .map(scalar_text)
         .unwrap_or_default();
     if let Some(token) = file_skills
-        .path(&["github", "token"])
+        .and_then(|f| f.path(&["github", "token"]))
         .filter(|t| !matches!(t, Doc::Null))
     {
         github_token = scalar_text(token);
     }
 
     // Pass 2 -- every other key in the file's `skills` mapping is a registry.
-    if let Doc::Object(entries) = file_skills {
+    if let Some(Doc::Object(entries)) = file_skills {
         for (key, node) in entries {
             let name = key.trim();
             if name.is_empty() || name == "registries" {
@@ -419,6 +435,63 @@ mod tests {
 
     fn has_token(registry: &Doc) -> bool {
         registry.get("auth_token").is_some()
+    }
+
+    /// The document's own `registries` is normalised by Go's decoder whether or not a
+    /// `.security.yml` exists -- and the common install has none. Gating the whole pass on the
+    /// file left these three shapes echoed back as written: a nested `param` kept under a
+    /// `param` key instead of flattened into the marshaler's top level, a `name` that
+    /// `MarshalJSON` never writes, and an `auth_token` the document spelled `null`. Putting
+    /// the `skills` key back in the security file made the first and third agree again, which
+    /// is what makes the *gate* the bug rather than the shapes themselves.
+    #[test]
+    fn the_documents_registries_are_normalised_without_a_security_file() {
+        let registries = registries_after(
+            "",
+            vec![(
+                "registries",
+                Doc::Object(vec![
+                    (
+                        "flattened".to_string(),
+                        Doc::Object(vec![
+                            ("enabled".to_string(), Doc::Bool(true)),
+                            (
+                                "param".to_string(),
+                                Doc::Object(vec![("a".to_string(), Doc::Int(1))]),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "renamed".to_string(),
+                        Doc::Object(vec![
+                            ("name".to_string(), Doc::String("named".to_string())),
+                            ("enabled".to_string(), Doc::Bool(true)),
+                        ]),
+                    ),
+                    (
+                        "nulled".to_string(),
+                        Doc::Object(vec![
+                            ("enabled".to_string(), Doc::Bool(true)),
+                            ("auth_token".to_string(), Doc::Null),
+                        ]),
+                    ),
+                ]),
+            )],
+        );
+        let flattened = registry_of(&registries, "flattened");
+        assert_eq!(flattened.get("a"), Some(&Doc::Int(1)), "{flattened:?}");
+        assert!(
+            flattened.get("param").is_none(),
+            "`param` survived: {flattened:?}"
+        );
+        assert!(
+            registry_of(&registries, "renamed").get("name").is_none(),
+            "`name` is not a field Go marshals"
+        );
+        assert!(
+            !has_token(&registry_of(&registries, "nulled")),
+            "a null `auth_token` became a key"
+        );
     }
 
     /// yaml.v3 short-circuits `!!null` for a type with a custom unmarshaler, so the

@@ -45,18 +45,21 @@ package, a module split that does not match a directory -- are not divergences i
 this file as long as observable behaviour is identical. They belong in
 `ARCHITECTURE.md`, next to the reason.
 
-### `crates/crab-config` drops the `web` and `skills` sections of `.security.yml`
+### `crates/crab-config` drops the `web` section of `.security.yml`
 
 - Go: `loadSecurityConfig` unmarshals the whole file into `Config`, and `Tools` is tagged
-  `yaml:",inline"`, so a top-level `web:` or `skills:` in the security file lands on
-  `tools.web` / `tools.skills` and overrides the JSON config. Both sections are written by
-  `saveSecurityConfig` whenever a search provider has an API key or a skill registry has an
-  auth token, so they are present in most real files.
-- Rust: they are reached and then dropped. `apply_security` does walk the inline branch --
+  `yaml:",inline"`, so a top-level `web:` in the security file lands on `tools.web` and
+  overrides the JSON config. The section is written by `saveSecurityConfig` whenever a search
+  provider has an API key, so it is present in most real files.
+- Rust: it is reached and then dropped. `apply_security` does walk the inline branch --
   it takes `tools`' own yaml list from the dump and hands each child to `merge_filling` --
   but `merge_filling` decides whether a key is a field by asking the **root** `Config`
-  schema, where `web` and `skills` are not fields of anything: they are fields of `Tools`,
-  one level down. The key is skipped and the section is gone.
+  schema, where `web` is not a field of anything: it is a field of `Tools`, one level down.
+  The key is skipped and the section is gone.
+- Scope note: `skills` used to be listed here as well. It is applied now, by
+  `skills::apply` (the legacy lift plus both registry passes); what is still open on that
+  section is its own entry below, and it is about the *builtin registry materialisation*, not
+  about the inline walk.
 - Why it is still open: the fix is the architecture rule this file already states -- thread
   the target's schema through the walk instead of resolving field knowledge once at the
   root -- and `merge_filling` is also the function the channel `settings` merge goes
@@ -116,6 +119,41 @@ this file as long as observable behaviour is identical. They belong in
 - Closes with: the singleton registry and the streaming rules carried in the dump (the same
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
+
+### A null or non-mapping `registries` section cannot be answered without the builtin registries
+
+- Go: `SkillsRegistriesConfig` is a slice, so yaml.v3's `!!null` short-circuit *zeroes* it
+  before the custom unmarshaler is reached -- the same short-circuit that makes a null
+  `SecureString` keep what it held, arriving at the opposite result because the kind differs.
+  The decoder then re-materialises the two builtins at their **zero** values, and the
+  document's own registries are gone with the slice. Measured at picoclaw `origin/main` and at
+  the fixture's head, identical on both:
+
+  | `.security.yml` `skills:` | Go's `tools.skills.registries` |
+  | --- | --- |
+  | `registries:` (null) | `clawhub {enabled: false, base_url: ""}`, `github {enabled: false, base_url: ""}` |
+  | same, with `custom` in `config.json` | `custom` gone entirely |
+  | `registries: null` beside a legacy key | builtins zeroed **and** the legacy registry created |
+  | `registries: {}` / `registries: []` | builtins intact (the port agrees) |
+  | `config.json` `registries: [{name: github, enabled: true}]`, no security file | the array ignored; `clawhub` + `github` at **defaults** |
+
+- Rust: a null section reads as "nothing to do" (`registry_nodes`' `_ => Vec::new()`), so the
+  builtins stay at their defaults and a `custom` survives; a non-object document `registries`
+  is echoed as written, which changes the *kind* of the node and deletes a builtin.
+- Why it is not fixed in the same commit as the gate: both answers need the two builtin
+  registries -- their names and the base URLs `defaults()` gives them -- and the port has
+  neither anywhere. `clawhub` appears nowhere in `crates/crab-config/src/` and not in the
+  schema dump, because it is data in `config.go:1560`/`:1609`, not a struct tag, so the AST
+  extractor cannot see it. Writing the pair by hand is exactly the failure mode `base_fields`
+  was extracted into the dump to avoid: a list that silently disagrees the day Go changes a
+  default.
+- Blast radius: an operator who leaves a `registries:` header and nothing under it gets a
+  config where clawhub is still enabled under the port and disabled under the shipped binary.
+  The array spelling is rarer and rewrites the node's kind.
+- Closes with: the builtin registry list carried in the dump the way the singleton channel
+  registry is (one Go-side extraction, then the two arms here are four lines), tracked as
+  vicowa-botworks/rusty-crab#13.
+- Recorded: 2026-10-28, #8 round 3.
 
 ### `crates/crab-config` loads a non-mapping skills value Go refuses
 
