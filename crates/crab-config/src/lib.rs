@@ -20,7 +20,17 @@
 //! * **strictness** ([`schema`]): every JSON decode reflects the target type and
 //!   refuses a key it cannot place, at any depth, naming the path. The security file is
 //!   the opposite -- decoded by a YAML library that ignores what it does not know -- and
-//!   an entry there *replaces* the JSON one rather than merging.
+//!   an entry there *fills in* rather than replacing. Which fields an entry may fill is
+//!   its own rule per section, and it is narrower than the entry's shape suggests:
+//!   `model_list` reaches exactly one field (`api_keys`), a channel's `settings` reaches
+//!   that settings struct, and a key with no yaml-tagged field to land in is dropped.
+//!   See [`apply_security`]. **All of that is the current version's answer.** A document
+//!   below `CurrentVersion` never reaches `loadSecurityConfig`: `LoadConfig`'s migration
+//!   arms merge the two files as plain data in `loadConfigMap`, and the strict validator
+//!   then runs over the merged bytes -- so the same `.security.yml` that is ignored at v3
+//!   is refused at v2, by config.json's own sentence. Both sides are measured, in the
+//!   `load` tests named `an_unknown_security_key_is_refused_for_a_legacy_document_only`
+//!   and `a_sequence_is_refused_for_the_current_version_and_ignored_for_a_legacy_one`.
 //! * **the pair** ([`yaml`]): `.security.yml` is the yaml-tagged half, which is not the
 //!   two sections its struct tags suggest at a glance.
 //!
@@ -198,8 +208,10 @@ impl Config {
 /// The security file *is* read, because leaving it out would load a config whose secrets
 /// are in the wrong place. `channels`/`channel_list` and `model_list` are merged. The
 /// other two sections Go applies -- `web` and `skills`, which reach `tools.web` and
-/// `tools.skills` through `Tools`' `yaml:",inline"` -- are parsed and then dropped, which
-/// is a divergence and is recorded in `docs/DIVERGENCES.md`. Refusing them instead was the
+/// `tools.skills` through `Tools`' `yaml:",inline"` -- are reached and then dropped, which
+/// is a divergence and is recorded in `docs/DIVERGENCES.md` with its real mechanism: the
+/// inline branch runs, and `merge_filling` refuses the key because it asks the root schema
+/// what is a field. Refusing them instead was the
 /// earlier behaviour and it was worse: every `.security.yml` the shipped binary has ever
 /// written carries both, so refusing made the loader reject the normal case. A key the
 /// struct does not name at all is ignored, because `loadSecurityConfig` calls plain
@@ -242,12 +254,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     let version = match document.get("version") {
         None | Some(Doc::Null) => 0,
         Some(Doc::Int(v)) => *v,
-        Some(other) => {
-            return Err(Error::VersionType(format!(
-                "cannot unmarshal {} into Go struct field .version of type int",
-                type_word(other)
-            )))
-        }
+        Some(other) => return Err(Error::VersionType(version_type_diagnostic(&text, other))),
     };
 
     if text.len() <= TINY_DOCUMENT_MAX {
@@ -262,32 +269,47 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         CURRENT_VERSION => document,
         other => return Err(Error::UnsupportedVersion(other)),
     };
+    let migrated = version < CURRENT_VERSION;
 
-    // The decode. Go decodes into a fresh DefaultConfig() and the unknown-field
-    // validator runs over the same bytes first, so strictness and defaults-filling are
-    // two passes over the document, not one.
-    validate_against(&document, &config_schema())
-        .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
+    // The security file, read before anything is validated. Absent is normal -- a config
+    // written before the split has none -- but any *other* read failure is fatal.
+    // `if let Ok(..)` here would treat EACCES or invalid UTF-8 as "no secrets file" and
+    // carry on with default secrets, which is the one place a silent fallback points the
+    // wrong way: it does not load a slightly staler config, it loads one that believes
+    // nothing is configured and then writes that belief back on the next save.
+    let security_path = path.with_file_name(SECURITY_FILE);
+    let security = match std::fs::read_to_string(&security_path) {
+        Ok(text) => Some(yaml::parse(&text)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Error::Io(format!("failed to read security config: {e}"))),
+    };
+
+    // The decode. Go decodes into a fresh DefaultConfig() and the unknown-field validator
+    // runs over the same bytes first, so strictness and defaults-filling are two passes
+    // over the document, not one. Which bytes those are depends on the version: a
+    // current-version document is validated as config.json alone, because its security file
+    // is decoded separately by `yaml.v3`; a legacy one has already been merged with the
+    // security file as plain data by `loadConfigMap`, re-marshalled, and validated as one
+    // document -- so a key only the security file introduced is refused there, with
+    // config.json's own sentence.
+    let mut issues = unknown_fields(&document, &config_schema());
+    if migrated {
+        if let Some(security) = &security {
+            issues.extend(unknown_fields(&migration_view(security), &config_schema()));
+            issues.sort();
+        }
+    }
+    if !issues.is_empty() {
+        return Err(Error::UnknownField(issues.join(", ")));
+    }
     let mut merged = default_config(home);
     merge_over(&mut merged, &document, &config_schema());
 
-    // The security file, read after the document and merged into it. Its absence is
-    // normal -- a config written before the split has none -- and its presence is what
-    // makes a loaded config differ from the file it came from.
-    // The security file. Absent is normal -- a config written before the split has none
-    // -- but any *other* read failure is fatal. `if let Ok(..)` here would treat EACCES
-    // or invalid UTF-8 as "no secrets file" and carry on with default secrets, which is
-    // the one place a silent fallback points the wrong way: it does not load a slightly
-    // staler config, it loads one that believes nothing is configured and then writes
-    // that belief back on the next save.
-    let security_path = path.with_file_name(SECURITY_FILE);
-    match std::fs::read_to_string(&security_path) {
-        Ok(text) => {
-            let security = yaml::parse(&text)?;
-            apply_security(&mut merged, &security)?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Io(format!("failed to read security config: {e}"))),
+    if let Some(security) = &security {
+        // Not wrapped. `Error::SecurityType` and `Error::UnparseableSecurity` are the two
+        // kinds this stage can raise and both name themselves; folding them into `Error::Io`
+        // would report a type error as a read failure.
+        apply_security(&mut merged, security, migrated)?;
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before
@@ -304,6 +326,40 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         document: merged,
         needs_version_bump: version < CURRENT_VERSION,
     })
+}
+
+/// The security file as the migration path sees it: data to be merged into config.json,
+/// after the two rewrites `loadConfigMap` performs on the way.
+///
+/// `model_list` is gone because that merge already consumed it, by name, and leaving a map
+/// under the key the schema says is an array would report an error Go does not. `web` and
+/// `skills` move under `tools` because `Config.Tools` is `yaml:",inline"`, so those two
+/// sections *are* tools fields to the decoder -- and the lift **replaces** any `tools`
+/// section the file itself carried, which is why a security file with both a `tools:` and a
+/// `web:` section has its `tools:` thrown away.
+fn migration_view(security: &yaml::Security) -> Doc {
+    let present = |name: &str| {
+        security
+            .document
+            .get(name)
+            .is_some_and(|v| !matches!(v, Doc::Null))
+    };
+    let mut entries: Vec<(String, Doc)> =
+        security.document.as_object().cloned().unwrap_or_default();
+    entries.retain(|(name, _)| name != "model_list");
+    if present("web") || present("skills") {
+        entries.retain(|(name, _)| name != "web" && name != "skills" && name != "tools");
+        let mut lifted: Vec<(String, Doc)> = Vec::new();
+        for name in ["web", "skills"] {
+            if present(name) {
+                if let Some(value) = security.document.get(name) {
+                    lifted.push((name.to_string(), value.clone()));
+                }
+            }
+        }
+        entries.push(("tools".to_string(), Doc::Object(lifted)));
+    }
+    Doc::Object(entries)
 }
 
 /// `SessionConfig.ApplyDmScope` then `DeriveDmScope` (config.go:360 and :380).
@@ -382,18 +438,69 @@ fn apply_dm_scope(document: &mut Doc) {
 }
 
 /// The word Go's type-error sentence uses for a JSON value.
-fn type_word(value: &Doc) -> &'static str {
-    match value {
-        Doc::String(_) => "string",
-        Doc::Bool(_) => "bool",
-        Doc::Float(_) => "float",
-        Doc::Array(_) => "array",
-        Doc::Object(_) => "object",
-        Doc::Int(_) | Doc::Null => "number",
+/// Go's `wrapJSONError` summary for the version probe (`diagnostics.go:81`, reached from
+/// `config.go:1311`). The probe decodes into `struct { Version int }`, so a version that
+/// is not an integer is an `UnmarshalTypeError` naming the field, and the wrapper restates
+/// it with the position of the value's last byte -- which is where serde puts it too, so
+/// the two agree on line and column for every shape measured against Go.
+///
+/// Go appends a preview block after this line (`   1 | {"version":"3"}` and a caret). It
+/// is deliberately not reproduced: it is coloured by `diagnosticsUseColor()`, and the
+/// corpus records no error text at all -- a failing case adds `error_op_index` and nothing
+/// else -- so this sentence exists for a human reading a failed start, not for a pin.
+fn version_type_diagnostic(text: &str, value: &Doc) -> String {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        #[allow(dead_code)]
+        version: i64,
     }
+    let (line, column) = serde_json::from_str::<Probe>(text)
+        .err()
+        .map(|e| (e.line(), e.column()))
+        .unwrap_or((1, 1));
+    // Go's `UnmarshalTypeError.Value`: the type name for a string or bool, and the literal
+    // text for a number, so `3.5` reads back as `number 3.5` and `1e10` as `number 1e10`.
+    let got = match value {
+        Doc::Float(_) | Doc::Int(_) => format!("number {}", number_literal(text, line, column)),
+        Doc::String(_) => "string".to_string(),
+        Doc::Bool(_) => "bool".to_string(),
+        Doc::Object(_) => "object".to_string(),
+        Doc::Array(_) => "array".to_string(),
+        Doc::Null => "null".to_string(),
+    };
+    format!(
+        "config.json type error at line {line}, column {column} for field \"version\": \
+         expected int but got {got}"
+    )
+}
+
+/// The number as the file spells it. A parsed float cannot give `1e10` back, so the
+/// literal is taken from the source: the run of number characters ending at the column
+/// the decoder stopped on.
+fn number_literal(text: &str, line: usize, column: usize) -> String {
+    let Some(line_text) = text.lines().nth(line.saturating_sub(1)) else {
+        return String::from("0");
+    };
+    let end = column.min(line_text.chars().count());
+    let taken: Vec<char> = line_text.chars().take(end).collect();
+    let start = taken
+        .iter()
+        .rposition(|c| !matches!(c, '0'..='9' | '.' | 'e' | 'E' | '+' | '-'))
+        .map_or(0, |i| i + 1);
+    taken[start..].iter().collect()
 }
 
 /// Fills the security file's sections into a document the JSON loader already settled.
+///
+/// `migrated` is the version's answer to a question the file cannot ask. A current-version
+/// document gets `loadSecurityConfig`, the typed merge described below. A legacy one never
+/// does: `LoadConfig`'s migration arms merge the two files as **plain data** in
+/// `loadConfigMap`, migrate the result, and hand the re-marshalled bytes to the ordinary
+/// decoder -- so for a migrated document only the `model_list` merge below runs (Go's
+/// `mergeModelListsWithMap`, which is the same matching by the same rule) and the rest of
+/// this function's work would be inventing a merge that happens somewhere else, differently
+/// and earlier. What the data merge does instead is recorded in `docs/DIVERGENCES.md`.
 ///
 /// `loadSecurityConfig` runs `yaml.Unmarshal(data, cfg)` over the whole file, so what
 /// applies is decided by the *yaml* tags, not the json ones -- a different set, and the
@@ -405,31 +512,86 @@ fn type_word(value: &Doc) -> &'static str {
 ///   contains both, so a loader that only knew the first two refused every real file.
 /// * Anything else in the file has no yaml-tagged field to land in and is dropped. That
 ///   is Go's behaviour, not a gap: the yaml half has no unknown-field validator, which is
-///   the asymmetry [`yaml`] documents.
+///   the asymmetry [`yaml`] documents -- for a *current-version* document, since a migrated
+///   one has its security file validated as config.json bytes. See [`migration_view`].
 ///
 /// Per field, not per entry: the file decodes into a `Config` the JSON pass has already
-/// populated, so an entry replaces the fields it names and leaves the rest alone.
-fn apply_security(merged: &mut Doc, security: &yaml::Security) -> Result<(), Error> {
+/// populated, so an entry touches the fields it names and leaves the rest alone. Which
+/// fields a section may name is decided by that section's own projection, not by the
+/// entry's shape -- `model_list` gets `api_keys` and nothing else, and an entry naming a
+/// model the document does not hold is ignored.
+fn apply_security(
+    merged: &mut Doc,
+    security: &yaml::Security,
+    migrated: bool,
+) -> Result<(), Error> {
     let schema = schema::config_schema();
 
-    if let Some(models) = security.model_list() {
-        // The file keys entries `name:index`; the document holds a sequence. Only the
-        // entries the file mentions are touched, and a key naming an entry that is not
-        // there is added, because Go's map decode creates it.
-        let Some(list) = merged.get_mut_at("model_list").and_then(Doc::as_array_mut) else {
-            return Ok(());
-        };
-        let Doc::Object(entries) = models else {
-            return Ok(());
-        };
-        let wanted = yaml::to_name_index(list);
-        for (key, value) in entries {
-            if let Some(position) = wanted.iter().position(|k| k == key) {
-                merge_filling(&mut list[position], value);
-            } else if let Doc::Object(_) = value {
-                list.push(value.clone());
+    // A `model_list` that is not a mapping: the JSON shape copied into a YAML file, or gone
+    // entirely. Fatal here, ignored for a migrated document, where `loadConfigMap` merges
+    // the section only if it is a map and deletes it either way. Measured on both sides of
+    // the same file: v3 refuses with the decoder's sentence, v2 loads the default list.
+    // `filter` rather than a nested `if`: the edition here has no let chains, and a nested
+    // one is what `collapsible_if` asks to collapse into a let chain.
+    if let Some(kind) = security.model_list_kind.filter(|_| !migrated) {
+        return Err(Error::SecurityType(format!(
+            "cannot unmarshal !!{kind} into map[string]*config.ModelConfig"
+        )));
+    }
+
+    // A `model_list` that is a mapping. A section that is not one was refused above, or
+    // parsed as an empty map for `model_list:` with no value; the migrated path ignores one.
+    if let Some(Doc::Object(entries)) = security.model_list() {
+        if let Some(list) = merged.get_mut_at("model_list").and_then(Doc::as_array_mut) {
+            // The file keys entries `name:index`; the document holds a sequence.
+            //
+            // `SecureModelList.UnmarshalYAML` (config_struct.go:326) walks the models the
+            // JSON loader produced and asks the security map for each one's `name:index`
+            // key, falling back to the bare name for a file written before the index was
+            // added. Three things follow, all measured against `LoadConfig` rather than read
+            // off the type:
+            //
+            // * **An entry naming no model is ignored, not appended.** The loop runs over the
+            //   models, not over the map, so a leftover `m9:0` against a config that lists
+            //   only `m1` contributes nothing. Appending it instead invents a model with an
+            //   empty name: the next `save` writes it into `config.json`, names it `:0` in
+            //   the security file, and the round trip cannot even reproduce the entry it
+            //   wrote. `mergeModelListsWithMap` drops it the same way on the migration path,
+            //   and deletes it from the map first so the generic data merge cannot turn it
+            //   into a top-level key.
+            // * **Only `api_keys` is taken.** `m.APIKeys = sec.APIKeys` is a field
+            //   assignment, so `m1:0: {provider: other}` leaves the provider alone -- merging
+            //   the whole entry would let the secrets file set a model's provider or rpm.
+            // * **The assignment is unconditional when the entry matches**, so a matching
+            //   entry with no `api_keys` clears the model's keys rather than leaving them
+            //   alone.
+            let keys = yaml::to_name_index(list);
+            for (position, key) in keys.iter().enumerate() {
+                let name = list[position]
+                    .get("model_name")
+                    .and_then(Doc::as_str)
+                    .unwrap_or_default();
+                let entry = entries
+                    .iter()
+                    .find(|(spelled, _)| spelled == key)
+                    .or_else(|| entries.iter().find(|(spelled, _)| spelled == name))
+                    .map(|(_, value)| value);
+                match entry.and_then(|value| value.get("api_keys")) {
+                    Some(found) => list[position].set("api_keys", found.clone()),
+                    // Go assigns a nil slice, which marshals to nothing. Removing the key is
+                    // that; an empty array would be a different value that happens to print
+                    // the same.
+                    None if entry.is_some() => {
+                        list[position].remove("api_keys");
+                    }
+                    None => {}
+                }
             }
         }
+    }
+
+    if migrated {
+        return Ok(());
     }
 
     for field in schema.yaml_fields() {
@@ -974,15 +1136,34 @@ mod tests {
     fn a_version_that_is_not_an_integer_is_refused_by_name() {
         // `{"version":"3"}` is the case `unwrap_or(0)` got wrong: filed as v0, the whole
         // migration ladder ran over the document and `needs_version_bump` was set, so a
-        // config Go refuses came out looking migrated. Go's sentence names the field and
-        // the target type, because the probe decodes into a typed struct.
-        let (_dir, path) = write_temp(r#"{"version":"3"}"#);
-        let err = load(&path, "/home/oracle").expect_err("a string version must be refused");
-        assert!(matches!(err, Error::VersionType(_)), "got {err}");
-        assert_eq!(
-            err.to_string(),
-            "cannot unmarshal string into Go struct field .version of type int"
-        );
+        // config Go refuses came out looking migrated.
+        //
+        // The sentence is Go's, measured from `LoadConfig` rather than composed: the probe
+        // decodes into a typed struct and `wrapJSONError` restates the type error with the
+        // position of the value's last byte. The three shapes below are the three ways a
+        // version can be wrong, and the column moves with the literal's length.
+        for (document, want) in [
+            (
+                r#"{"version":"3"}"#,
+                "config.json type error at line 1, column 14 for field \"version\": \
+                 expected int but got string",
+            ),
+            (
+                r#"{"version":true}"#,
+                "config.json type error at line 1, column 15 for field \"version\": \
+                 expected int but got bool",
+            ),
+            (
+                r#"{"version":3.5}"#,
+                "config.json type error at line 1, column 14 for field \"version\": \
+                 expected int but got number 3.5",
+            ),
+        ] {
+            let (_dir, path) = write_temp(document);
+            let err = load(&path, "/home/oracle").expect_err("a non-integer version is refused");
+            assert!(matches!(err, Error::VersionType(_)), "got {err}");
+            assert_eq!(err.to_string(), want, "{document}");
+        }
     }
 
     #[test]
@@ -1117,5 +1298,255 @@ mod tests {
         assert_eq!(TINY_DOCUMENT_MAX, 10);
         assert_eq!(CURRENT_VERSION, 3);
         assert_eq!(SECURITY_FILE, ".security.yml");
+    }
+
+    /// Seeds a directory with both halves of a split config and returns the config path.
+    ///
+    /// Every case here needs the pair: a `.security.yml` with no `config.json` beside it
+    /// takes the `DefaultConfig()` shortcut at the top of `LoadConfig` and never reads the
+    /// security file at all.
+    fn write_pair(config: &str, security: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, config).expect("write config.json");
+        std::fs::write(path.with_file_name(SECURITY_FILE), security).expect("write security");
+        (dir, path)
+    }
+
+    /// The models a load produced, as `model_name` strings.
+    fn models(document: &Doc) -> Vec<String> {
+        document
+            .get("model_list")
+            .and_then(Doc::as_array)
+            .map(|list| {
+                list.iter()
+                    .map(|entry| {
+                        entry
+                            .get("model_name")
+                            .and_then(Doc::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One field of one model entry, by position.
+    fn model_field<'a>(document: &'a Doc, position: usize, field: &str) -> Option<&'a Doc> {
+        document
+            .get("model_list")?
+            .as_array()?
+            .get(position)?
+            .get(field)
+    }
+
+    /// A v3 document with one model, `m1`, holding no keys.
+    const ONE_MODEL: &str =
+        r#"{"version":3,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+
+    #[test]
+    fn the_security_file_merges_into_the_model_it_is_named_for() {
+        // The direct witness that `apply_security` merges at all. Nothing in the corpus can
+        // be it: every `save` case is red on other bytes, and a refusal case refuses in the
+        // parse stage, with the merge deleted or not. Deleting the `apply_security` call in
+        // `load` fails this test and nothing else.
+        //
+        // It reads the document rather than the marshalled loaded value on purpose. The
+        // marshalled form hides `api_keys` -- `SecureStrings.MarshalJSON` emits nothing --
+        // which is Go's rule and the reason the corpus's security cases grade a `save`. The
+        // document is where the merge lands, so that rule cannot make this assertion vacuous
+        // when the marshalling stage is ported.
+        let (_dir, path) = write_pair(
+            ONE_MODEL,
+            "model_list:\n    m1:0:\n      api_keys: [sk-from-security]\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        assert_eq!(
+            model_field(&cfg.document, 0, "api_keys"),
+            Some(&Doc::Array(vec![Doc::String(
+                "sk-from-security".to_string()
+            )])),
+            "the entry fills the field it names"
+        );
+    }
+
+    #[test]
+    fn a_matching_entry_without_keys_clears_them() {
+        // `m.APIKeys = sec.APIKeys` is unconditional once the entry matches, so an entry
+        // that names no keys assigns nil -- it does not leave the model's keys alone.
+        let config =
+            r#"{"version":3,"model_list":[{"model_name":"m1","api_keys":["sk-original"]}]}"#;
+        let (_dir, path) = write_pair(config, "model_list:\n    m1:0: {}\n");
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        assert_eq!(
+            model_field(&cfg.document, 0, "api_keys"),
+            None,
+            "cleared, not left alone and not emptied"
+        );
+    }
+
+    #[test]
+    fn a_matching_entry_cannot_set_a_field_it_is_not_named_for() {
+        // The security file is a secrets file. `SecureModelList.UnmarshalYAML` assigns
+        // `api_keys` and nothing else, so `provider` here is inert -- merging the whole entry
+        // would let a secrets file repoint a model at another provider.
+        let (_dir, path) = write_pair(
+            ONE_MODEL,
+            "model_list:\n    m1:0:\n      provider: anthropic\n      api_keys: [sk-1]\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        assert_eq!(
+            model_field(&cfg.document, 0, "provider"),
+            Some(&Doc::String("openai".to_string())),
+            "the document's own provider survives"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_no_model_is_ignored_rather_than_appended() {
+        // The phantom this port used to invent: an entry keyed for a model the document does
+        // not hold, appended as a model with an empty name. It then survives the process --
+        // `save` writes it into `config.json` and names it `:0` in the security file, which
+        // the round trip cannot read back as the entry it wrote.
+        let (_dir, path) = write_pair(
+            ONE_MODEL,
+            "model_list:\n    m9:0:\n      api_keys: [sk-phantom]\n",
+        );
+        let mut cfg = load(&path, "/home/oracle").expect("the pair loads");
+        assert_eq!(
+            models(&cfg.document),
+            vec!["m1".to_string()],
+            "the security entry names nothing, so it adds nothing"
+        );
+        save(&path, &mut cfg, "/home/oracle").expect("save");
+        let written = std::fs::read_to_string(&path).expect("config.json");
+        assert!(
+            !written.contains("sk-phantom") && !written.contains("api_keys"),
+            "and the phantom cannot come back through the writer: {written}"
+        );
+        let security =
+            std::fs::read_to_string(path.with_file_name(SECURITY_FILE)).expect("security file");
+        assert!(
+            security.contains("\n  m1:0:")
+                && !security.contains("\n  :0:")
+                && !security.contains("m9"),
+            "one entry, named for the model that exists: {security}"
+        );
+    }
+
+    #[test]
+    fn a_sequence_is_refused_for_the_current_version_and_ignored_for_a_legacy_one() {
+        // The JSON shape copied into the YAML file. Both sides of this were measured against
+        // `LoadConfig`: v3 reports the decoder's type error, v2 loads the default list,
+        // because `loadConfigMap` merges the section only when it is a map and deletes it
+        // either way. A port that refuses it always loads a file Go accepts; one that always
+        // ignores it accepts a file Go refuses.
+        let security = "model_list:\n    - model_name: m1\n      api_keys: [sk-1]\n";
+        let (_dir, path) = write_pair(ONE_MODEL, security);
+        let err = load(&path, "/home/oracle").expect_err("v3 refuses the sequence");
+        assert!(
+            matches!(err, Error::SecurityType(_)),
+            "the current version reports a type error: {err}"
+        );
+        assert!(
+            err.to_string().contains("map[string]*config.ModelConfig"),
+            "naming the type it wanted: {err}"
+        );
+
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let (_dir, path) = write_pair(legacy, security);
+        let cfg = load(&path, "/home/oracle").expect("v2 loads the same file");
+        assert!(
+            !models(&cfg.document).contains(&"m1".to_string())
+                || model_field(&cfg.document, 0, "api_keys").is_none(),
+            "the sequence is ignored, so no key from it lands anywhere: {:?}",
+            models(&cfg.document)
+        );
+        assert!(
+            cfg.needs_version_bump,
+            "and it is still the migration path that loaded it"
+        );
+    }
+
+    #[test]
+    fn an_unknown_security_key_is_refused_for_a_legacy_document_only() {
+        // The other edge of the same split. A current-version security file is decoded by
+        // `yaml.v3` into `Config`, and a key with nowhere to land is dropped without a word.
+        // A legacy one is merged into config.json as data first, and the strict validator
+        // then runs over the merged bytes -- so the key is refused, with config.json's own
+        // sentence naming it. Measured: v3 loads, v2 reports
+        // `config.json contains unknown field(s): nonsense`.
+        let (_dir, path) = write_pair(ONE_MODEL, "nonsense:\n    a: 1\n");
+        load(&path, "/home/oracle").expect("the current version ignores it");
+
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let (_dir, path) = write_pair(legacy, "nonsense:\n    a: 1\n");
+        let err = load(&path, "/home/oracle").expect_err("v2 refuses the same file");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "nonsense"),
+            "the legacy path refuses it by name: {err}"
+        );
+    }
+
+    #[test]
+    fn web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema() {
+        // `Tools` is `yaml:",inline"`, so the file's top-level `web:` and `skills:` are
+        // `tools` fields and Go applies them. This port reaches them -- `apply_security`
+        // walks the inline branch and hands each child to `merge_filling` -- and then drops
+        // them, because `merge_filling` still asks the *root* schema whether a key is a
+        // field, and `web` is a field of `Tools`, not of `Config`.
+        //
+        // So this test pins the divergence, not the goal: it fails the day the gate is
+        // threaded with the target's schema, and the day it does, `docs/DIVERGENCES.md`
+        // loses the entry and these three assertions turn into the merge they describe.
+        // Recorded here rather than only in the doc because the doc claimed a mechanism
+        // (`apply_security` merges only the two named sections) that the code no longer has.
+        let (_dir, path) = write_pair(
+            ONE_MODEL,
+            "web:\n  brave:\n    api_keys: [bk-from-security]\nskills:\n  github:\n    auth_token: gh-from-security\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        let tools = cfg.document.get("tools").expect("tools is in the defaults");
+        assert_eq!(
+            tools
+                .get("web")
+                .and_then(|w| w.get("brave"))
+                .and_then(|b| b.get("api_keys")),
+            None,
+            "the security key does not land -- docs/DIVERGENCES.md"
+        );
+        assert_eq!(
+            tools
+                .get("skills")
+                .and_then(|s| s.get("github"))
+                .and_then(|g| g.get("auth_token")),
+            None,
+            "nor the registry token -- docs/DIVERGENCES.md"
+        );
+    }
+
+    #[test]
+    fn the_legacy_view_lifts_web_and_skills_into_tools() {
+        // `Config.Tools` is `yaml:",inline"`, so `web` and `skills` are tools fields and the
+        // lift keeps them legal under the strict validator. The lift also *replaces* the
+        // file's own `tools` section -- `m2["tools"] = m3`, where `m3` holds only the two
+        // lifted sections -- which is why a security file carrying both a `tools:` and a
+        // `web:` section has its `tools:` thrown away.
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let (_dir, path) = write_pair(
+            legacy,
+            "tools:\n  bogus: 1\nweb:\n  brave:\n    api_keys: [bk]\nskills:\n  github:\n    token: gh\n",
+        );
+        load(&path, "/home/oracle").expect("the lifted sections are legal");
+
+        // Without the lift the same `tools` content is refused, which is what makes the
+        // above a fact about the lift rather than about `bogus` being accepted.
+        let (_dir, path) = write_pair(legacy, "tools:\n  bogus: 1\n");
+        let err = load(&path, "/home/oracle").expect_err("tools.bogus has no field to hold it");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "tools.bogus"),
+            "named by path, the way the JSON validator names it: {err}"
+        );
     }
 }
