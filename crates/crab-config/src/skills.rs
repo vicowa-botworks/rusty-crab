@@ -31,17 +31,25 @@
 //!
 //! ## What the corpus cannot see
 //!
-//! Injecting faults into this module and replaying the config seam leaves three that no
-//! case fails. Two are equivalent and one is a gap in this port, and the three should not
-//! be remembered as the same kind of thing:
+//! Injecting faults into this module and replaying the config seam leaves faults that no
+//! case fails, and they are not all the same kind of thing -- an equivalence, a survivor, and
+//! a gap need different responses. Re-derived at this commit rather than carried forward,
+//! because the last tally here was wrong in both directions:
 //!
-//! * **Writing `auth_token` over one that is already set** is equivalent, because every
-//!   `SecureString` marshals to the same `[NOT_HERE]`. No document can tell "kept the
-//!   stored token" from "replaced it with the legacy one"; only the file that `save`
-//!   writes back could, and `save` is not ported yet.
-//! * **Letting the file's `github.token` win over one already in config.json** is the
-//!   same equivalence seen from the other field: both are invisible in the loaded value
-//!   (see `marshal`'s SecureString rule) and both qualify the registry identically.
+//! * **Writing `auth_token` over one that is already set is a survivor, not an equivalence.**
+//!   Making the legacy pass write unconditionally (dropping `if current.auth_token.is_empty()`)
+//!   leaves the unit tests and the replay green, because every `SecureString` marshals to the
+//!   same `[NOT_HERE]` -- but the *effective* credential differs, and the effective credential
+//!   is exactly what `save` writes back to `.security.yml`. This seam has already carried one
+//!   bug of that shape (`security_registry_token_save_splits_masked_and_real`), so "invisible
+//!   in the loaded value" is not a claim of equivalence, only of where the witness has to
+//!   live: a `save`-side case. Until one exists this is an uncovered branch, and it should be
+//!   read that way rather than as harmless.
+//! * **Letting the file's `github.token` win over one already in config.json is not a fault at
+//!   all any more.** It has been the shipped behaviour since the file's value was made to
+//!   *replace* the document's, and its opposite (fill-only) is killed by
+//!   `the_files_github_token_replaces_the_documents`. It stayed on this list after that commit
+//!   changed what it described, which is how a counted "equivalent" survived a round.
 //! * **Dropping the `registries` skip is a gap, not an equivalent.** Go refuses a file
 //!   whose legacy skills value is not a mapping -- `valueNode.Decode` into a
 //!   `SkillRegistryConfig` decodes into a `map[string]any`, and a scalar is not one. This
