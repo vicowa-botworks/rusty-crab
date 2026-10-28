@@ -112,9 +112,19 @@ pub(crate) fn expand(document: &mut Doc, schema: &Schema) -> Vec<usize> {
             virtual_positions.push(expanded.len());
             expanded.push(entry);
         }
-        debug_assert_eq!(
-            virtual_positions.len() - (expanded.len() - first_virtual),
-            0
+        // The property `save` actually depends on: every position recorded for this model
+        // points at one of its virtual entries, and the primary written next is not among
+        // them -- those indices are what gets filtered out of the written `model_list`, so
+        // an off-by-one here either leaves a virtual entry in `config.json` or deletes a
+        // real model. (The previous version of this line subtracted a length from itself.)
+        debug_assert!(
+            virtual_positions[first_virtual..]
+                .iter()
+                .all(|&at| expanded[at]
+                    .get("model_name")
+                    .and_then(Doc::as_str)
+                    .is_some_and(|m| m != name && m.starts_with(name.as_str()))),
+            "a recorded virtual position does not point at a virtual entry of `{name}`"
         );
         expanded.push(primary);
     }
@@ -130,6 +140,15 @@ fn rebuild(entry: &Doc, elem: &Schema, model_name: &str) -> Doc {
     for field in elem.json_fields() {
         let key = field.json;
         if key == "enabled" {
+            continue;
+        }
+        if key == "fallbacks" {
+            // Neither Go literal names `Fallbacks`: `additionalEntry` (config.go:1802)
+            // never mentions it, and `primaryEntry` receives it only after the literal,
+            // from `append(fallbackNames, m.Fallbacks...)`. So the virtual copies must not
+            // carry the user's model fallbacks -- copying them makes every virtual entry a
+            // failover target in its own right, which is a different routing than the one
+            // the file asked for. The primary gets the key from the caller.
             continue;
         }
         if key == "model_name" {
@@ -235,6 +254,7 @@ fn materialise(entry: Doc, elem: &Schema) -> Doc {
     Doc::Object(out)
 }
 
+/// `model_list`'s element schema -- the one position this stage reads the dump for.
 fn model_elem(schema: &Schema) -> Option<&Schema> {
     schema
         .field("model_list")
@@ -347,6 +367,28 @@ mod tests {
             .expect("fallbacks");
         let names: Vec<&str> = fallbacks.iter().filter_map(Doc::as_str).collect();
         assert_eq!(names, vec!["m__key_1", "m__key_2", "z"]);
+    }
+
+    /// The other half of the same rule, and the one the corpus could not see until a model
+    /// had several keys *and* a model fallback: Go names the fields twice and never names
+    /// `Fallbacks` in either literal, so only the primary receives it afterwards. Copying it
+    /// makes every virtual entry a failover target in its own right, which is not the
+    /// routing the file asked for.
+    #[test]
+    fn a_virtual_copy_carries_no_model_fallbacks() {
+        let list = model(
+            "{\"model_name\":\"m\",\"provider\":\"p\",\"model\":\"q\",\"api_keys\":[\"a\",\"b\",\"c\"],\"fallbacks\":[\"z\"]}",
+        );
+        let mut doc = Doc::Object(vec![("model_list".into(), list)]);
+        expand(&mut doc, &config_schema());
+        let entries = doc.get("model_list").and_then(Doc::as_array).expect("list");
+        assert_eq!(entries.len(), 3);
+        for entry in &entries[..2] {
+            assert!(
+                entry.get("fallbacks").is_none(),
+                "a virtual copy inherited the model's fallbacks: {entry:?}"
+            );
+        }
     }
 
     #[test]

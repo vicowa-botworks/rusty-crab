@@ -83,10 +83,13 @@ impl Registry {
     /// marshal time rather than here.
     fn read(&mut self, node: &Doc) {
         let Doc::Object(entries) = node else {
-            // A scalar or sequence where a mapping belongs. Go's `Decode(&raw)` into a
-            // `map[string]any` fails on a scalar, and the legacy pass refuses a
-            // non-mapping node outright; neither is in the corpus, so the port declines
-            // the node rather than inventing a shape for it.
+            // A scalar or sequence where a mapping belongs. Go's decode into
+            // `SkillRegistryConfig` fails outright -- `skills: {github: ghp_direct}` is a
+            // config the shipped binary will not load -- while this port declines the node
+            // and carries on loading, which is the divergence recorded under "loads a
+            // non-mapping skills value Go refuses" in `docs/DIVERGENCES.md`. What matters
+            // here is what this arm does *not* do: printing the node and keeping it as a
+            // token would manufacture a credential Go refuses to have.
             return;
         };
         if let Some(Doc::Object(nested)) =
@@ -132,6 +135,12 @@ impl Registry {
             ("enabled".to_string(), Doc::Bool(self.enabled)),
         ];
         if !self.auth_token.is_empty() {
+            // The hand-written placeholder, and the reason it survives the walk: the
+            // document holds an *object* under `registries`, whose schema is a slice that
+            // is not a JSON array, so `apply_omit` falls to its passthrough arm and never
+            // consults `is_dropped_by_omit`. Normalise this document to an array some day
+            // and the `SecureString` arm in `marshal.rs` will eat this key -- the two
+            // changes are load-bearing for each other, which is why both say so.
             out.push(("auth_token".to_string(), Doc::String(NOT_HERE.to_string())));
         }
         for (k, v) in &self.params {
@@ -159,13 +168,22 @@ impl Registry {
 /// an `enc://` or `file://` reference is kept as the opaque text it is, so its emptiness is
 /// the reference's emptiness rather than the secret's. The corpus has no key material and
 /// clears the environment, so that half is unpinnable and stays so.
+///
+/// A null is the one shape that never reaches `UnmarshalYAML` at all: yaml.v3 short-circuits
+/// `!!null` for a type with a custom unmarshaler and zeroes the target, so `fromRaw` is
+/// never called and the `SecureString` stays empty. Printing the node would give `"null"`,
+/// which is a credential -- `security_legacy_null_token_creates_no_credential` and
+/// `security_legacy_empty_token_creates_no_credential` pin the registry existing with no
+/// `auth_token` key at all. Numbers are the opposite case: `42` and `1.5` are both printed
+/// scalars, so both create one.
 fn scalar_text(node: &Doc) -> String {
     match node {
         Doc::String(s) => s.clone(),
         Doc::Bool(true) => "true".to_string(),
         Doc::Bool(false) => "false".to_string(),
         Doc::Int(i) => i.to_string(),
-        Doc::Null => "null".to_string(),
+        Doc::Float(f) => crate::doc::go_number(*f),
+        Doc::Null => String::new(),
         _ => String::new(),
     }
 }
@@ -222,30 +240,43 @@ pub fn apply(merged: &mut Doc, security: &Security) -> Result<Vec<(String, Strin
         .unwrap_or_default();
 
     // Pass 1 -- `registries`, cloned-by-name then decoded.
-    if let Some(Doc::Object(entries)) = file_skills.get("registries") {
-        for (name, node) in entries {
-            let name = name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let mut registry = lookup(&registries, name).cloned().unwrap_or_default();
-            registry.read(node);
-            set(&mut registries, name, registry);
+    //
+    // Both node kinds are walked, because `decodeRegistryNodesFromYAML` walks
+    // `value.Content` in pairs and never tests what kind of node it is holding: for a
+    // mapping that is `key, value` pairs, and for a sequence it is `item, item` pairs, so
+    // `registries: [clawhub, {enabled: false}]` names the registry from element 0 and
+    // decodes element 1. Reading only the mapping form silently leaves such a registry at
+    // its defaults -- a different config rather than a refused one, which is worse than the
+    // refusals this pass does raise.
+    for (name, node) in registry_nodes(file_skills.get("registries")) {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
         }
+        let mut registry = lookup(&registries, name).cloned().unwrap_or_default();
+        registry.read(node);
+        set(&mut registries, name, registry);
     }
 
     // The deprecated `github.token`, which the yaml pass sets and the legacy pass reads.
     // It is invisible in the loaded value -- `SecureString` marshals to nothing there --
     // and its only observable effect is the registry it fills in below.
+    //
+    // The file's value *replaces* the document's whenever the key is present, and that
+    // includes replacing it with nothing: pass 1 is `yaml.Unmarshal(data, cfg)`, and yaml
+    // decodes a struct field into the existing value, so `SecureString.UnmarshalYAML`
+    // assigns whatever the node holds. `security_github_file_token_empty_overwrites_the_documents`
+    // is the only case that can see the difference -- with both sides non-empty the mask
+    // renders `[NOT_HERE]` either way -- and it shows `token: ""` in the file removing the
+    // document's token, while `security_github_file_token_absent_keeps_the_documents` shows
+    // an absent key keeping it. Fill-only would pass both of the obvious cases and fail
+    // exactly that pair.
     let mut github_token = target
         .path(&["github", "token"])
         .map(scalar_text)
         .unwrap_or_default();
     if let Some(token) = file_skills.path(&["github", "token"]) {
-        let token = scalar_text(token);
-        if github_token.is_empty() && !token.is_empty() {
-            github_token = token;
-        }
+        github_token = scalar_text(token);
     }
 
     // Pass 2 -- every other key in the file's `skills` mapping is a registry.
@@ -256,13 +287,13 @@ pub fn apply(merged: &mut Doc, security: &Security) -> Result<Vec<(String, Strin
                 continue;
             }
             if name == "github" {
-                let legacy = node
-                    .get("token")
-                    .map(scalar_text)
-                    .unwrap_or_else(|| scalar_text(node));
-                if github_token.is_empty() && !legacy.is_empty() {
-                    github_token = legacy;
-                }
+                // Nothing to do here: pass 1 above already took this node's `token`, which
+                // is the same value Go's `cfg.Tools.Skills.Github.Token` holds by the time
+                // the legacy pass reads it. Reading it again here was what let a *bare
+                // scalar* under `github` become a token (`skills: {github: ghp_direct}`),
+                // manufacturing a credential Go refuses to load at all -- see the
+                // non-mapping skills entry in `docs/DIVERGENCES.md`, whose blast radius is
+                // "the token is dropped" only because this line no longer prints one.
             }
             let mut legacy = Registry::default();
             legacy.read(node);
@@ -328,6 +359,31 @@ fn go_yaml_kind(value: &Doc) -> &'static str {
     }
 }
 
+/// The `(name, node)` pairs `decodeRegistryNodesFromYAML` walks.
+///
+/// Go steps through `value.Content` two at a time without checking what kind of node it is
+/// holding, so a sequence works as well as a mapping: element 0 is the name -- its `Value`,
+/// which is empty for a container, so a container names nothing -- and element 1 is the
+/// registry. A trailing element with no pair is dropped rather than turned into a registry
+/// with no fields.
+fn registry_nodes(node: Option<&Doc>) -> Vec<(String, &Doc)> {
+    match node {
+        Some(Doc::Object(entries)) => entries
+            .iter()
+            .map(|(name, value)| (name.clone(), value))
+            .collect(),
+        Some(Doc::Array(items)) => items
+            .chunks(2)
+            .filter_map(|pair| {
+                let name = scalar_text(&pair[0]);
+                let value = pair.get(1)?;
+                Some((name, value))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn lookup<'a>(list: &'a [(String, Registry)], name: &str) -> Option<&'a Registry> {
     list.iter().find(|(k, _)| k == name).map(|(_, v)| v)
 }
@@ -336,5 +392,141 @@ fn set(list: &mut Vec<(String, Registry)>, name: &str, registry: Registry) {
     match list.iter_mut().find(|(k, _)| k == name) {
         Some(slot) => slot.1 = registry,
         None => list.push((name.to_string(), registry)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The state the loader hands this pass: `tools.skills` exists by the time the security
+    /// file is applied, because the defaults materialise it.
+    fn document(skills: Vec<(&str, Doc)>) -> Doc {
+        Doc::Object(vec![(
+            "tools".to_string(),
+            Doc::Object(vec![(
+                "skills".to_string(),
+                Doc::Object(
+                    skills
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                ),
+            )]),
+        )])
+    }
+
+    fn registries_after(security_yaml: &str, skills: Vec<(&str, Doc)>) -> Doc {
+        let security = crate::yaml::parse(security_yaml).expect("the snippet must parse");
+        let mut doc = document(skills);
+        // The verdict is not what this helper is for: the refusals have their own tests on
+        // the `Result`. A rejected node leaves the document untouched either way, which is
+        // exactly what the callers below assert.
+        let _ = apply(&mut doc, &security);
+        doc.path(&["tools", "skills", "registries"])
+            .cloned()
+            .unwrap_or(Doc::Null)
+    }
+
+    fn registry_of(registries: &Doc, name: &str) -> Doc {
+        let Doc::Object(entries) = registries else {
+            panic!("`registries` must be an object, got {registries:?}");
+        };
+        entries
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("`{name}` was not created; got {registries:?}"))
+    }
+
+    fn has_token(registry: &Doc) -> bool {
+        registry.get("auth_token").is_some()
+    }
+
+    /// yaml.v3 short-circuits `!!null` for a type with a custom unmarshaler, so the
+    /// `SecureString` is never handed a value: the registry exists and carries no
+    /// credential. Printing the node would give `"null"`, which is one.
+    #[test]
+    fn a_null_or_empty_legacy_token_creates_no_credential() {
+        let registries = registries_after(
+            "skills:\n  registries:\n    blank:\n      auth_token:\n    explicit:\n      auth_token: null\n",
+            Vec::new(),
+        );
+        for name in ["blank", "explicit"] {
+            let registry = registry_of(&registries, name);
+            assert_eq!(registry.get("enabled"), Some(&Doc::Bool(false)));
+            assert!(
+                !has_token(&registry),
+                "`{name}` gained a credential: {registry:?}"
+            );
+        }
+    }
+
+    /// The other side of the same rule: a number is a printed scalar, so it *is* a token.
+    /// Both faces, because the float is only attributable to the scalar's kind next to the
+    /// integer.
+    #[test]
+    fn a_numeric_legacy_token_is_a_credential() {
+        let registries = registries_after(
+            "skills:\n  registries:\n    int:\n      auth_token: 42\n    float:\n      auth_token: 1.5\n",
+            Vec::new(),
+        );
+        for name in ["int", "float"] {
+            assert!(
+                has_token(&registry_of(&registries, name)),
+                "`{name}` lost its credential"
+            );
+        }
+    }
+
+    /// Pass 1 decodes the file *into* the value the document already left there, so the
+    /// file's text replaces whatever was there -- including with nothing. The observable
+    /// consequence is the registry the legacy pass creates from that token: replaced with
+    /// nothing, no registry; key absent, the document's token still qualifies one. Fill-only
+    /// would create a registry in both halves.
+    #[test]
+    fn the_files_github_token_replaces_the_documents() {
+        let with_document_token = || {
+            vec![(
+                "github",
+                Doc::Object(vec![(
+                    "token".to_string(),
+                    Doc::String("ghp_doc".to_string()),
+                )]),
+            )]
+        };
+
+        let emptied = registries_after(
+            "skills:\n  github:\n    token: \"\"\n",
+            with_document_token(),
+        );
+        assert!(
+            matches!(emptied, Doc::Null),
+            "an empty file token left the document's credential and created a registry: {emptied:?}"
+        );
+
+        let kept = registries_after(
+            "skills:\n  github:\n    base_url: https://github.com\n",
+            with_document_token(),
+        );
+        assert!(
+            has_token(&registry_of(&kept, "github")),
+            "an absent file token dropped the document's credential: {kept:?}"
+        );
+    }
+
+    /// `decodeRegistryNodesFromYAML` walks `Content` in pairs without testing the node kind,
+    /// so a sequence names its registry from element zero rather than being ignored.
+    #[test]
+    fn a_sequence_of_registries_is_read_as_pairs() {
+        let registries = registries_after(
+            "skills:\n  registries:\n    - clawhub\n    - enabled: true\n",
+            Vec::new(),
+        );
+        assert_eq!(
+            registry_of(&registries, "clawhub").get("enabled"),
+            Some(&Doc::Bool(true)),
+            "the sequence form was not read: {registries:?}"
+        );
     }
 }
