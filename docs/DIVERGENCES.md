@@ -52,8 +52,17 @@ this file as long as observable behaviour is identical. They belong in
   `tools.web` / `tools.skills` and overrides the JSON config. Both sections are written by
   `saveSecurityConfig` whenever a search provider has an API key or a skill registry has an
   auth token, so they are present in most real files.
-- Rust: `yaml::parse` accepts them and `apply_security` merges only `channels` and
-  `model_list`, so the two sections are read and then discarded.
+- Rust: they are reached and then dropped. `apply_security` does walk the inline branch --
+  it takes `tools`' own yaml list from the dump and hands each child to `merge_filling` --
+  but `merge_filling` decides whether a key is a field by asking the **root** `Config`
+  schema, where `web` and `skills` are not fields of anything: they are fields of `Tools`,
+  one level down. The key is skipped and the section is gone.
+- Why it is still open: the fix is the architecture rule this file already states -- thread
+  the target's schema through the walk instead of resolving field knowledge once at the
+  root -- and `merge_filling` is also the function the channel `settings` merge goes
+  through, whose `settings`/`api_keys` exemptions exist only because of the same root
+  lookup. Threading it correctly changes bytes on cases that are green today, so it is its
+  own change rather than a line in this one.
 - Why not refuse them instead: that was the first behaviour, and it was the wrong direction
   -- refusing makes the loader reject a file the shipped binary loads, and the failure lands
   on every install that has ever saved a search key. Ignoring is the smaller divergence and
@@ -62,6 +71,41 @@ this file as long as observable behaviour is identical. They belong in
   `.security.yml` gets a config where that key is absent, so a search tool that works under
   Go reports "not configured" under the port. Secrets are not leaked or written anywhere new
   -- they are read and dropped.
-- Closes with: `apply_security` growing the two sections. The schema dump already carries
-  their field lists, so no Go-side work is needed.
-- Recorded: 2026-10-26, #5.
+- Closes with: `merge_filling` taking the schema of the node it is merging into. The dump
+  already carries every field list needed, so no Go-side work is required.
+  `web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema` fails on the
+  day it does, and this entry goes with it.
+- Recorded: 2026-10-26, #5; mechanism corrected 2026-10-28, #11.
+
+### A migrated document's security file is merged as data, and only its `model_list` half is ported
+
+- Go: `LoadConfig` calls `loadSecurityConfig` only for a document already at
+  `CurrentVersion`. A legacy document goes through `loadConfigMap` (migration.go:404),
+  which unmarshals `.security.yml` as a plain `map[string]any`, rewrites it
+  (`mergeModelListsWithMap` consumes `model_list` by name; `web`/`skills` are lifted into
+  `tools`, replacing any `tools` the file itself carried), merges it into config.json with
+  the generic `mergeMap`, and hands the re-marshalled result to the ordinary decoder.
+- Rust: the version decides the two edges that are observable today -- a key the decoder
+  cannot place is ignored at v3 and refused at v2, and a `model_list` that is not a mapping
+  is a type error at v3 and deleted at v2 -- and the `model_list` merge itself runs on both
+  paths. What is not ported is the generic `mergeMap` over the rest of a legacy document:
+  there, a security `channel_list` entry replaces what is in the config rather than filling
+  into it, and a scalar the two files both name goes to the security file.
+- Why: the merge happens in a stage this crate reaches only for documents below
+  `CurrentVersion`, and it is a different function from the typed one -- `mergeMap` on
+  untyped data, before `migrateV1ToV2`, with its own ordering. Porting the typed merge and
+  calling it done is what produced the two wrong edges above, both of which read the file as
+  though one loader owned it.
+- Blast radius: an install whose `config.json` is still on version 1 or 2 and which has a
+  `.security.yml` with a `channel_list` entry. The port loads the secrets it needs and
+  differs from Go on the non-secret keys the same entry carries. A current-version install
+  -- every install that has saved once -- is unaffected.
+- Why no recorded case can show it: every corpus case that has a `.security.yml` is a v3
+  document, because the file is written by a v3 save; and the three `migrate_*` cases have
+  no security file at all. `migrate_backs_up_both_files` is the single case with a legacy
+  document *and* a security file, and it is deferred on the `save` half -- its load prefix
+  is replayed and labelled `security_data_merge` in `tests/conformance.rs`, which is the
+  closest the fixture currently comes. Closing this needs a Go-side case: a v2
+  `config.json` plus a `.security.yml` whose `channel_list` entry names keys the config also
+  sets.
+- Recorded: 2026-10-28, #11.

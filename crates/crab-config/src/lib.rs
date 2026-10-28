@@ -24,7 +24,13 @@
 //!   its own rule per section, and it is narrower than the entry's shape suggests:
 //!   `model_list` reaches exactly one field (`api_keys`), a channel's `settings` reaches
 //!   that settings struct, and a key with no yaml-tagged field to land in is dropped.
-//!   See [`apply_security`].
+//!   See [`apply_security`]. **All of that is the current version's answer.** A document
+//!   below `CurrentVersion` never reaches `loadSecurityConfig`: `LoadConfig`'s migration
+//!   arms merge the two files as plain data in `loadConfigMap`, and the strict validator
+//!   then runs over the merged bytes -- so the same `.security.yml` that is ignored at v3
+//!   is refused at v2, by config.json's own sentence. Both sides are measured, in the
+//!   `load` tests named `an_unknown_security_key_is_refused_for_a_legacy_document_only`
+//!   and `a_sequence_is_refused_for_the_current_version_and_ignored_for_a_legacy_one`.
 //! * **the pair** ([`yaml`]): `.security.yml` is the yaml-tagged half, which is not the
 //!   two sections its struct tags suggest at a glance.
 //!
@@ -197,8 +203,10 @@ impl Config {
 /// The security file *is* read, because leaving it out would load a config whose secrets
 /// are in the wrong place. `channels`/`channel_list` and `model_list` are merged. The
 /// other two sections Go applies -- `web` and `skills`, which reach `tools.web` and
-/// `tools.skills` through `Tools`' `yaml:",inline"` -- are parsed and then dropped, which
-/// is a divergence and is recorded in `docs/DIVERGENCES.md`. Refusing them instead was the
+/// `tools.skills` through `Tools`' `yaml:",inline"` -- are reached and then dropped, which
+/// is a divergence and is recorded in `docs/DIVERGENCES.md` with its real mechanism: the
+/// inline branch runs, and `merge_filling` refuses the key because it asks the root schema
+/// what is a field. Refusing them instead was the
 /// earlier behaviour and it was worse: every `.security.yml` the shipped binary has ever
 /// written carries both, so refusing made the loader reject the normal case. A key the
 /// struct does not name at all is ignored, because `loadSecurityConfig` calls plain
@@ -1407,6 +1415,43 @@ mod tests {
         assert!(
             matches!(&err, Error::UnknownField(paths) if paths == "nonsense"),
             "the legacy path refuses it by name: {err}"
+        );
+    }
+
+    #[test]
+    fn web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema() {
+        // `Tools` is `yaml:",inline"`, so the file's top-level `web:` and `skills:` are
+        // `tools` fields and Go applies them. This port reaches them -- `apply_security`
+        // walks the inline branch and hands each child to `merge_filling` -- and then drops
+        // them, because `merge_filling` still asks the *root* schema whether a key is a
+        // field, and `web` is a field of `Tools`, not of `Config`.
+        //
+        // So this test pins the divergence, not the goal: it fails the day the gate is
+        // threaded with the target's schema, and the day it does, `docs/DIVERGENCES.md`
+        // loses the entry and these three assertions turn into the merge they describe.
+        // Recorded here rather than only in the doc because the doc claimed a mechanism
+        // (`apply_security` merges only the two named sections) that the code no longer has.
+        let (_dir, path) = write_pair(
+            ONE_MODEL,
+            "web:\n  brave:\n    api_keys: [bk-from-security]\nskills:\n  github:\n    auth_token: gh-from-security\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        let tools = cfg.document.get("tools").expect("tools is in the defaults");
+        assert_eq!(
+            tools
+                .get("web")
+                .and_then(|w| w.get("brave"))
+                .and_then(|b| b.get("api_keys")),
+            None,
+            "the security key does not land -- docs/DIVERGENCES.md"
+        );
+        assert_eq!(
+            tools
+                .get("skills")
+                .and_then(|s| s.get("github"))
+                .and_then(|g| g.get("auth_token")),
+            None,
+            "nor the registry token -- docs/DIVERGENCES.md"
         );
     }
 

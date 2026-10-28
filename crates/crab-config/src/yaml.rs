@@ -2,23 +2,34 @@
 //!
 //! Two things make this file its own problem rather than a second copy of the first.
 //!
-//! **It is a different strictness.** The JSON document goes through [`crate::schema`],
-//! which refuses any key the target type cannot place. The security file is decoded by
-//! a YAML library into the same `Config` struct, where every field that is not
-//! yaml-tagged is simply *not a field* -- so a key the JSON side would refuse is
-//! silently ignored here, and only a syntax error or a type error fails. The corpus pins
-//! the refusal half (`unparseable_security_file_is_refused`). The ignore half has no
-//! load-side witness at all, for a reason of its own: everything the file can set is a
-//! secret, and a secret is invisible in the value a config loads to -- see
+//! **It is a different strictness -- for the current version.** The JSON document goes
+//! through [`crate::schema`], which refuses any key the target type cannot place. The
+//! security file is decoded by a YAML library into the same `Config` struct, where every
+//! field that is not yaml-tagged is simply *not a field* -- so a key the JSON side would
+//! refuse is silently ignored here, and only a syntax error or a type error fails. The
+//! corpus pins the refusal half (`unparseable_security_file_is_refused`). The ignore half
+//! has no load-side witness at all, for a reason of its own: everything the file can set
+//! is a secret, and a secret is invisible in the value a config loads to -- see
 //! `go_records_no_secrets_in_the_loaded_value`, which pins that rule from Go's bytes.
 //!
+//! Neither half is a fact about the file. Both are facts about which loader has it, and
+//! the version decides: a document below `CurrentVersion` is merged with this file as
+//! plain data by `loadConfigMap` before the strict validator ever sees it, so the key
+//! that is ignored at v3 is *refused* at v2 and the `model_list` that is a type error at
+//! v3 is deleted and ignored at v2. That is why [`parse`] records a non-mapping
+//! `model_list` as a kind rather than deciding it is an error, and why the decision is
+//! made in [`crate::apply_security`], where the version is in hand.
+//!
 //! **It decodes into a config that is already populated.** `loadSecurityConfig` runs
-//! after the JSON document has been read, so the file fills fields in and never replaces
-//! an entry. What it is *allowed* to fill is per section and narrower than an entry's
-//! shape suggests: a `model_list` entry goes through `SecureModelList.UnmarshalYAML`,
-//! which assigns `m.APIKeys = sec.APIKeys` and discards everything else it decoded, so
-//! `model_list: {m1:0: {rpm: 5}}` gives m1 nothing at all, and an entry naming a model
-//! the config does not list is ignored rather than added. A channel's `settings` is the
+//! after the JSON document has been read -- for a current-version document; a legacy one
+//! is merged with the file as data before it is decoded at all -- so the file fills
+//! fields in and never replaces an entry. What it is *allowed* to fill is per section and
+//! narrower than an entry's shape suggests: a `model_list` entry goes through
+//! `SecureModelList.UnmarshalYAML`, which assigns `m.APIKeys = sec.APIKeys` and discards
+//! everything else it decoded, so `model_list: {m1:0: {rpm: 5}}` gives m1 nothing at all,
+//! and an entry naming a model the config does not list is ignored rather than added --
+//! the migration path's `mergeModelListsWithMap` drops it too, and deletes it from the map
+//! first so the generic merge cannot see it. A channel's `settings` is the
 //! other extreme -- a raw node decoded by JSON rules, reaching every field of that
 //! channel's settings struct. The one statement that holds across both is the direction.
 //!
@@ -703,8 +714,9 @@ mod tests {
         // direction a compat port must not move in.
         //
         // `web` and `skills` are NOT in this category -- `Tools` is `yaml:",inline"`, so
-        // Go applies them -- and they are the two sections `apply_security` does not merge
-        // yet. That gap is `docs/DIVERGENCES.md`, not this test.
+        // Go applies them. This port reaches them and drops them at the merge, which is
+        // `docs/DIVERGENCES.md` and is pinned by
+        // `web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema`.
         let sec = parse("tools:\n  exec:\n    enabled: true\n").expect("unknown section loads");
         assert!(sec.channels().is_none(), "and nothing else is read");
         assert!(sec.model_list().is_none());
