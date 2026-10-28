@@ -983,7 +983,7 @@ fn yaml_accepts(node: &Doc, schema: &Schema) -> bool {
         return true;
     }
     // Defensive, and unreachable today: probed by panicking on this branch and running the
-    // whole suite (70 unit, 73 conformance, 3 golden), which never reached it. It stays
+    // whole suite (72 unit, 73 conformance, 3 golden), which never reached it. It stays
     // because the exemption is a property of the Go type, not of the corpus -- a position
     // whose type has its own `(Unm|M)arshalYAML` decides its own shape, and the generic walk
     // has no business judging it (`SecureString` takes a bare scalar, `SecureModelList` and
@@ -2031,6 +2031,67 @@ mod tests {
                 .map(Vec::len),
             Some(2),
             "the failed save left the caller's config with its virtual entries filtered out"
+        );
+    }
+
+    /// The secret half of the same promise, and the one no `save`-op case can grade.
+    ///
+    /// `save` swaps each registry's real `auth_token` into the document so the yaml writer
+    /// can print it -- the document normally holds the `[NOT_HERE]` placeholder that
+    /// `SkillRegistryConfig.MarshalJSON` produces -- and puts the placeholder back before
+    /// `config.json` is marshalled. On the failure path that is a *second* restore, and
+    /// without it the caller keeps a document that renders its own credential: the loaded
+    /// value prints it, and the retry writes it into `config.json`, the file that is not the
+    /// secrets file. The model-list half above cannot see this; the two restores are
+    /// different calls on different paths.
+    #[test]
+    fn a_failed_save_does_not_hand_back_a_real_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"version\":3,\"tools\":{\"skills\":{\"registries\":{\"github\":",
+                "{\"enabled\":true,\"base_url\":\"https://github.com\"}}}}}"
+            ),
+        )
+        .expect("write config.json");
+        // The token has to arrive through the security file. A token the *document* carries
+        // is already in the document as its real text -- the placeholder is a rendering rule,
+        // not a stored one -- so only a file-sourced token is the one `save` swaps in and
+        // back out.
+        std::fs::write(
+            dir.path().join(SECURITY_FILE),
+            "skills:\n  registries:\n    github:\n      auth_token: ghp_sec\n",
+        )
+        .expect("write .security.yml");
+        let mut cfg = load(&path, "/home/oracle").expect("the config must load");
+
+        let token = |cfg: &Config| {
+            cfg.document
+                .get("tools")
+                .and_then(|tools| tools.get("skills"))
+                .and_then(|skills| skills.get("registries"))
+                .and_then(|registries| registries.get("github"))
+                .and_then(|github| github.get("auth_token"))
+                .and_then(Doc::as_str)
+                .map(str::to_string)
+        };
+        assert_eq!(
+            token(&cfg).as_deref(),
+            Some("[NOT_HERE]"),
+            "the loaded document must hold the placeholder, not the credential"
+        );
+
+        let unwritable = dir.path().join("gone/config.json");
+        assert!(
+            save(&unwritable, &mut cfg, "/home/oracle").is_err(),
+            "a missing directory must fail the save"
+        );
+        assert_eq!(
+            token(&cfg).as_deref(),
+            Some("[NOT_HERE]"),
+            "the failed save handed the caller a document holding its own token"
         );
     }
 }
