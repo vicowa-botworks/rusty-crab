@@ -84,3 +84,28 @@ this file as long as observable behaviour is identical. They belong in
 - Closes with: the singleton registry and the streaming rules carried in the dump (the same
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
+
+### `crates/crab-config` names a migration backup by the UTC date
+
+- Go: `MakeBackup` builds the suffix from `time.Now().Format("20060102")`, and `time.Now()`
+  is the **local** calendar date. `config.json.20261027.bak` is the day as the user's own
+  wall clock reads it.
+- Rust: `today()` derives the date from `SystemTime::now()` as UTC. The crate carries no date
+  dependency and this is the only calendar date it needs, so it does the civil-from-days
+  arithmetic itself.
+- Why: the corpus cannot see the difference, in either direction. Config cases run with the
+  environment cleared, so `TZ` is UTC in the generator as well as in the replay; and the
+  eight date digits of a backup name are masked by the generator's clock rule anyway, because
+  a timestamp at or after the generator process started is the code's own. A case here would
+  compare `<date>` with `<date>`.
+- Blast radius: only a migration writes a backup, so this is a once-per-upgrade file, and only
+  for a user whose local date differs from UTC at that moment. West of UTC that is the last
+  hours of the local day, and there **two migrations on consecutive local days fall inside one
+  UTC day, so the second backup overwrites the first that Go would have kept** -- the one
+  direction in which this loses data. East of UTC, in the first hours of the local day, the
+  port names the file with the previous day instead, which only leaves more files behind than
+  Go does. No config content changes, and the newest backup always exists.
+- Closes with: a local-time source in `today()` -- a date dependency, or reading `TZ` and
+  `/etc/localtime` -- and even then no corpus case can pin it, because the clock is masked, so
+  treat this as permanent rather than deferred.
+- Recorded: 2026-10-28, #9.

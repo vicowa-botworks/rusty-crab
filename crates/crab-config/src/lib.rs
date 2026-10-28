@@ -371,8 +371,16 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // next start would migrate the same file again.
     if migrated {
         let path = path.to_path_buf();
+        // `MakeBackup` is a plain call in Go, so a directory that cannot hold a backup does
+        // fail the load. The save is the one whose result is thrown away.
         make_backup(&path)?;
-        save(&path, &mut config, home)?;
+        // `defer SaveConfig(path, cfg)` discards its error, and that is a behaviour, not an
+        // oversight: Go starts the agent on the migrated config in memory while the file on
+        // disk stays at the old version. Propagating here would turn a read-only config
+        // directory into "no config at all", which is a strictly worse failure than the one
+        // the shipped binary has -- and the caller cannot retry, because `load` has already
+        // returned the error instead of the config.
+        let _ = save(&path, &mut config, home);
     }
 
     Ok(config)
@@ -945,14 +953,33 @@ pub fn save(path: &Path, cfg: &mut Config, _home: &str) -> Result<Vec<String>, E
     let filtered = hide_virtual_models(cfg);
     let masked = unmask_registry_tokens(cfg);
 
-    let schema = schema::config_schema();
     let security_path = path.with_file_name(SECURITY_FILE);
-    let security = yaml::write(&cfg.document, &schema)?;
-    write_atomic(&security_path, &security)?;
-    remask_registry_tokens(cfg, masked);
-
-    let document = marshal::config_file(&cfg.document, &schema)?;
+    // Everything that can fail is inside the block below, and both undo steps run after it
+    // whichever way it ends. Go restores the model list on a `defer`, so its caller is left
+    // holding a whole config even when the save fails; the `?`s this used to carry returned
+    // early with the caller's real models still removed, and the next `save` on that config
+    // would write a `model_list` missing every virtual entry's primary.
+    //
+    // The mask is the worse half of the same mistake. The document is the JSON rendering, so
+    // a registry left holding its real token after a failed save renders that secret into
+    // anything that reads the loaded value afterwards -- which is why the mask goes back on
+    // the failure path too, and why it goes back *before* `config.json` is marshalled on the
+    // success path, exactly where Go puts it.
+    let mut pending = Some(masked);
+    let outcome = (|| -> Result<(String, String), Error> {
+        let schema = schema::config_schema();
+        let security = yaml::write(&cfg.document, &schema)?;
+        write_atomic(&security_path, &security)?;
+        if let Some(tokens) = pending.take() {
+            remask_registry_tokens(cfg, tokens);
+        }
+        Ok((security, marshal::config_file(&cfg.document, &schema)?))
+    })();
+    if let Some(tokens) = pending.take() {
+        remask_registry_tokens(cfg, tokens);
+    }
     restore_model_list(cfg, filtered);
+    let (security, document) = outcome?;
     write_atomic(path, &document)?;
 
     Ok(vec![security, document])
@@ -1010,7 +1037,6 @@ fn remask_registry_tokens(cfg: &mut Config, previous: Vec<(String, String)>) {
             }
         }
     }
-    let _ = cfg;
 }
 
 /// Removes the loader-created `model_list` entries and hands back what was taken, so the
@@ -1123,14 +1149,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 fn copy_file(from: &Path, to: &Path) -> Result<(), Error> {
     let bytes = std::fs::read(from)
         .map_err(|e| Error::Io(format!("failed to create config backup: {e}")))?;
-    std::fs::write(to, bytes)
-        .map_err(|e| Error::Io(format!("failed to create config backup: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    // Atomic, like every other write this crate does. A plain `write` leaves the backup
+    // truncated-and-readable for the length of the copy, and the one file this one exists
+    // to protect is the config: a crash here used to replace a good `config.json.<date>.bak`
+    // with a partial one, which is worse than not making the backup at all.
+    write_atomic(to, bytes).map_err(|e| Error::Io(format!("failed to create config backup: {e}")))
 }
 
 /// `fileutil.WriteFileAtomic`: write beside the target, then rename over it.
@@ -1138,7 +1161,7 @@ fn copy_file(from: &Path, to: &Path) -> Result<(), Error> {
 /// The mode is set on the temp file *before* the rename, so there is no window in which
 /// the new content exists under a permissive mode -- and no window in which the target
 /// exists but is short.
-fn write_atomic(path: &Path, contents: &str) -> Result<(), Error> {
+fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> Result<(), Error> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1717,5 +1740,45 @@ mod tests {
         assert_eq!(TINY_DOCUMENT_MAX, 10);
         assert_eq!(CURRENT_VERSION, 3);
         assert_eq!(SECURITY_FILE, ".security.yml");
+    }
+
+    /// Go restores the filtered `model_list` on a `defer`, so a save that fails still hands
+    /// the caller back a whole config. The `?`s `save` used to carry returned early with the
+    /// caller's real models still removed, and the next save on that same config would then
+    /// write a `model_list` missing a primary -- a silent config edit caused by a failed
+    /// write, which is the one thing a failed write must never do.
+    #[test]
+    fn a_failed_save_leaves_the_callers_config_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            "{\"version\":3,\"model_list\":[{\"model_name\":\"m\",\"provider\":\"p\",\"model\":\"q\",\"api_keys\":[\"a\",\"b\"]}]}",
+        )
+        .expect("write config.json");
+        let mut cfg = load(&path, "/home/oracle").expect("the config must load");
+        assert_eq!(
+            cfg.document
+                .get("model_list")
+                .and_then(Doc::as_array)
+                .map(Vec::len),
+            Some(2),
+            "a two-key model should have virtualised into a copy and a primary"
+        );
+
+        // A directory that does not exist, rather than one with a mode that forbids writes:
+        // CI runs the suite as root, and root walks straight through `0o500`.
+        let unwritable = dir.path().join("gone/config.json");
+        let failed = save(&unwritable, &mut cfg, "/home/oracle");
+
+        assert!(failed.is_err(), "a missing directory must fail the save");
+        assert_eq!(
+            cfg.document
+                .get("model_list")
+                .and_then(Doc::as_array)
+                .map(Vec::len),
+            Some(2),
+            "the failed save left the caller's config with its virtual entries filtered out"
+        );
     }
 }
