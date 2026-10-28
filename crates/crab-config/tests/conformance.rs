@@ -87,6 +87,21 @@ fn snapshot(dir: &Path) -> BTreeMap<String, String> {
 /// error sentences quote absolute paths, so pinning them would compare paths, not
 /// behaviour.
 fn run_script(case: &str, ops: &[Op]) -> Value {
+    run_ops(case, ops, false)
+}
+
+/// The same script, stopped at its first `save`.
+///
+/// A case that saves is deferred whole because its `expected` holds files this crate
+/// cannot write yet -- and deferring it whole used to defer its `load` values with it.
+/// That is backwards: the loads are replayable today, and they are the only recorded
+/// witness of what the loader does with a `.security.yml`, which is what most of those
+/// cases were written to show.
+fn run_prefix(case: &str, ops: &[Op]) -> Value {
+    run_ops(case, ops, true)
+}
+
+fn run_ops(case: &str, ops: &[Op], stop_at_save: bool) -> Value {
     let dir = scratch_dir(case);
     let home = "/home/oracle";
     let schema = config_schema();
@@ -94,6 +109,9 @@ fn run_script(case: &str, ops: &[Op]) -> Value {
     let mut error_op_index: Option<usize> = None;
 
     for (index, op) in ops.iter().enumerate() {
+        if stop_at_save && op.op == "save" {
+            break;
+        }
         match op.op.as_str() {
             "defaults" => {
                 results.push(json!({"op": op.op, "op_index": index, "value": loaded_value(&default_config(home), &schema)}));
@@ -162,11 +180,90 @@ fn loading_matches_what_go_returned() {
     let mut report = Report::new(&fixture);
     let mut deferred: Vec<&str> = Vec::new();
     let mut gaps: Vec<&str> = Vec::new();
-    let mut matched = 0;
+    let mut prefix_checked = 0usize;
+    let mut prefix_failed: Vec<String> = Vec::new();
 
     for case in &fixture.cases {
         let input: Script = case.parse();
-        if input.ops.iter().any(|op| op.op == "save") {
+        if let Some(first_save) = input.ops.iter().position(|op| op.op == "save") {
+            // The whole script is out of reach until `save` is ported, but every recorded
+            // load before that save is not. Compare those, so a deferred case still
+            // witnesses the loader.
+            let got = run_prefix(&case.name, &input.ops);
+            let produced = got["results"].as_array().expect("results are an array");
+            let gaps = KNOWN_LOAD_GAPS
+                .iter()
+                .find(|(name, _)| *name == case.name.as_str())
+                .map(|(_, gaps)| *gaps)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} is deferred for a `save` but is not in KNOWN_LOAD_GAPS, so its \
+                         load-side values are unaccounted for. Add it, naming the stages \
+                         that explain any difference (an empty list if none does).",
+                        case.name
+                    )
+                });
+            let want = case.expected["results"]
+                .as_array()
+                .expect("a scripted case records its results");
+            for entry in want.iter().filter(|r| {
+                r["op_index"]
+                    .as_u64()
+                    .is_some_and(|i| i < first_save as u64)
+            }) {
+                let index = entry["op_index"].as_u64().expect("op_index is a number");
+                prefix_checked += 1;
+                let recorded = entry["value"].as_str().unwrap_or_default();
+                let Some(produced) = produced
+                    .iter()
+                    .find(|r| r["op_index"].as_u64() == Some(index))
+                    .and_then(|r| r["value"].as_str())
+                else {
+                    prefix_failed.push(format!(
+                        "{} op {index}: this crate produced no value",
+                        case.name
+                    ));
+                    continue;
+                };
+                let (want_doc, got_doc) = (document(recorded), document(produced));
+                if want_doc == got_doc {
+                    if !gaps.is_empty() {
+                        panic!(
+                            "{} op {index} now matches Go exactly. Drop a label from \
+                             KNOWN_LOAD_GAPS -- a stage listed there that no longer explains \
+                             anything is a lie about what is still unported.",
+                            case.name
+                        );
+                    }
+                    continue;
+                }
+                if stripped(&want_doc, gaps) != stripped(&got_doc, gaps) {
+                    prefix_failed.push(format!(
+                        "{} op {index} differs for a reason outside {}\n    go:   {}\n    rust: {}",
+                        case.name,
+                        gaps.join(" + "),
+                        truncate(recorded),
+                        truncate(produced),
+                    ));
+                    continue;
+                }
+                // Every named stage has to be load-bearing, or the table is a list of
+                // excuses rather than a list of gaps.
+                for (position, label) in gaps.iter().enumerate() {
+                    let fewer: Vec<&str> = gaps
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != position)
+                        .map(|(_, gap)| *gap)
+                        .collect();
+                    if stripped(&want_doc, &fewer) == stripped(&got_doc, &fewer) {
+                        prefix_failed.push(format!(
+                            "{} op {index}: `{label}` in KNOWN_LOAD_GAPS explains nothing here",
+                            case.name
+                        ));
+                    }
+                }
+            }
             deferred.push(case.name.as_str());
             continue;
         }
@@ -174,7 +271,11 @@ fn loading_matches_what_go_returned() {
         let got = run_script(&case.name, &input.ops);
         let known = KNOWN_UNPORTED.contains(&case.name.as_str());
         match (case.expected == got, known) {
-            (true, false) => matched += 1,
+            // Recorded, not just counted. A success that never reaches the Report leaves
+            // `passed` at zero, and the summary line then reads "0 of 96 cases match" on
+            // a run where every case matched -- a number that looks like the seam is
+            // broken when it is the counter that is.
+            (true, false) => report.record(case, got),
             (true, true) => panic!(
                 "{} now matches Go. Remove it from KNOWN_UNPORTED -- a case on that list \
                  that passes is a lie about what is still missing.",
@@ -196,7 +297,8 @@ fn loading_matches_what_go_returned() {
     // Printed before `finish`, which panics on the first disagreement: these two lines are
     // what a reader needs most, and they must not be the part that gets lost.
     eprintln!(
-        "{matched} of {} replayable cases match Go byte for byte",
+        "{} of {} replayable cases match Go byte for byte",
+        report.passed(),
         fixture.cases.len() - deferred.len(),
     );
     eprintln!(
@@ -206,5 +308,135 @@ deferred until `save` is ported ({}): {}",
         deferred.len(),
         deferred.join(", ")
     );
+    eprintln!(
+        "load values replayed out of the deferred cases: {prefix_checked} compared, {} disagree \
+         for a reason outside the stages KNOWN_LOAD_GAPS names",
+        prefix_failed.len()
+    );
+    for failure in &prefix_failed {
+        eprintln!("  {failure}");
+    }
     report.finish(8);
+    assert!(
+        prefix_failed.is_empty(),
+        "{} of the {} load values recorded before a deferred `save` disagree with Go for a \
+         reason outside the stages KNOWN_LOAD_GAPS names",
+        prefix_failed.len(),
+        prefix_checked
+    );
+}
+
+/// A recorded loaded value as a document. Something that is not JSON compares as its text.
+fn document(value: &str) -> Value {
+    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into()))
+}
+
+/// The unported stages a deferred case's recorded `load` is allowed to differ by.
+///
+/// A case that saves is deferred whole, which used to defer its `load` values with it --
+/// so the ten save cases witnessed nothing at all about the loader, even though every load
+/// in them is replayable today. They are replayed now, and this table is what keeps that
+/// honest: each case names the stages that explain any difference, and the harness checks
+/// that every named stage is *load-bearing*. A stage that stops mattering fails the run,
+/// exactly like a case that leaves `KNOWN_UNPORTED` stale.
+const KNOWN_LOAD_GAPS: &[(&str, &[&str])] = &[
+    ("save_writes_the_document", &["channel_settings"]),
+    ("save_bumps_an_old_version", &["channel_settings"]),
+    ("session_omitted_when_empty", &["channel_settings"]),
+    (
+        "migrate_backs_up_both_files",
+        &["channel_settings", "model_api_keys"],
+    ),
+    (
+        "unparseable_security_file_is_refused",
+        &["channel_settings", "model_api_keys"],
+    ),
+    (
+        "security_entry_replaces_the_json_model",
+        &["channel_settings", "model_api_keys"],
+    ),
+    (
+        "security_seq_form_is_refused",
+        &["channel_settings", "model_api_keys"],
+    ),
+    (
+        "save_writes_both_halves",
+        &["channel_settings", "model_api_keys"],
+    ),
+    (
+        "virtual_key_models_are_written_back_once",
+        &["channel_settings", "model_list"],
+    ),
+    (
+        "save_then_load_then_save_is_stable",
+        &["channel_settings", "model_list"],
+    ),
+];
+
+/// Removes what one unported stage is responsible for.
+///
+/// Every label is a *laxness*: stripping can only make a comparison easier to pass. So a
+/// match here is proof that nothing beyond the named stages is wrong, never proof that the
+/// loader is right -- which is the same bargain `KNOWN_UNPORTED` strikes, per case rather
+/// than per whole script.
+fn strip_gap(label: &str, value: &mut Value) {
+    match label {
+        // `InitChannelList` is not ported. Go marshals each channel's *settings struct*,
+        // so untagged and zero-valued fields appear and a `SecureString` inside them does
+        // not; the three telegram values this crate's `defaults.rs` adds land in the same
+        // three keys.
+        "channel_settings" => {
+            if let Some(channels) = value.get_mut("channel_list").and_then(Value::as_object_mut) {
+                for channel in channels.values_mut() {
+                    if let Some(fields) = channel.as_object_mut() {
+                        for key in ["settings", "typing", "placeholder"] {
+                            fields.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        // The SecureString family must marshal to nothing at all, so a model's `api_keys`
+        // belongs in `.security.yml` and never in the loaded value.
+        "model_api_keys" => {
+            if let Some(models) = value.get_mut("model_list").and_then(Value::as_array_mut) {
+                for model in models {
+                    if let Some(fields) = model.as_object_mut() {
+                        fields.remove("api_keys");
+                    }
+                }
+            }
+        }
+        // `expandMultiKeyModels` is not ported: Go turns one model holding two keys into
+        // `m1__key_1` and `m1__key_2`, so the list itself is a different length and a
+        // per-field strip cannot express it.
+        "model_list" => {
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("model_list");
+            }
+        }
+        other => panic!("{other} is not a gap this harness knows how to strip"),
+    }
+}
+
+/// Both sides with `gaps` removed, ready to compare.
+fn stripped(value: &Value, gaps: &[&str]) -> Value {
+    let mut copy = value.clone();
+    for gap in gaps {
+        strip_gap(gap, &mut copy);
+    }
+    copy
+}
+
+/// Enough of a loaded value to tell one from another in a failure line.
+fn truncate(value: &str) -> String {
+    const MAX: usize = 240;
+    let mut end = MAX.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == value.len() {
+        return value.to_string();
+    }
+    format!("{}…", &value[..end])
 }
