@@ -110,7 +110,24 @@ impl Registry {
                         self.base_url = s.clone();
                     }
                 }
-                "auth_token" => self.auth_token = scalar_text(v),
+                "auth_token" => {
+                    // A yaml null is not a value: `yaml.v3` short-circuits `!!null` before it
+                    // asks a custom unmarshaler, so `SecureString.UnmarshalYAML` never sees
+                    // the node and the field keeps what the decode is writing *into*. `""` is
+                    // a value and does clear. The two assignment sites in this pass need the
+                    // same guard; `a_null_leaves_a_credential_the_document_already_holds`
+                    // pins both, and pins the empty string beside them so the pair cannot
+                    // agree by construction.
+                    //
+                    // The JSON document is the opposite rule, and this function reads both:
+                    // `encoding/json` does call `UnmarshalJSON` for `null`, and
+                    // `SecureString.fromRaw("")` resolves it to empty. That is invisible
+                    // here because the document side always starts from
+                    // `Registry::default()`, where keep and clear are the same string.
+                    if !matches!(v, Doc::Null) {
+                        self.auth_token = scalar_text(v);
+                    }
+                }
                 // Hydrates the SecureString only; never persisted as a param.
                 "_auth_token" | "param" | "name" => {}
                 _ => self.set_param(k, v),
@@ -238,20 +255,28 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     // It is invisible in the loaded value -- `SecureString` marshals to nothing there --
     // and its only observable effect is the registry it fills in below.
     //
-    // The file's value *replaces* the document's whenever the key is present, and that
-    // includes replacing it with nothing: pass 1 is `yaml.Unmarshal(data, cfg)`, and yaml
-    // decodes a struct field into the existing value, so `SecureString.UnmarshalYAML`
+    // The file's value *replaces* the document's whenever the key is present with a value,
+    // and that includes replacing it with nothing: pass 1 is `yaml.Unmarshal(data, cfg)`, and
+    // yaml decodes a struct field into the existing value, so `SecureString.UnmarshalYAML`
     // assigns whatever the node holds. `security_github_file_token_empty_overwrites_the_documents`
     // is the only case that can see the difference -- with both sides non-empty the mask
     // renders `[NOT_HERE]` either way -- and it shows `token: ""` in the file removing the
     // document's token, while `security_github_file_token_absent_keeps_the_documents` shows
     // an absent key keeping it. Fill-only would pass both of the obvious cases and fail
     // exactly that pair.
+    //
+    // A null is the third state, and it belongs with "absent", not with "empty": yaml
+    // short-circuits `!!null` before the unmarshaler, so the field keeps the document's value
+    // and the plaintext `token` param still records the null the file spelled. Clearing here
+    // deleted a credential the shipped binary keeps.
     let mut github_token = target
         .path(&["github", "token"])
         .map(scalar_text)
         .unwrap_or_default();
-    if let Some(token) = file_skills.path(&["github", "token"]) {
+    if let Some(token) = file_skills
+        .path(&["github", "token"])
+        .filter(|t| !matches!(t, Doc::Null))
+    {
         github_token = scalar_text(token);
     }
 
@@ -465,6 +490,85 @@ mod tests {
         assert!(
             has_token(&registry_of(&kept, "github")),
             "an absent file token dropped the document's credential: {kept:?}"
+        );
+    }
+
+    /// The third state, which is neither "absent" nor "empty". yaml.v3 short-circuits `!!null`
+    /// before it asks a custom unmarshaler, so a null `github.token` never reaches
+    /// `SecureString.UnmarshalYAML` and the field keeps the document's value -- while the
+    /// plaintext `token` param still records the null the file spelled, because the registry
+    /// is created and the param walk is not type-guarded. Clearing here deleted a credential
+    /// the shipped binary keeps, and lost that param with it.
+    #[test]
+    fn a_null_github_token_keeps_the_documents_and_prints_itself() {
+        let with_document_token = || {
+            vec![(
+                "github",
+                Doc::Object(vec![(
+                    "token".to_string(),
+                    Doc::String("ghp_doc".to_string()),
+                )]),
+            )]
+        };
+        for file in [
+            "skills:\n  github:\n    token:\n",
+            "skills:\n  github:\n    token: null\n",
+            "skills:\n  github:\n    token: ~\n",
+        ] {
+            let registries = registries_after(file, with_document_token());
+            let github = registry_of(&registries, "github");
+            // The mask is the only face a kept credential has in a loaded value --
+            // `SkillRegistryConfig.MarshalJSON` writes the literal for the key whatever the
+            // value is -- so the discriminator against clearing is that the key is there.
+            assert_eq!(
+                github.get("auth_token"),
+                Some(&Doc::String("[NOT_HERE]".to_string())),
+                "`{file}` cleared a credential Go keeps"
+            );
+            assert_eq!(
+                github.get("token"),
+                Some(&Doc::Null),
+                "`{file}` lost the plaintext null param that comes with the key"
+            );
+        }
+    }
+
+    /// The same rule at the other assignment site -- the `auth_token` a `registries` entry
+    /// names -- with the empty string beside it, because a test that only checks the null
+    /// passes when both nulls and empties clear.
+    #[test]
+    fn a_null_leaves_a_credential_the_document_already_holds() {
+        let with_document_token = || {
+            vec![(
+                "registries",
+                Doc::Object(vec![(
+                    "github".to_string(),
+                    Doc::Object(vec![(
+                        "auth_token".to_string(),
+                        Doc::String("ghp_doc".to_string()),
+                    )]),
+                )]),
+            )]
+        };
+        for file in [
+            "skills:\n  registries:\n    github:\n      auth_token:\n",
+            "skills:\n  registries:\n    github:\n      auth_token: null\n",
+        ] {
+            let registries = registries_after(file, with_document_token());
+            assert_eq!(
+                registry_of(&registries, "github").get("auth_token"),
+                Some(&Doc::String("[NOT_HERE]".to_string())),
+                "`{file}` cleared a credential Go keeps"
+            );
+        }
+
+        let cleared = registries_after(
+            "skills:\n  registries:\n    github:\n      auth_token: \"\"\n",
+            with_document_token(),
+        );
+        assert!(
+            !has_token(&registry_of(&cleared, "github")),
+            "an empty string must still clear the credential: {cleared:?}"
         );
     }
 
