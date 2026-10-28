@@ -45,38 +45,6 @@ package, a module split that does not match a directory -- are not divergences i
 this file as long as observable behaviour is identical. They belong in
 `ARCHITECTURE.md`, next to the reason.
 
-### `crates/crab-config` drops the `web` section of `.security.yml`
-
-- Go: `loadSecurityConfig` unmarshals the whole file into `Config`, and `Tools` is tagged
-  `yaml:",inline"`, so a top-level `web:` in the security file lands on `tools.web` and
-  overrides the JSON config. `saveSecurityConfig` writes the section whenever a search
-  provider has an API key, so it is present in most real files -- and it is present even
-  when empty, because the writer emits every provider.
-- Rust: `yaml::parse` accepts the section and `apply_security` does not read it, so it is
-  parsed and then discarded. Its sibling `skills:` **is** applied now (see the two skills
-  entries below); `web` is the one that remains.
-- Why the asymmetry is the right shape rather than half a job: `skills` is observable
-  through a load, because `SkillRegistryConfig.MarshalJSON` hand-builds its output and
-  re-emits the registries into the loaded value. `web` is not. Every field under it that
-  could carry a key is a `SecureStrings`, and `SecureStrings.IsZero` reports true for any
-  caller but the YAML encoder, so `encoding/json` never writes one -- a security file's
-  `web.brave.api_keys` leaves the loaded value **byte-identical** to no security file at
-  all. A case added for it would structurally be unable to see its own subject.
-- Why not refuse it instead: that was the first behaviour, and it was the wrong direction
-  -- refusing makes the loader reject a file the shipped binary loads, and the failure
-  lands on every install that has ever saved a search key. Ignoring is the smaller
-  divergence and it is visible here rather than in a user's running agent.
-- Blast radius: an install that keeps a web-search key in `.security.yml` gets a config
-  where that key is absent at the point the port reports the loaded value, so a search
-  tool that works under Go reports "not configured" under the port. Secrets are not
-  leaked or written anywhere new -- they are read and dropped. The gap becomes observable
-  the moment `save` is compared, because the merge is what decides what gets written back
-  into `tools.web`.
-- Closes with: `apply_security` growing the section, in the same step as the `save` cases
-  that can witness it. The schema dump already carries the field list, so no Go-side work
-  is needed -- a corpus case is, and it has to be a save case.
-- Recorded: 2026-10-26, #5; narrowed to `web` on 2026-10-27 once `skills` landed.
-
 ### `crates/crab-config` does not apply the Telegram streaming env-compat shims
 
 - Go: `applyTelegramStreamingEnvCompat` (`pkg/config/config_channel.go:768`) runs inside
@@ -117,7 +85,7 @@ this file as long as observable behaviour is identical. They belong in
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
 
-### `crates/crab-config` loads a non-mapping skills value Go refuses
+### `crates/crab-config` loads a non-mapping value *inside* a legacy skills key
 
 - Go: `applyLegacySkillsSecurityNode` (`pkg/config/security.go:124`) decodes every value in
   the security file's `skills` mapping into a `SkillRegistryConfig`, and that decoder
@@ -127,6 +95,10 @@ this file as long as observable behaviour is identical. They belong in
   token really is dropped: an earlier round printed the bare scalar as a token, which made
   the port *manufacture* a credential (`auth_token: "[NOT_HERE]"`) on a config Go refuses --
   a worse divergence than the one recorded here, and fixed in #8 round 2.
+- Not this entry: the `skills:` node itself being a non-mapping. That is refused on both
+  sides since #10 -- `security_skills_{scalar,sequence,number}_is_refused`, with `null`
+  loading because a null never asks for a mapping. This entry is only about a value *under*
+  a legacy skills key, which the parent-node refusal does not reach.
 - Why: the one corpus case in this area, `security_a_scalar_under_registries_loads_unchanged`,
   pins the file that *does* load -- `registries` is skipped by name before the decode, which
   is the only reason it survives. No case pins a non-`registries` key holding a scalar, so
@@ -140,7 +112,8 @@ this file as long as observable behaviour is identical. They belong in
   an error type on this pass. The `registries` skip itself stays unpinnable until then: with
   the skip removed this port still replays green, because it never reaches the refusal the
   skip exists to avoid.
-- Recorded: 2026-10-27.
+- Recorded: 2026-10-27, re-scoped and restored 2026-10-28 (#10 round 3) after this head
+  deleted it while the behaviour it describes was still live.
 
 ### `crates/crab-config` names a migration backup by the UTC date
 
