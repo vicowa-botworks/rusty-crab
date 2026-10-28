@@ -1332,6 +1332,29 @@ mod tests {
         );
     }
 
+    /// The same rule on the legacy path, which is the half the v3 test above leaves unwitnessed.
+    /// A legacy document is merged with the security file **as data** before the strict pass
+    /// (`config.go:1474` `mergeMap`), and it is tempting to conclude that a data merge copies
+    /// every key the config entry lacks. It does not: measured against `LoadConfig` at v2 with
+    /// `provider: other`, `model: othermodel`, `rpm: 77` and `api_keys` in the same entry, the
+    /// loaded model keeps `provider`, `model` and `rpm` from the document and gains only the
+    /// keys -- byte-identical to v3. The merge is generic, but the security file's own typed
+    /// decode has already narrowed the entry to `api_keys` by the time it is data.
+    #[test]
+    fn a_legacy_document_narrows_the_security_entry_to_its_keys_too() {
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let (_dir, path) = write_pair(
+            legacy,
+            "model_list:\n    m1:0:\n      provider: anthropic\n      api_keys: [sk-1]\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        assert_eq!(
+            model_field(&cfg.document, 0, "provider"),
+            Some(&Doc::String("openai".to_string())),
+            "the data merge does not widen what a secrets file may set"
+        );
+    }
+
     #[test]
     fn an_entry_naming_no_model_is_ignored_rather_than_appended() {
         // The phantom this port used to invent: an entry keyed for a model the document does
