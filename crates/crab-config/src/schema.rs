@@ -456,7 +456,10 @@ pub(crate) const FLEXIBLE_STRING_SLICE: &str = "FlexibleStringSlice";
 pub(crate) fn flexible_element_text(value: &Doc) -> Doc {
     let text = match value {
         Doc::String(s) => s.clone(),
-        Doc::Int(i) => i.to_string(),
+        // `encoding/json` hands the type a `float64` for *every* number, so an integer is
+        // `%.0f` of a float: past 2^53 the value moves, and matching that is the difference
+        // between Go's `["12345678901234568"]` and a faithful-looking `["12345678901234567"]`.
+        Doc::Int(i) => format!("{:.0}", *i as f64),
         Doc::Float(f) => format!("{f:.0}"),
         other => go_percent_v(other),
     };
@@ -478,11 +481,15 @@ fn go_percent_v(value: &Doc) -> String {
             items.iter().map(go_percent_v).collect::<Vec<_>>().join(" ")
         ),
         Doc::Object(entries) => {
-            let mut parts: Vec<String> = entries
+            // Go sorts the *keys*, not the rendered `key:value` pairs: `{"a":1,"a!":2}` is
+            // `map[a:1 a!:2]`, and sorting the pairs would put `a!` first because `!` sorts
+            // before `:`.
+            let mut ordered: Vec<&(String, Doc)> = entries.iter().collect();
+            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            let parts: Vec<String> = ordered
                 .iter()
                 .map(|(key, value)| format!("{key}:{}", go_percent_v(value)))
                 .collect();
-            parts.sort();
             format!("map[{}]", parts.join(" "))
         }
     }

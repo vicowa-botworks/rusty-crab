@@ -14,20 +14,27 @@
 //!
 //! Note what is *not* in that output: `token`. `SecureString` fields are dropped from the
 //! settings entirely -- not written as the `[NOT_HERE]` placeholder their `MarshalJSON`
-//! returns, and not echoed. **Two mechanisms do that, and they cover different fields**, so
+//! returns, and not echoed. **Two rules remove them, and they cover different fields**, so
 //! naming only one is a rule that holds by coincidence on the rest:
 //!
 //! * the 24 *direct* secure fields are removed by name by the settings marshaler
 //!   (`extractSecureFieldNames`, `config_channel.go:555`), independently of any omit option;
 //! * the two *nested* ones -- `slack_webhook.webhooks[].webhook_url` and
-//!   `teams_webhook.webhooks[].webhook_url` -- are dropped by `omitzero`, because that walk
-//!   reads direct fields only and `SecureString.IsZero()` reports true for every non-YAML
-//!   caller (`config_struct.go:209`).
+//!   `teams_webhook.webhooks[].webhook_url` -- are dropped by the marshaler itself:
+//!   `SecureString.MarshalJSON` returns nil bytes and `encoding/json` omits a field whose
+//!   Marshaler does that, so **the tag is never consulted** (`config_struct.go:209`). That
+//!   is why `apply_omit` carries an explicit `SecureString`/`SecureStrings` arm instead of
+//!   an omit-option test.
 //!
-//! So a port that applies only `omitzero` gets the nested two right and the other 24 wrong:
-//! it sees a non-zero `SecureString`, keeps it, and writes either the placeholder or, if it
-//! reads the stored value instead of the typed one, every secret in the file. Pinned by
-//! `a_string_in_a_secure_string_channel_setting_loads`.
+//! Every secure `json_field` in the dump happens to carry `omitzero` today (10 of 10, none
+//! `omitempty`), so the two rules agree on bytes and disagree on the reason -- and the
+//! reason is what a `save` path copies, which is why it is stated here once rather than
+//! inferred per site.
+//!
+//! So a port that applies only an emptiness test gets the nested two right and the other 24
+//! wrong: it sees a non-zero `SecureString`, keeps it, and writes either the placeholder or,
+//! if it reads the stored value instead of the typed one, every secret in the file. Pinned
+//! by `a_string_in_a_secure_string_channel_setting_loads`.
 //!
 //! Two consequences a port cannot guess from the file:
 //!
@@ -277,21 +284,32 @@ fn project(schema: &Schema, stored: Option<&Doc>, path: &str) -> Result<Doc, Mis
                 type_name: schema.name().unwrap_or("").to_string(),
             }),
         },
-        Schema::Slice { elem, .. } => match &flexible_as_array(schema, stored) {
-            None | Some(Doc::Null) => Ok(Doc::Null),
-            Some(Doc::Array(items)) => {
-                let mut out = Vec::with_capacity(items.len());
-                for (index, item) in items.iter().enumerate() {
-                    let child_path = format!("{path}[{index}]");
-                    out.push(project(elem, Some(item), &child_path)?);
+        Schema::Slice { elem, .. } => {
+            // An *override*, not a replacement: `flexible_as_array` answers `None` for three
+            // different things -- not this type, no stored value, and a value that becomes
+            // nil -- so falling back to `stored` is what keeps a plain `[]string` projecting
+            // what the file holds. Matching the coercion alone made every non-flexible slice
+            // a constant `Null`, which silently deleted `group_trigger.prefixes` and turned
+            // Go's refusal of a bare bool or object into a load with the field absent.
+            let coerced = flexible_as_array(schema, stored);
+            match coerced.as_ref().or(stored) {
+                None | Some(Doc::Null) => Ok(Doc::Null),
+                Some(Doc::Array(items)) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for (index, item) in items.iter().enumerate() {
+                        let child_path = format!("{path}[{index}]");
+                        out.push(project(elem, Some(item), &child_path)?);
+                    }
+                    Ok(Doc::Array(out))
                 }
-                Ok(Doc::Array(out))
+                // Reached for a bare bool or object at a `FlexibleStringSlice`, which falls
+                // through every arm of Go's decoder and refuses naming the type.
+                Some(other) => Err(Mismatch::Value {
+                    got: other.json_kind(),
+                    type_name: schema.name().unwrap_or("").to_string(),
+                }),
             }
-            Some(other) => Err(Mismatch::Value {
-                got: other.json_kind(),
-                type_name: schema.name().unwrap_or("").to_string(),
-            }),
-        },
+        }
         Schema::Scalar { .. } => project_scalar(schema, stored, path),
     }
 }
@@ -450,8 +468,12 @@ fn sort_keys_recursively(document: &mut Doc) {
 /// binary *rewrites* `"allow_from": "alice"` to `["alice"]` on the next save.
 ///
 /// `null` is deliberately not coerced: Go sets the slice to nil, which marshals back as
-/// `null`. A bare bool or object is left for the caller's refusal too, because those fall
-/// through every arm of Go's decoder and the error naming the type is the Go answer.
+/// `null`. A bare bool or object is not coerced either, because those fall through every arm
+/// of Go's decoder and the refusal naming the type is the Go answer.
+///
+/// `None` therefore means three different things -- not this type, no stored value, and a
+/// value that becomes nil -- so the caller must fall back to the stored document
+/// (`project`'s Slice arm) rather than treat `None` as the answer.
 fn flexible_as_array(schema: &Schema, stored: Option<&Doc>) -> Option<Doc> {
     if !matches!(
         schema,

@@ -340,28 +340,21 @@ fn document(value: &str) -> Value {
 /// that every named stage is *load-bearing*. A stage that stops mattering fails the run,
 /// exactly like a case that leaves `KNOWN_UNPORTED` stale.
 const KNOWN_LOAD_GAPS: &[(&str, &[&str])] = &[
-    ("save_writes_the_document", &["channel_settings"]),
-    ("save_bumps_an_old_version", &["channel_settings"]),
-    ("session_omitted_when_empty", &["channel_settings"]),
-    ("migrate_backs_up_both_files", &["channel_settings"]),
-    (
-        "unparseable_security_file_is_refused",
-        &["channel_settings"],
-    ),
-    (
-        "security_entry_replaces_the_json_model",
-        &["channel_settings"],
-    ),
-    ("security_seq_form_is_refused", &["channel_settings"]),
-    ("save_writes_both_halves", &["channel_settings"]),
-    (
-        "virtual_key_models_are_written_back_once",
-        &["channel_settings", "model_list"],
-    ),
-    (
-        "save_then_load_then_save_is_stable",
-        &["channel_settings", "model_list"],
-    ),
+    // Every `channel_settings` label here went empty when the base's `apply_omit` work merged
+    // in: eight of these ten save cases now match Go byte for byte on the load side too, and
+    // the two that still differ do so on `model_list`, not on channel settings. The harness
+    // fails on a label that no longer explains anything exactly as loudly as it fails on a
+    // difference nobody accounted for, so an empty list is a claim, not a placeholder.
+    ("save_writes_the_document", &[]),
+    ("save_bumps_an_old_version", &[]),
+    ("session_omitted_when_empty", &[]),
+    ("migrate_backs_up_both_files", &[]),
+    ("unparseable_security_file_is_refused", &[]),
+    ("security_entry_replaces_the_json_model", &[]),
+    ("security_seq_form_is_refused", &[]),
+    ("save_writes_both_halves", &[]),
+    ("virtual_key_models_are_written_back_once", &["model_list"]),
+    ("save_then_load_then_save_is_stable", &["model_list"]),
 ];
 
 /// Removes what one unported stage is responsible for.

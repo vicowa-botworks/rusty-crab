@@ -1132,10 +1132,51 @@ mod tests {
         );
     }
 
+    /// The other half of the Slice arm. `group_trigger.prefixes` is a plain `[]string`, and
+    /// the `FlexibleStringSlice` coercion is an *override* over the stored value, not a
+    /// replacement of it. Matching the coercion alone projected every non-flexible slice to
+    /// `Null`, so a user's trigger prefixes disappeared from the loaded value with no error
+    /// at all -- and `prefixes` appears in no corpus case, so the replay stays green.
+    #[test]
+    fn a_plain_slice_in_channel_settings_still_projects() {
+        let (_dir, path) = write_temp(
+            r#"{"version":3,"session":{"dm_scope":"per-channel"},"channel_list":{"telegram":{"group_trigger":{"prefixes":["!","?"],"mention_only":true}}}}"#,
+        );
+        let cfg = load(&path, "/home/oracle").expect("load");
+        // Both keys, in `GroupTriggerConfig`'s declaration order rather than the file's.
+        assert_eq!(
+            cfg.document
+                .path(&["channel_list", "telegram", "group_trigger"])
+                .map(Doc::to_compact_json),
+            Some(r#"{"mention_only":true,"prefixes":["!","?"]}"#.to_string())
+        );
+    }
+
+    /// A bare bool or object at a `FlexibleStringSlice` falls through every arm of Go's
+    /// decoder, which refuses it naming the type. The override restored that by falling back
+    /// to the stored document, whose value then lands in the mismatch arm; before it, the
+    /// field projected to `Null`, `omitzero` dropped it, and the load *succeeded* with the
+    /// field absent -- a silently different config, the case the `Struct` arm exists for one
+    /// arm over.
+    #[test]
+    fn a_bool_or_object_at_a_flexible_slice_is_refused() {
+        for value in ["true", r#"{"a":"b"}"#] {
+            let document = format!(
+                r#"{{"version":3,"session":{{"dm_scope":"per-channel"}},"channel_list":{{"telegram":{{"allow_from":{value}}}}}}}"#
+            );
+            let (_dir, path) = write_temp(&document);
+            let err = load(&path, "/home/oracle")
+                .expect_err("a bool or object at a FlexibleStringSlice is refused, not erased");
+            assert!(
+                err.to_string().contains("FlexibleStringSlice"),
+                "{value}: got {err}"
+            );
+        }
+    }
+
     #[test]
     fn a_version_that_is_not_an_integer_is_refused_by_name() {
-        // `{"version":"3"}` is the case `unwrap_or(0)` got wrong: filed as v0, the whole
-        // migration ladder ran over the document and `needs_version_bump` was set, so a
+        // `{"version":"3"}` is the case `unwrap_or(0)` got wrong: filed as v0, the whole        // migration ladder ran over the document and `needs_version_bump` was set, so a
         // config Go refuses came out looking migrated.
         //
         // The sentence is Go's, measured from `LoadConfig` rather than composed: the probe
