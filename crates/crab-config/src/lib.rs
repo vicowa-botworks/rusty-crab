@@ -952,6 +952,24 @@ mod tests {
         assert_eq!(cfg.document, default_config("/home/oracle"));
     }
 
+    /// The `load` wiring, pinned here rather than left to the corpus: the coercion runs on the
+    /// merged document before `InitChannelList`, so a scalar in the file is already a list by
+    /// the time anything reads the loaded value. Without the call in `load` this is the only
+    /// test that notices, and the corpus cases that would have caught it live above this
+    /// branch.
+    #[test]
+    fn a_bare_allow_from_loads_as_a_list() {
+        let (_dir, path) = write_temp(
+            r#"{"version":3,"session":{"dm_scope":"per-channel"},"channel_list":{"telegram":{"allow_from":"alice"}}}"#,
+        );
+        let cfg = load(&path, "/home/oracle").expect("load");
+        assert_eq!(
+            cfg.document
+                .path(&["channel_list", "telegram", "allow_from"]),
+            Some(&Doc::Array(vec![Doc::String("alice".to_string())]))
+        );
+    }
+
     #[test]
     fn a_version_that_is_not_an_integer_is_refused_by_name() {
         // `{"version":"3"}` is the case `unwrap_or(0)` got wrong: filed as v0, the whole

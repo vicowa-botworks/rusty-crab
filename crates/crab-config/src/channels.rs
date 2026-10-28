@@ -14,9 +14,19 @@
 //!
 //! Note what is *not* in that output: `token`. `SecureString` fields are dropped from the
 //! settings entirely -- not written as the `[NOT_HERE]` placeholder their `MarshalJSON`
-//! returns, and not echoed. A port that applies only `omitzero` sees a non-zero
-//! `SecureString`, keeps it, and writes either the placeholder or, if it reads the stored
-//! value instead of the typed one, every secret in the file. Pinned by
+//! returns, and not echoed. **Two mechanisms do that, and they cover different fields**, so
+//! naming only one is a rule that holds by coincidence on the rest:
+//!
+//! * the 24 *direct* secure fields are removed by name by the settings marshaler
+//!   (`extractSecureFieldNames`, `config_channel.go:555`), independently of any omit option;
+//! * the two *nested* ones -- `slack_webhook.webhooks[].webhook_url` and
+//!   `teams_webhook.webhooks[].webhook_url` -- are dropped by `omitzero`, because that walk
+//!   reads direct fields only and `SecureString.IsZero()` reports true for every non-YAML
+//!   caller (`config_struct.go:209`).
+//!
+//! So a port that applies only `omitzero` gets the nested two right and the other 24 wrong:
+//! it sees a non-zero `SecureString`, keeps it, and writes either the placeholder or, if it
+//! reads the stored value instead of the typed one, every secret in the file. Pinned by
 //! `a_string_in_a_secure_string_channel_setting_loads`.
 //!
 //! Two consequences a port cannot guess from the file:
@@ -104,13 +114,14 @@ pub fn init_channel_list(document: &mut Doc, schema: &Schema) -> Result<(), Erro
             )));
         };
 
+        let stored = channel.get(SETTINGS_KEY);
+
         let mut out: Vec<(String, Doc)> = Vec::new();
         for field in elem.json_fields() {
             let Some(child) = elem.field(field.json) else {
                 continue;
             };
             if field.json == SETTINGS_KEY {
-                let stored = channel.get(SETTINGS_KEY);
                 // The decode targets the settings struct, so that is what Go names at the
                 // head of a field path -- not `settings`.
                 let seed = settings_schema.name().unwrap_or(SETTINGS_KEY).to_string();
@@ -266,7 +277,7 @@ fn project(schema: &Schema, stored: Option<&Doc>, path: &str) -> Result<Doc, Mis
                 type_name: schema.name().unwrap_or("").to_string(),
             }),
         },
-        Schema::Slice { elem, .. } => match stored {
+        Schema::Slice { elem, .. } => match &flexible_as_array(schema, stored) {
             None | Some(Doc::Null) => Ok(Doc::Null),
             Some(Doc::Array(items)) => {
                 let mut out = Vec::with_capacity(items.len());
@@ -427,5 +438,42 @@ fn sort_keys_recursively(document: &mut Doc) {
             }
         }
         _ => {}
+    }
+}
+
+/// The one slice type that does not require the array shape it declares.
+///
+/// `FlexibleStringSlice.UnmarshalJSON` (`config_struct.go:24`) answers a bare string and a
+/// bare number with a one-element list, and re-formats every element of an array, so the
+/// decoded value is not the stored one. Returning the list here -- rather than tolerating the
+/// scalar and passing it through -- is what makes the loaded bytes match Go's: the shipped
+/// binary *rewrites* `"allow_from": "alice"` to `["alice"]` on the next save.
+///
+/// `null` is deliberately not coerced: Go sets the slice to nil, which marshals back as
+/// `null`. A bare bool or object is left for the caller's refusal too, because those fall
+/// through every arm of Go's decoder and the error naming the type is the Go answer.
+fn flexible_as_array(schema: &Schema, stored: Option<&Doc>) -> Option<Doc> {
+    if !matches!(
+        schema,
+        Schema::Slice {
+            name: Some(crate::schema::FLEXIBLE_STRING_SLICE),
+            ..
+        }
+    ) {
+        return None;
+    }
+    match stored? {
+        Doc::Array(items) => Some(Doc::Array(
+            items
+                .iter()
+                .map(crate::schema::flexible_element_text)
+                .collect(),
+        )),
+        Doc::String(_) | Doc::Int(_) | Doc::Float(_) => {
+            Some(Doc::Array(vec![crate::schema::flexible_element_text(
+                stored?,
+            )]))
+        }
+        Doc::Null | Doc::Bool(_) | Doc::Object(_) => None,
     }
 }
