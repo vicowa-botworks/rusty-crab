@@ -112,7 +112,10 @@ this file as long as observable behaviour is identical. They belong in
   the security file's `skills` mapping into a `SkillRegistryConfig`, and that decoder
   decodes into a `map[string]any`. A scalar or sequence there is a decode failure, so
   `skills: {github: ghp_direct}` is a config the shipped binary will not load.
-- Rust: `skills::apply` answers a non-mapping node by ignoring it, so the file loads.
+- Rust: `skills::apply` answers a non-mapping node by ignoring it, so the file loads. The
+  token really is dropped: an earlier round printed the bare scalar as a token, which made
+  the port *manufacture* a credential (`auth_token: "[NOT_HERE]"`) on a config Go refuses --
+  a worse divergence than the one recorded here, and fixed in #8 round 2.
 - Why: the one corpus case in this area, `security_a_scalar_under_registries_loads_unchanged`,
   pins the file that *does* load -- `registries` is skipped by name before the decode, which
   is the only reason it survives. No case pins a non-`registries` key holding a scalar, so
