@@ -894,8 +894,8 @@ fn apply_security_channels(target: &mut Doc, source: &Doc) -> Result<(), Error> 
 /// That is the whole difference between the two passes: the JSON document is validated
 /// before it is merged, so an unknown key there is a refusal; the security file is not
 /// validated, so an unknown key there is nothing at all. Shape is the exception, and the
-/// other way round: `loadSecurityConfig` decodes the file into the typed `SecurityConfig`,
-/// so a node that does not fit its field fails the load -- see [`yaml_accepts`].
+/// other way round: `loadSecurityConfig` runs `yaml.Unmarshal(data, cfg)` over the whole
+/// file, so a node that does not fit its field fails the load -- see [`yaml_accepts`].
 ///
 /// `fields` is the schema of the node being merged *into*, and it has to be threaded from
 /// the caller. Asking the top-level `Config` schema instead -- which is what this function
@@ -915,10 +915,11 @@ fn apply_security_channels(target: &mut Doc, source: &Doc) -> Result<(), Error> 
 /// Visibility comes from `yaml_fields`, never from the JSON list. `tools.web.brave` has
 /// three JSON fields and one yaml field, and a secrets file can set exactly the one.
 fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) -> Result<(), Error> {
-    // Go never merges this file into anything: `loadSecurityConfig` decodes the whole
-    // document into the typed `SecurityConfig` first, and `yaml.v3` refuses a node whose
-    // shape does not fit the field it lands on. So a position with a schema has to be
-    // shape-checked here, before the merge walk decides the value is fine to place.
+    // Go never merges this file into anything: `loadSecurityConfig` runs
+    // `yaml.Unmarshal(data, cfg)` over the whole document into the typed config first, and
+    // `yaml.v3` refuses a node whose shape does not fit the field it lands on. So a
+    // position with a schema has to be shape-checked here, before the merge walk decides
+    // the value is fine to place.
     if let Some(schema) = fields {
         if !yaml_accepts(overlay, schema) {
             return Err(Error::SecurityType(format!(
@@ -981,9 +982,14 @@ fn yaml_accepts(node: &Doc, schema: &Schema) -> bool {
     if matches!(node, Doc::Null) {
         return true;
     }
-    // A type with its own `(Unm|M)arshalYAML` decides its own shape, and the generic walk
-    // has no business judging it: `SecureString` takes a bare scalar, `SecureModelList` and
-    // `SkillsRegistriesConfig` each project to something the field list does not describe.
+    // Defensive, and unreachable today: probed by panicking on this branch and running the
+    // whole suite (70 unit, 73 conformance, 3 golden), which never reached it. It stays
+    // because the exemption is a property of the Go type, not of the corpus -- a position
+    // whose type has its own `(Unm|M)arshalYAML` decides its own shape, and the generic walk
+    // has no business judging it (`SecureString` takes a bare scalar, `SecureModelList` and
+    // `SkillsRegistriesConfig` each project to something the field list does not describe).
+    // The first one this walk does reach through a schema has to arrive with a case, not
+    // with this branch already graded green.
     let custom = match schema {
         Schema::Struct { marshaler, .. } | Schema::Map { marshaler, .. } => *marshaler,
         Schema::Slice { marshaler, .. } => *marshaler,
@@ -1689,8 +1695,8 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Go decodes the whole `.security.yml` into the typed `SecurityConfig` *before* anything
-    /// is merged, so a node that does not fit the field it lands on fails the load. The port
+    /// Go decodes the whole `.security.yml` into the typed config *before* anything is
+    /// merged, so a node that does not fit the field it lands on fails the load. The port
     /// overwrote the node instead, which is the direction that loses data without saying so.
     ///
     /// `security_scalar_where_a_struct_belongs` and `security_map_where_a_sequence_belongs`
@@ -1789,7 +1795,35 @@ mod tests {
 
         assert!(
             drifted.is_empty(),
-            "the security merge gates readability on YamlField.name and merges into              YamlField.json, which is only behaviour-neutral while the two agree. These              gated fields now disagree, so a `.security.yml` key stops being readable (or              becomes readable) depending on which column is asked: {drifted:?}"
+            "the security merge gates readability on YamlField.name and merges into YamlField.json, which is only behaviour-neutral while the two agree. These gated fields now disagree, so a `.security.yml` key stops being readable (or becomes readable) depending on which column is asked: {drifted:?}"
+        );
+    }
+
+    /// The security walk has exactly three sections it can be asked about, and the tail of
+    /// its loop -- the lookup that asks the file for a field by its yaml spelling -- is
+    /// therefore unreachable today: `model_list` and `channel_list` are each handled before
+    /// it, and `tools` is inlined so it never appears as a key of its own.
+    ///
+    /// Asserted rather than commented because the branch is not wrong, only unwitnessed: a
+    /// fourth yaml section in the dump would make it live, and no case would say so. The
+    /// corpus pins the boundary from the other side --
+    /// `security_agents_section_is_not_readable_from_the_file` records that a section outside
+    /// these three is not merely unknown to the decoder but `yaml:"-"` and unreadable, so a
+    /// port that walked the JSON field list would apply `agents` and diverge on every field
+    /// inside it.
+    #[test]
+    fn the_security_walk_has_exactly_the_three_sections_it_handles() {
+        let mut names: Vec<&str> = config_schema()
+            .yaml_fields()
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["channel_list", "model_list", "tools"],
+            "a fourth yaml section makes apply_security's tail lookup live, unwitnessed, and \
+             in need of a case before it is trusted"
         );
     }
 
