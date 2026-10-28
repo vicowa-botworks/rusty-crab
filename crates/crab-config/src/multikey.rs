@@ -102,7 +102,10 @@ pub(crate) fn expand(document: &mut Doc, schema: &Schema) -> Vec<usize> {
         fallback_names.extend(existing_fallbacks);
         primary.set("fallbacks", Doc::Array(fallback_names));
 
-        let first_virtual = expanded.len();
+        // The start index belongs to the vector being sliced. `expanded` grows by one per
+        // model as well as per copy, so taking the start from it points past this model's
+        // positions -- vacuous for two models, out of range for three.
+        let first_virtual = virtual_positions.len();
         for entry in generated {
             virtual_positions.push(expanded.len());
             expanded.push(entry);
@@ -346,5 +349,58 @@ mod tests {
             })
             .collect();
         assert_eq!(keys, vec![Some("b"), Some("a")]);
+    }
+
+    /// The shape the key pool actually uses -- several models each with several keys -- and
+    /// the one that makes the recorded-position assertion bite. With the start index taken
+    /// from `expanded` instead of `virtual_positions`, the slice for the third model starts
+    /// past the end of the vector and the debug build panics (`range start index 4 out of
+    /// range for slice of length 3`), so this test is the witness for that off-by-one.
+    #[test]
+    fn three_multikey_models_record_a_position_per_copy() {
+        let list = model(
+            "{\"model_name\":\"m1\",\"provider\":\"p\",\"model\":\"q\",\"api_keys\":[\"a1\",\"b1\"]},\
+             {\"model_name\":\"m2\",\"provider\":\"p\",\"model\":\"q\",\"api_keys\":[\"a2\",\"b2\"]},\
+             {\"model_name\":\"m3\",\"provider\":\"p\",\"model\":\"q\",\"api_keys\":[\"a3\",\"b3\"]}",
+        );
+        let mut doc = Doc::Object(vec![("model_list".into(), list)]);
+        let virtuals = expand(&mut doc, &config_schema());
+        let entries = doc.get("model_list").and_then(Doc::as_array).expect("list");
+        assert_eq!(entries.len(), 6, "three copies and three primaries");
+        assert_eq!(virtuals.len(), 3);
+        let named = |at: usize| {
+            entries[at]
+                .get("model_name")
+                .and_then(Doc::as_str)
+                .expect("name")
+                .to_string()
+        };
+        assert_eq!(
+            virtuals.iter().map(|&at| named(at)).collect::<Vec<_>>(),
+            vec!["m1__key_1", "m2__key_1", "m3__key_1"],
+            "a recorded position must point at its own model's copy"
+        );
+    }
+
+    /// A plain model ahead of a multi-key one. Here the wrong start index is only
+    /// *vacuous* -- it never names a wrong entry, because `expanded` only ever runs ahead of
+    /// `virtual_positions` -- so the assertion above proves nothing for this shape and the
+    /// position checks below are what pin it.
+    #[test]
+    fn a_plain_model_before_a_multikey_one_records_the_multikey_copy() {
+        let list = model(
+            "{\"model_name\":\"m0\",\"provider\":\"p\",\"model\":\"q\",\"api_keys\":[\"a0\"]},\
+             {\"model_name\":\"m1\",\"provider\":\"p\",\"model\":\"q\",\"api_keys\":[\"a1\",\"b1\"]}",
+        );
+        let mut doc = Doc::Object(vec![("model_list".into(), list)]);
+        let virtuals = expand(&mut doc, &config_schema());
+        let entries = doc.get("model_list").and_then(Doc::as_array).expect("list");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(virtuals.len(), 1);
+        assert_eq!(
+            entries[virtuals[0]].get("model_name").and_then(Doc::as_str),
+            Some("m1__key_1"),
+            "the only recorded position belongs to the second model"
+        );
     }
 }

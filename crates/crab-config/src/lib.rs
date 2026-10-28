@@ -381,6 +381,13 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // directory into "no config at all", which is a strictly worse failure than the one
         // the shipped binary has -- and the caller cannot retry, because `load` has already
         // returned the error instead of the config.
+        //
+        // Timing, for whoever ports the stages listed in this function's doc: Go's `defer`
+        // runs at the *return* of `LoadConfig`, so it persists whatever the loader did after
+        // the migration switch -- `env.Parse` and the `Validate*` calls included. This writes
+        // at the migration point, which produces the same bytes only while nothing follows
+        // it. When those stages land, move this beside `Ok(config)` or the file on disk will
+        // disagree with the value the caller receives.
         let _ = save(&path, &mut config, home);
     }
 
