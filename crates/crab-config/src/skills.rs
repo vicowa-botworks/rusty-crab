@@ -419,7 +419,10 @@ mod tests {
     fn registries_after(security_yaml: &str, skills: Vec<(&str, Doc)>) -> Doc {
         let security = crate::yaml::parse(security_yaml).expect("the snippet must parse");
         let mut doc = document(skills);
-        apply(&mut doc, &security);
+        // The verdict is not what this helper is for: the refusals have their own tests on
+        // the `Result`. A rejected node leaves the document untouched either way, which is
+        // exactly what the callers below assert.
+        let _ = apply(&mut doc, &security);
         doc.path(&["tools", "skills", "registries"])
             .cloned()
             .unwrap_or(Doc::Null)

@@ -507,8 +507,12 @@ fn emit_seq_item(out: &mut String, level: usize, item: &Rendered) -> Result<(), 
         }
         Rendered::Value(other) => return emit_line(out, &dash, &scalar_text(other)),
         other => {
-            // A nested sequence has no key to ride the dash, so it becomes an anonymous
-            // block one level in -- what `yaml.v3` does for a sequence of sequences.
+            // Defensive, and unreachable today: the dump has no slice of slices anywhere in
+            // the config schema, so no recorded byte pair grades what this emits. It is kept
+            // because `Rendered::Seq` inside a sequence is representable in this type and a
+            // silent panic would be worse than an odd document. No claim is made about what
+            // `yaml.v3` would print -- the nested form it produces (`- - a`, riding the dash)
+            // is not what `emit_entry(.., "")` renders, which is an empty-key block.
             emit_entry(&mut buf, "", level + 1, other)?;
             true
         }

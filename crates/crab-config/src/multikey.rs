@@ -254,6 +254,7 @@ fn materialise(entry: Doc, elem: &Schema) -> Doc {
     Doc::Object(out)
 }
 
+/// `model_list`'s element schema -- the one position this stage reads the dump for.
 fn model_elem(schema: &Schema) -> Option<&Schema> {
     schema
         .field("model_list")
