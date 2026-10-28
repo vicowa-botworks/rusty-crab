@@ -990,7 +990,8 @@
           "json": "fallbacks",
           "omit": "omitempty"
          }
-        ]
+        ],
+        "json_marshaler": true
        },
        "name": {
         "kind": "scalar",
@@ -1059,7 +1060,8 @@
             "json": "fallbacks",
             "omit": "omitempty"
            }
-          ]
+          ],
+          "json_marshaler": true
          }
         },
         "name": "SubagentsConfig",
@@ -1366,6 +1368,7 @@
       "kind": "scalar",
       "name": "RawNode",
       "omit": "omitzero",
+      "json_marshaler": true,
       "marshaler": true
      },
      "type": {
@@ -1493,6 +1496,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "rpc_server_path": {
@@ -1580,6 +1584,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        }
       },
@@ -1616,6 +1621,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        }
       },
@@ -1651,12 +1657,14 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "encrypt_key": {
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "is_lark": {
@@ -1675,6 +1683,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        }
       },
@@ -1739,12 +1748,14 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "password": {
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "real_name": {
@@ -1765,6 +1776,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "sasl_user": {
@@ -1852,12 +1864,14 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "channel_secret": {
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "webhook_host": {
@@ -1935,6 +1949,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "crypto_database_path": {
@@ -2035,6 +2050,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "qos": {
@@ -2051,6 +2067,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        }
       },
@@ -2107,6 +2124,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "group_trigger_prefix": {
@@ -2239,6 +2257,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "write_timeout": {
@@ -2288,7 +2307,8 @@
         "json": "max_connections",
         "omit": "omitempty"
        }
-      ]
+      ],
+      "streaming_validated": true
      },
      "pico_client": {
       "kind": "struct",
@@ -2312,6 +2332,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "url": {
@@ -2360,6 +2381,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "max_base64_file_size_mib": {
@@ -2409,12 +2431,14 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "bot_token": {
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        }
       },
@@ -2464,6 +2488,7 @@
            "kind": "struct",
            "name": "SecureString",
            "omit": "omitzero",
+           "json_marshaler": true,
            "marshaler": true
           }
          },
@@ -2524,6 +2549,7 @@
            "kind": "struct",
            "name": "SecureString",
            "omit": "omitzero",
+           "json_marshaler": true,
            "marshaler": true
           }
          },
@@ -2635,6 +2661,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "use_markdown_v2": {
@@ -2671,7 +2698,8 @@
        {
         "json": "media_group_delay_ms"
        }
-      ]
+      ],
+      "streaming_validated": true
      },
      "vk": {
       "kind": "struct",
@@ -2684,6 +2712,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        }
       },
@@ -2716,6 +2745,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        },
        "send_thinking_message": {
@@ -2808,7 +2838,8 @@
         "json": "streaming",
         "omit": "omitzero"
        }
-      ]
+      ],
+      "streaming_validated": true
      },
      "weixin": {
       "kind": "struct",
@@ -2834,6 +2865,7 @@
         "kind": "struct",
         "name": "SecureString",
         "omit": "omitzero",
+        "json_marshaler": true,
         "marshaler": true
        }
       },
@@ -2924,6 +2956,11 @@
       ]
      }
     },
+    "singleton_channel_types": [
+     "pico",
+     "pico_client"
+    ],
+    "json_marshaler": true,
     "marshaler": true
    },
    "name": "ChannelsConfig"
@@ -3208,7 +3245,8 @@
      "json": "min_success_rate",
      "omit": "omitempty"
     }
-   ]
+   ],
+   "json_marshaler": true
   },
   "gateway": {
    "kind": "struct",
@@ -3705,10 +3743,12 @@
       "elem": {
        "kind": "struct",
        "name": "SecureString",
+       "json_marshaler": true,
        "marshaler": true
       },
       "name": "SecureStrings",
-      "omit": "omitzero"
+      "omit": "omitzero",
+      "json_marshaler": true
      },
      "auth_method": {
       "kind": "scalar",
@@ -4795,6 +4835,7 @@
          "kind": "struct",
          "name": "SecureString",
          "omit": "omitzero",
+         "json_marshaler": true,
          "marshaler": true
         }
        },
@@ -4834,6 +4875,7 @@
           "kind": "struct",
           "name": "SecureString",
           "omit": "omitzero",
+          "json_marshaler": true,
           "marshaler": true
          },
          "base_url": {
@@ -4874,9 +4916,11 @@
           "omit": "omitzero"
          }
         ],
+        "json_marshaler": true,
         "marshaler": true
        },
        "name": "SkillsRegistriesConfig",
+       "json_marshaler": true,
        "marshaler": true
       },
       "search_cache": {
@@ -5015,6 +5059,7 @@
          "kind": "struct",
          "name": "SecureString",
          "omit": "omitzero",
+         "json_marshaler": true,
          "marshaler": true
         },
         "base_url": {
@@ -5062,10 +5107,12 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
+          "json_marshaler": true,
           "marshaler": true
          },
          "name": "SecureStrings",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "json_marshaler": true
         },
         "enabled": {
          "kind": "scalar",
@@ -5152,6 +5199,7 @@
          "kind": "struct",
          "name": "SecureString",
          "omit": "omitzero",
+         "json_marshaler": true,
          "marshaler": true
         },
         "enabled": {
@@ -5198,6 +5246,7 @@
          "kind": "struct",
          "name": "SecureString",
          "omit": "omitzero",
+         "json_marshaler": true,
          "marshaler": true
         },
         "base_url": {
@@ -5252,10 +5301,12 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
+          "json_marshaler": true,
           "marshaler": true
          },
          "name": "SecureStrings",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "json_marshaler": true
         },
         "base_url": {
          "kind": "scalar",
@@ -5302,10 +5353,12 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
+          "json_marshaler": true,
           "marshaler": true
          },
          "name": "SecureStrings",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "json_marshaler": true
         },
         "enabled": {
          "kind": "scalar",
@@ -5448,10 +5501,12 @@
          "elem": {
           "kind": "struct",
           "name": "SecureString",
+          "json_marshaler": true,
           "marshaler": true
          },
          "name": "SecureStrings",
-         "omit": "omitzero"
+         "omit": "omitzero",
+         "json_marshaler": true
         },
         "base_url": {
          "kind": "scalar",
@@ -5806,6 +5861,10 @@
  ],
  "json_fields": [
   {
+   "json": "session",
+   "omit": "omitempty"
+  },
+  {
    "json": "version"
   },
   {
@@ -5814,10 +5873,6 @@
   },
   {
    "json": "agents"
-  },
-  {
-   "json": "session",
-   "omit": "omitempty"
   },
   {
    "json": "evolution",
@@ -5856,5 +5911,6 @@
    "json": "build_info",
    "omit": "omitempty"
   }
- ]
+ ],
+ "json_marshaler": true
 }
