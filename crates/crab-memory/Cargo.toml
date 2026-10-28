@@ -1,0 +1,21 @@
+[package]
+name = "crab-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "picoclaw's JSONL session store, ported from pkg/memory"
+
+[dependencies]
+crab-gojson = { path = "../crab-gojson" }
+crab-protocoltypes = { path = "../crab-protocoltypes" }
+serde.workspace = true
+serde_json.workspace = true
+# Go's `crypto/sha256` is standard library, so the faithful mapping is the
+# RustCrypto implementation rather than a hand-rolled digest: `isMainSessionAlias`
+# decides whether a session is the shared fallback, and a wrong digest silently
+# moves main's history into a channel's canonical session.
+sha2 = "0.10"
+
+[dev-dependencies]
+conformance = { path = "../../conformance" }

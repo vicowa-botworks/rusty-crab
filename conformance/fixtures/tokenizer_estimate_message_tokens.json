@@ -2,7 +2,7 @@
   "schema": "rusty-crab-conformance/1",
   "generator": "cmd/oracle",
   "source_repo": "github.com/sipeed/picoclaw",
-  "source_commit": "626387ca38971f9998375abbd2fc359de7ef92c5",
+  "source_commit": "01635da3af7a7f07110bf145da8b6609c96b984c",
   "seed": 24301,
   "seam": "tokenizer/EstimateMessageTokens",
   "note": "Content and ReasoningContent are counted in runes; ToolCall and ToolCallID fields are counted in bytes; the scale is a floor division; media is added after scaling.",

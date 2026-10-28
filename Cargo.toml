@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "conformance",
     "crates/crab-gojson",
+    "crates/crab-memory",
     "crates/crab-protocoltypes",
     "crates/crab-tokenizer",
 ]

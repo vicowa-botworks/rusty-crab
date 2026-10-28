@@ -2,10 +2,10 @@
   "schema": "rusty-crab-conformance/1",
   "generator": "cmd/oracle",
   "source_repo": "github.com/sipeed/picoclaw",
-  "source_commit": "626387ca38971f9998375abbd2fc359de7ef92c5",
+  "source_commit": "01635da3af7a7f07110bf145da8b6609c96b984c",
   "seed": 24301,
   "seam": "pkg/providers/protocoltypes + encoding/json.Marshal",
-  "note": "expected is the exact output of json.Marshal over the described Go value. Field order is declaration order. Absent, null, [] and \"\" are four different encodings and each comes from a different Go value: an omitempty field is dropped for its zero value, a bare field is always emitted, a nil slice or map emits null and an empty one emits [] or {}. time.Time is RFC3339Nano, which trims trailing zeros from the fraction (an exact second has none). StreamChunk has no json tags, so its keys are the Go field names with their original capitalisation. Fields tagged json:\"-\" (Name, Arguments, ThoughtSignature on ToolCall; PromptLayer, PromptSlot, PromptSource everywhere) never appear.",
+  "note": "expected is the exact output of json.Marshal over the described Go value, or null when it returns an error -- which it can, because Arguments and Parameters carry arbitrary map[string]any and a NaN, channel or func inside one is a marshaling failure. Such a value is not dropped from input: portable() replaces it with {\"$go_marshal_error\": \"unsupported_type\"} (or NaN, +Inf, -Inf, complex for those), so the refusal is visible in the case rather than silent. Field order is declaration order. Absent, null, [] and \"\" are four different encodings and each comes from a different Go value: an omitempty field is dropped for its zero value -- including an empty non-nil slice or map, which is why media: [] and media: null both omit the key -- a bare field is always emitted, a nil slice or map emits null and an empty one emits [] or {}. time.Time is RFC3339Nano, which trims trailing zeros from the fraction (an exact second has none). StreamChunk has no json tags, so its keys are the Go field names with their original capitalisation. Fields tagged json:\"-\" (Name, Arguments, ThoughtSignature on ToolCall; PromptLayer, PromptSlot, PromptSource everywhere) never appear.",
   "case_count": 248,
   "cases": [
     {
@@ -314,7 +314,7 @@
       "input": {
         "kind": "llm_response",
         "value": {
-          "content": "",
+          "content": "x",
           "finish_reason": "",
           "reasoning": "",
           "reasoning_content": "",
@@ -323,14 +323,14 @@
           "usage": null
         }
       },
-      "expected": "{\"content\":\"\",\"finish_reason\":\"\",\"reasoning\":\"\",\"reasoning_details\":null}"
+      "expected": "{\"content\":\"x\",\"finish_reason\":\"\",\"reasoning\":\"\",\"reasoning_details\":null}"
     },
     {
       "name": "response_details_empty",
       "input": {
         "kind": "llm_response",
         "value": {
-          "content": "",
+          "content": "x",
           "finish_reason": "",
           "reasoning": "",
           "reasoning_content": "",
@@ -339,7 +339,7 @@
           "usage": null
         }
       },
-      "expected": "{\"content\":\"\",\"finish_reason\":\"\",\"reasoning\":\"\",\"reasoning_details\":[]}"
+      "expected": "{\"content\":\"x\",\"finish_reason\":\"\",\"reasoning\":\"\",\"reasoning_details\":[]}"
     },
     {
       "name": "response_details_one",
@@ -789,7 +789,7 @@
           "content": "",
           "created_at": {
             "nanos": 0,
-            "offset_seconds": 19800,
+            "offset_seconds": 3600,
             "unix_seconds": 1700000000
           },
           "media": null,
@@ -804,7 +804,7 @@
           "tool_calls": null
         }
       },
-      "expected": "{\"role\":\"\",\"content\":\"\",\"created_at\":\"2023-11-15T03:43:20+05:30\"}"
+      "expected": "{\"role\":\"\",\"content\":\"\",\"created_at\":\"2023-11-14T23:13:20+01:00\"}"
     },
     {
       "name": "message_time_offset_negative",

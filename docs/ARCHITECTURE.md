@@ -71,6 +71,7 @@ sides unambiguously.
 |---|---|
 | `crab-tokenizer` | `pkg/tokenizer` |
 | `crab-protocoltypes` | `pkg/providers/protocoltypes` |
+| `crab-memory` | `pkg/memory` |
 | `crab-gojson` | Go's `encoding/json` — standard library, not a picoclaw package |
 
 Deviations from one-to-one need a reason written next to them. `crab-gojson` is
@@ -118,16 +119,20 @@ Port the buffer sizes, since they are usually the backpressure design.
 
 ## Where to start
 
-Two crates are done and are the template: `crab-tokenizer` (arithmetic and
-byte/rune tallies) and `crab-protocoltypes` (a serialisation surface). Each has a
+Three crates are done and are the template: `crab-tokenizer` (arithmetic and
+byte/rune tallies), `crab-protocoltypes` (a serialisation surface) and
+`crab-memory` (a whole store: files on disk, not a return value). Each has a
 Go-side generator, a committed corpus, a replay test, and unit tests that explain
 the traps.
 
-They fail differently, which is why both are worth having as precedents. A
+They fail differently, which is why all three are worth having as precedents. A
 tokenizer divergence is a wrong number that is invisible until a context window
 overflows. A wire-type divergence is a byte that a provider still accepts and that
 only the *next release* notices, when it reads back a session file the old port
-wrote. The second kind is the one no test catches without an oracle.
+wrote. A store divergence is a file the next version cannot open at all — and it
+is the only one of the three whose contract is not a function signature, which is
+why its fixture replays a script and compares a directory.
 
-Next, in the order the oracle suite covers them: the memory JSONL store, then
-`pkg/config`. Both are stored formats, so both are wire-type-shaped problems.
+Next, in the order the oracle suite covers them: `pkg/config`. It is a stored
+format, so it is memory-shaped: the artefact is the file, and the interesting
+cases are the ones where the code and the file disagree.

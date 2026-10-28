@@ -8,6 +8,7 @@ description = "Provider wire types for rusty-crab, ported from picoclaw pkg/prov
 
 [dependencies]
 crab-gojson = { path = "../crab-gojson" }
+serde_json.workspace = true
 
 [dev-dependencies]
 conformance = { path = "../../conformance" }
