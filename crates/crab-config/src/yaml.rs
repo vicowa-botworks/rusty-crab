@@ -6,15 +6,21 @@
 //! which refuses any key the target type cannot place. The security file is decoded by
 //! a YAML library into the same `Config` struct, where every field that is not
 //! yaml-tagged is simply *not a field* -- so a key the JSON side would refuse is
-//! silently ignored here, and only a syntax error or a type error fails. The corpus
-//! pins both halves of that asymmetry (`security_entry_replaces_the_json_model`,
-//! `unparseable_security_file_is_refused`).
+//! silently ignored here, and only a syntax error or a type error fails. The corpus pins
+//! the refusal half (`unparseable_security_file_is_refused`). The ignore half has no
+//! load-side witness at all, for a reason of its own: everything the file can set is a
+//! secret, and a secret is invisible in the value a config loads to -- see
+//! `go_records_no_secrets_in_the_loaded_value`, which pins that rule from Go's bytes.
 //!
 //! **It decodes into a config that is already populated.** `loadSecurityConfig` runs
-//! after the JSON document has been read, so a security entry fills in the fields it
-//! mentions and leaves the rest of that entry alone. That is per-field, not
-//! per-entry: `model_list: {m1:0: {rpm: 5}}` gives m1 an rpm and keeps its provider.
-//! The wholesale-replacement reading is the intuitive one and it is wrong.
+//! after the JSON document has been read, so the file fills fields in and never replaces
+//! an entry. What it is *allowed* to fill is per section and narrower than an entry's
+//! shape suggests: a `model_list` entry goes through `SecureModelList.UnmarshalYAML`,
+//! which assigns `m.APIKeys = sec.APIKeys` and discards everything else it decoded, so
+//! `model_list: {m1:0: {rpm: 5}}` gives m1 nothing at all, and an entry naming a model
+//! the config does not list is ignored rather than added. A channel's `settings` is the
+//! other extreme -- a raw node decoded by JSON rules, reaching every field of that
+//! channel's settings struct. The one statement that holds across both is the direction.
 //!
 //! `channels` / `channel_list` is the exception with its own mechanism: it is pulled
 //! out of the node tree before the decode and merged into the JSON-loaded channels
@@ -46,6 +52,15 @@ use crate::Error;
 pub struct Security {
     /// The file's root mapping.
     pub document: Doc,
+    /// The kind word for a `model_list` that is not a mapping -- `seq`, `str`, `int`.
+    ///
+    /// Whether that is an error is not a property of the file, so `parse` does not decide
+    /// it. `loadSecurityConfig` hands the whole file to `yaml.Unmarshal` against a
+    /// `map[string]*ModelConfig` and reports the mismatch; the migration path never calls
+    /// that, it merges the file as plain data, and `loadConfigMap` only merges the section
+    /// when it is a map and deletes it either way. So the version decides, and the version
+    /// is not known down here.
+    pub model_list_kind: Option<&'static str>,
 }
 
 impl Security {
@@ -96,6 +111,7 @@ pub fn parse(text: &str) -> Result<Security, Error> {
     };
 
     let mut entries = Vec::with_capacity(mapping.len());
+    let mut model_list_kind = None;
     for (key, value) in mapping {
         let name = match key
             .as_str()
@@ -105,39 +121,51 @@ pub fn parse(text: &str) -> Result<Security, Error> {
             Some(n) => n,
             None => continue,
         };
-        // `model_list` is checked as it is read because it is the one section whose
-        // shape can be structurally wrong in a way the decoder reports rather than
-        // ignores. Everything else is kept verbatim and filtered at merge time by the
-        // yaml table, which is where "no field can hold this" gets decided -- in the
-        // same place Go decides it.
+        // `model_list` is the one section whose shape can be structurally wrong in a way
+        // the decoder reports rather than ignores -- but *whether* it reports it depends on
+        // which loader has the file, so the kind is recorded rather than judged. Everything
+        // else is kept verbatim and filtered at merge time by the yaml table, which is
+        // where "no field can hold this" gets decided -- in the same place Go decides it.
         if name == "model_list" {
-            entries.push((name, decode_model_list(value)?));
+            let (doc, kind) = decode_model_list(value);
+            model_list_kind = kind;
+            entries.push((name, doc));
         } else {
             entries.push((name, scalar_or_container(value)));
         }
     }
     out.document = Doc::Object(entries);
+    out.model_list_kind = model_list_kind;
 
     Ok(out)
 }
 
 /// `yaml.Unmarshal(data, cfg)` for the `model_list` field: `map[string]*ModelConfig`.
 ///
-/// A sequence is the mistake a user makes by copying the JSON shape, and Go's answer is
-/// a type error naming both the kind it found and the type it wanted. The sentence is
-/// not pinned by the corpus -- Go prefixes it with an absolute path -- but the refusal
-/// is, and so is the fact that a map whose entries carry unknown keys is accepted.
-fn decode_model_list(value: &Yaml) -> Result<Doc, Error> {
+/// A sequence is the mistake a user makes by copying the JSON shape, and a scalar is the
+/// same mistake one level further gone. Both are the loader's business, not the parser's:
+/// see [`Security::model_list_kind`]. The sentence Go prints is not pinned by the corpus --
+/// it prefixes it with an absolute path -- but the refusal is, and so is the fact that a
+/// map whose entries carry unknown keys is accepted.
+fn decode_model_list(value: &Yaml) -> (Doc, Option<&'static str>) {
     match value {
-        Yaml::Array(_) => Err(Error::SecurityType(
-            "cannot unmarshal !!seq into map[string]*config.ModelConfig".to_string(),
-        )),
-        Yaml::Null => Ok(Doc::Object(Vec::new())),
-        other => to_doc(other).ok_or_else(|| {
-            Error::SecurityType(
-                "cannot unmarshal !!str into map[string]*config.ModelConfig".to_string(),
-            )
-        }),
+        Yaml::Hash(_) => (to_doc(value).unwrap_or_default(), None),
+        Yaml::Null => (Doc::Object(Vec::new()), None),
+        other => (scalar_or_container(other), Some(kind_word(other))),
+    }
+}
+
+/// The `!!` tag `yaml.v3` names a node by in a decode error.
+fn kind_word(value: &Yaml) -> &'static str {
+    match value {
+        Yaml::Array(_) => "seq",
+        Yaml::String(_) => "str",
+        Yaml::Integer(_) => "int",
+        Yaml::Real(_) => "float",
+        Yaml::Boolean(_) => "bool",
+        Yaml::Null => "null",
+        Yaml::Hash(_) => "map",
+        Yaml::BadValue | Yaml::Alias(_) => "!!unknown",
     }
 }
 
@@ -612,12 +640,41 @@ mod tests {
     }
 
     #[test]
-    fn a_sequence_is_a_type_error() {
-        // The JSON shape in YAML. Go refuses; a port that accepts it loads a file the
-        // Go build stops on.
-        let err = parse("model_list:\n    - model_name: m1\n").expect_err("seq must be refused");
-        assert!(matches!(err, Error::SecurityType(_)), "got {err}");
-        assert!(err.to_string().contains("map[string]*config.ModelConfig"));
+    fn a_sequence_is_recorded_rather_than_refused() {
+        // The JSON shape in YAML. Go's answer depends on which loader has the file --
+        // `loadSecurityConfig` reports a type error, the migration path deletes the section
+        // and carries on -- so `parse` only records what it found. The refusal itself is
+        // `a_sequence_is_refused_for_the_current_version_and_ignored_for_a_legacy_one`.
+        let sec = parse("model_list:\n    - model_name: m1\n").expect("seq parses");
+        assert_eq!(sec.model_list_kind, Some("seq"));
+        assert!(
+            matches!(sec.model_list(), Some(Doc::Array(_))),
+            "the node is kept, not dropped: {:?}",
+            sec.model_list()
+        );
+    }
+
+    #[test]
+    fn a_scalar_is_recorded_with_the_tag_yaml_names_it() {
+        let sec = parse("model_list: nope\n").expect("scalar parses");
+        assert_eq!(sec.model_list_kind, Some("str"));
+    }
+
+    #[test]
+    fn a_mapping_and_an_empty_section_are_not_a_shape_problem() {
+        assert_eq!(
+            parse("model_list:\n    m1:0:\n      api_keys: [k]\n")
+                .expect("map form")
+                .model_list_kind,
+            None
+        );
+        assert_eq!(
+            parse("model_list:\n")
+                .expect("empty section")
+                .model_list_kind,
+            None,
+            "`model_list:` with no value is a nil map to Go, not a type error"
+        );
     }
 
     #[test]
@@ -678,6 +735,18 @@ mod tests {
         // `-lead` plain. Quoting it would still parse, but it would not be Go's bytes.
         assert_eq!(quote_key("-lead"), "-lead");
         assert_eq!(quote_key("- lead"), "\"- lead\"");
+    }
+
+    #[test]
+    fn a_leading_reserved_indicator_is_quoted() {
+        // `@` and backtick are *reserved*: libyaml refuses to parse a plain scalar that
+        // starts with one, so an email address used as a key is not YAML at all until it
+        // is quoted. The rule is about the first character only -- the same character
+        // inside the scalar is ordinary text, and quoting that would not be Go's bytes.
+        assert_eq!(quote_key("@nine.testrun.org"), "\"@nine.testrun.org\"");
+        assert_eq!(quote_key("`tick"), "\"`tick\"");
+        assert_eq!(quote_key("nine@testrun.org"), "nine@testrun.org");
+        assert_eq!(quote_key("a@b"), "a@b");
     }
 
     #[test]
