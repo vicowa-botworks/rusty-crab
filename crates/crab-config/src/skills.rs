@@ -239,10 +239,22 @@ pub fn apply(merged: &mut Doc, security: &Security, baseline: Option<&Doc>) {
 ///
 /// | document `registries` | Go's loaded value |
 /// | --- | --- |
-/// | a mapping | that mapping, normalised |
-/// | an array or scalar | the array ignored, `clawhub` + `github` at their **defaults** |
-/// | `null` | the baseline's **names** at **zero** values, the document's own entries gone |
+/// | a mapping | that mapping, merged over the builtins and normalised |
+/// | `null` | `clawhub` + `github` at their **defaults** -- the same answer as an array |
+/// | an array | the array ignored, the builtins standing at their **defaults** |
+/// | a number | refused outright, see the scalar arm in [`rebuild`] |
 /// | absent | untouched -- Go's decoder is never called for a key that is not there |
+///
+/// Measured at picoclaw `01635da3`, one process per shape, no `.security.yml` on disk:
+/// `null`, `[{enabled:true,name:github}]` and an absent key all give
+/// `{clawhub:{base_url:"https://clawhub.ai",enabled:true}, github:{...}}`, and a mapping
+/// `{"custom":{base_url:"u"}}` keeps both builtins and adds `custom` at zero values.
+///
+/// **Do not read the `null` row as the file's null header.** A `registries:` with nothing
+/// after the colon in `.security.yml` is a different pass and a different answer -- the
+/// baseline's *names* at **zero** values, with the document's own registries gone. That one
+/// is pinned by `a_null_registries_header_in_the_file_wipes_to_the_builtins_at_zero_values`;
+/// this pass never wipes, and the two are the easiest pair on this seam to confuse.
 pub fn normalise_document(merged: &mut Doc, baseline: Option<&Doc>) {
     rebuild(merged, None, baseline);
 }
@@ -304,9 +316,12 @@ fn rebuild(merged: &mut Doc, security: Option<&Security>, baseline: Option<&Doc>
                     .collect()
             })
             .unwrap_or_default(),
-        // A scalar where the mapping belongs is the one shape not measured against Go: its
-        // decoder reports a type error at a stage this crate refuses nothing at, so the
-        // document keeps the shape it was given rather than an answer invented here.
+        // A number where the mapping belongs is the one shape Go refuses here, measured at
+        // picoclaw `01635da3`: `config.json type error at line 1, column 1: expected
+        // map[string]jsontext.Value but got number`. That sentence belongs to a loader stage
+        // this crate has not ported -- it refuses nothing at this depth -- so the document
+        // keeps the shape it was given rather than an answer invented here, and the
+        // divergence is recorded in `docs/DIVERGENCES.md` rather than papered over.
         Some(_) => Vec::new(),
         None => Vec::new(),
     };

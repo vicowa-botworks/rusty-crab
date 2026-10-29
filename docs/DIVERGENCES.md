@@ -135,7 +135,9 @@ this file as long as observable behaviour is identical. They belong in
   because this crate has no stage that raises Go's `jsontext` type error at all -- the
   unknown-field validator reports names, not kinds, and the two sentences differ.
 - Why it is left: inventing a refusal here would be inventing its wording too, and the
-  measured Go sentence belongs to a loader stage this crate has not ported. The blast radius
+  measured Go sentence -- `config.json type error at line 1, column 1: expected
+  map[string]jsontext.Value but got number`, at picoclaw `01635da3` -- belongs to a loader
+  stage this crate has not ported. The blast radius
   is a config that should not load, loading with a scalar where a registry map belongs; the
   registries themselves come back as the baseline's, so nothing silently gains a credential.
 - Closes with: the type-error stage, which is the same missing stage as the `SecureString`
