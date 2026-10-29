@@ -120,40 +120,32 @@ this file as long as observable behaviour is identical. They belong in
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
 
-### A null or non-mapping `registries` section cannot be answered without the builtin registries
+### A scalar at a document's `registries` is refused by Go and loads here
 
-- Go: `SkillsRegistriesConfig` is a slice, so yaml.v3's `!!null` short-circuit *zeroes* it
-  before the custom unmarshaler is reached -- the same short-circuit that makes a null
-  `SecureString` keep what it held, arriving at the opposite result because the kind differs.
-  The decoder then re-materialises the two builtins at their **zero** values, and the
-  document's own registries are gone with the slice. Measured at picoclaw `origin/main` and at
-  the fixture's head, identical on both:
+- Go: `tools.skills.registries` is decoded through the `jsontext` map reader, so a scalar is a
+  type error naming its own line and column -- measured at picoclaw `1a4e1edf`, whose
+  `pkg/config` loader differs from the `01635da3` the review ran at only by `schema_dump.go`
+  and a test file:
+  `config.json type error at line 1, column 3: expected map[string]jsontext.Value but got
+  string`, with the offending line quoted and a caret under the path. A sequence is *not* in
+  that family: it is ignored, and the builtin registries stand at their defaults.
+- Rust: `skills::rebuild` treats a sequence as "ignored, baseline stands" (pinned by
+  `a_non_mapping_registries_node_leaves_the_builtins_standing`, which covers both that and a
+  document `null`) and leaves a scalar in the document untouched rather than refusing it,
+  because this crate has no stage that raises Go's `jsontext` type error at all -- the
+  unknown-field validator reports names, not kinds, and the two sentences differ.
+- Why it is left: inventing a refusal here would be inventing its wording too, and the
+  measured Go sentence belongs to a loader stage this crate has not ported. The blast radius
+  is a config that should not load, loading with a scalar where a registry map belongs; the
+  registries themselves come back as the baseline's, so nothing silently gains a credential.
+- Closes with: the type-error stage, which is the same missing stage as the `SecureString`
+  number refusal in vicowa-botworks/rusty-crab#15.
+- Recorded: 2026-10-28, #8 round 4. The entry this replaces -- "a null or non-mapping
+  `registries` section cannot be answered without the builtin registries" -- was wrong about
+  its own cause: the names and defaults are in the embedded `defaults.json`, which is the
+  baseline `load` merges into, so both arms were four lines each and they are now landed
+  (`normalise_document` for the document side, the null-header wipe for the file's).
 
-  | `.security.yml` `skills:` | Go's `tools.skills.registries` |
-  | --- | --- |
-  | `registries:` (null) | `clawhub {enabled: false, base_url: ""}`, `github {enabled: false, base_url: ""}` |
-  | same, with `custom` in `config.json` | `custom` gone entirely |
-  | `registries: null` beside a legacy key | builtins zeroed **and** the legacy registry created |
-  | `registries: {}` / `registries: []` | builtins intact (the port agrees) |
-  | `config.json` `registries: [{name: github, enabled: true}]`, no security file | the array ignored; `clawhub` + `github` at **defaults** |
-
-- Rust: a null section reads as "nothing to do" (`registry_nodes`' `_ => Vec::new()`), so the
-  builtins stay at their defaults and a `custom` survives; a non-object document `registries`
-  is echoed as written, which changes the *kind* of the node and deletes a builtin.
-- Why it is not fixed in the same commit as the gate: both answers need the two builtin
-  registries -- their names and the base URLs `defaults()` gives them -- and the port has
-  neither anywhere. `clawhub` appears nowhere in `crates/crab-config/src/` and not in the
-  schema dump, because it is data in `config.go:1560`/`:1609`, not a struct tag, so the AST
-  extractor cannot see it. Writing the pair by hand is exactly the failure mode `base_fields`
-  was extracted into the dump to avoid: a list that silently disagrees the day Go changes a
-  default.
-- Blast radius: an operator who leaves a `registries:` header and nothing under it gets a
-  config where clawhub is still enabled under the port and disabled under the shipped binary.
-  The array spelling is rarer and rewrites the node's kind.
-- Closes with: the builtin registry list carried in the dump the way the singleton channel
-  registry is (one Go-side extraction, then the two arms here are four lines), tracked as
-  vicowa-botworks/rusty-crab#13.
-- Recorded: 2026-10-28, #8 round 3.
 
 ### `crates/crab-config` loads a non-mapping skills value Go refuses
 

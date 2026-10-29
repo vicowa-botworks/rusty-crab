@@ -208,8 +208,11 @@ impl Config {
 ///
 /// The security file *is* read, because leaving it out would load a config whose secrets
 /// are in the wrong place. `channels`/`channel_list` and `model_list` are merged, and
-/// `skills` is applied by [`skills::apply`] -- the legacy lift and both registry passes,
-/// which is what the `tools.skills` half of the loaded value is pinned against.
+/// `skills` runs in the two halves Go runs it in: [`skills::normalise_document`] with the
+/// document alone, then [`skills::apply`] for the file's two merge passes -- the legacy lift
+/// and the registry passes, which is what the `tools.skills` half of the loaded value is
+/// pinned against. The split is not cosmetic: the first half happens during Go's JSON
+/// unmarshal, so it runs when there is no `.security.yml` at all.
 ///
 /// One section Go applies is still dropped: `web`, which reaches `tools.web` through
 /// `Tools`' `yaml:",inline"`. That is a divergence and is recorded in `docs/DIVERGENCES.md`
@@ -306,13 +309,27 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         return Err(Error::UnknownField(issues.join(", ")));
     }
     let mut merged = default_config(home);
+    // The baseline `tools.skills.registries` before the document is merged over it. Go decodes
+    // the file *into* the defaults, so a document whose `registries` is not a mapping leaves
+    // the builtins standing, and after `merge_over` the answer is no longer in the document.
+    let baseline_registries = merged.path(&["tools", "skills", "registries"]).cloned();
     merge_over(&mut merged, &document, &config_schema());
+
+    // `SkillsRegistriesConfig`'s decoder, which Go runs as part of the JSON unmarshal -- that
+    // is, before the security file is opened. It is the document-side half of the skills pass
+    // and it does not ask whether a `.security.yml` exists; the two merge passes below do.
+    skills::normalise_document(&mut merged, baseline_registries.as_ref());
 
     if let Some(security) = &security {
         // Not wrapped. `Error::SecurityType` and `Error::UnparseableSecurity` are the two
         // kinds this stage can raise and both name themselves; folding them into `Error::Io`
         // would report a type error as a read failure.
-        apply_security(&mut merged, security, migrated)?;
+        apply_security(
+            &mut merged,
+            security,
+            migrated,
+            baseline_registries.as_ref(),
+        )?;
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before
@@ -527,6 +544,7 @@ fn apply_security(
     merged: &mut Doc,
     security: &yaml::Security,
     migrated: bool,
+    baseline_registries: Option<&Doc>,
 ) -> Result<(), Error> {
     let schema = schema::config_schema();
 
@@ -642,7 +660,7 @@ fn apply_security(
         }
     }
 
-    skills::apply(merged, security);
+    skills::apply(merged, security, baseline_registries);
 
     Ok(())
 }
@@ -1630,5 +1648,133 @@ mod tests {
             matches!(&err, Error::UnknownField(paths) if paths == "tools.bogus"),
             "named by path, the way the JSON validator names it: {err}"
         );
+    }
+
+    /// Writes `config.json` and **no** `.security.yml` -- the state most installs are in, and
+    /// the one `write_pair` cannot express because it always writes both files.
+    fn write_config_only(config: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, config).expect("write config.json");
+        assert!(
+            !dir.path().join(SECURITY_FILE).exists(),
+            "the point of this helper is that the security file is absent"
+        );
+        (dir, path)
+    }
+
+    /// The loaded value's `tools.skills.registries`, in the same compact JSON the corpus records.
+    fn loaded_registries(path: &std::path::Path) -> serde_json::Value {
+        let cfg = load(path, "/home/oracle").expect("the pair must load");
+        let value = loaded_value(&cfg.document, &config_schema());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&value).expect("the loaded value is JSON");
+        parsed["tools"]["skills"]["registries"].clone()
+    }
+
+    #[test]
+    fn the_document_is_normalised_with_no_security_file_on_disk() {
+        // Go normalises `tools.skills.registries` **during** the JSON unmarshal, before the
+        // security file is opened, so the pass cannot be gated on that file existing. The
+        // three shapes are the ones the decoder changes rather than passes through, and each
+        // is a different mistake: `flattened` is the nested `param` map lifted to its keys,
+        // `renamed` is the `name` key the marshaler writes itself being dropped, `nulled` is a
+        // null credential becoming no key rather than a key holding null.
+        let (_dir, path) = write_config_only(
+            r#"{"version":3,"tools":{"skills":{"registries":{
+                "flattened":{"enabled":true,"param":{"a":1}},
+                "renamed":{"name":"named","enabled":true},
+                "nulled":{"enabled":true,"auth_token":null}}}}}"#,
+        );
+        let registries = loaded_registries(&path);
+        assert_eq!(
+            registries["flattened"],
+            serde_json::json!({"a": 1, "base_url": "", "enabled": true}),
+            "the nested `param` is lifted and the wrapper gone: {registries}"
+        );
+        assert_eq!(
+            registries["renamed"],
+            serde_json::json!({"base_url": "", "enabled": true}),
+            "`name` is one of the keys the marshaler writes itself, so it is not a param: \
+             {registries}"
+        );
+        assert_eq!(
+            registries["nulled"],
+            serde_json::json!({"base_url": "", "enabled": true}),
+            "a null credential is no key at all, not `auth_token: null`: {registries}"
+        );
+    }
+
+    #[test]
+    fn a_null_registries_header_in_the_file_wipes_to_the_builtins_at_zero_values() {
+        // `registries:` with nothing after the colon is a `!!null` node, and yaml short-circuits
+        // it into a nil slice: the document's own registry is gone and what remains is the
+        // baseline's *names* at zero values. Measured against `LoadConfig` at picoclaw
+        // `01635da3`: `{"clawhub":{"base_url":"","enabled":false},"github":{...}}`. The names
+        // come from the baseline, so this is the pass that cannot be answered without it --
+        // neither file says `clawhub` any more.
+        let (_dir, path) = write_pair(
+            r#"{"version":3,"tools":{"skills":{"registries":{"custom":{"enabled":true}}}}}"#,
+            "skills:\n  registries:\n",
+        );
+        assert_eq!(
+            loaded_registries(&path),
+            serde_json::json!({
+                "clawhub": {"base_url": "", "enabled": false},
+                "github": {"base_url": "", "enabled": false},
+            }),
+            "the null header replaces the set rather than adding nothing to it"
+        );
+    }
+
+    #[test]
+    fn an_empty_registries_mapping_in_the_file_is_not_a_wipe() {
+        // The other half of the same node-kind distinction, and the one that broke a fixed
+        // point through Go's own saved pair when the two were read as one shape: the file Go
+        // writes says `registries: {}`, and treating that as a wipe turns Go's own output into
+        // a config Go never produced. An empty mapping decodes to a map that adds nothing, so
+        // the builtins keep their **defaults** and the document's entry survives.
+        let (_dir, path) = write_pair(
+            r#"{"version":3,"tools":{"skills":{"registries":{"custom":{"enabled":true}}}}}"#,
+            "skills:\n  registries: {}\n",
+        );
+        assert_eq!(
+            loaded_registries(&path),
+            serde_json::json!({
+                "clawhub": {"base_url": "https://clawhub.ai", "enabled": true},
+                "custom": {"base_url": "", "enabled": true},
+                "github": {"base_url": "https://github.com", "enabled": true},
+            }),
+            "`registries: {{}}` adds nothing; `registries:` replaces everything"
+        );
+    }
+
+    #[test]
+    fn a_non_mapping_registries_node_leaves_the_builtins_standing() {
+        // A document whose `registries` is not a mapping is ignored rather than applied, so the
+        // baseline survives at its **defaults** -- the same answer as `null` at this depth, and
+        // the opposite of `null` in the file. This is the arm the ledger used to call
+        // unanswerable for want of the builtin names: they are in the embedded `defaults.json`
+        // that `default_config` returns, which is the very baseline `load` merges into.
+        for (shape, document) in [
+            (
+                "an array",
+                r#"{"version":3,"tools":{"skills":{"registries":[{"enabled":true,"name":"github"}]}}}"#,
+            ),
+            (
+                "null",
+                r#"{"version":3,"tools":{"skills":{"registries":null}}}"#,
+            ),
+        ] {
+            let (_dir, path) = write_config_only(document);
+            assert_eq!(
+                loaded_registries(&path),
+                serde_json::json!({
+                    "clawhub": {"base_url": "https://clawhub.ai", "enabled": true},
+                    "github": {"base_url": "https://github.com", "enabled": true},
+                }),
+                "{shape} at `registries` is ignored, not echoed over the builtins"
+            );
+        }
     }
 }

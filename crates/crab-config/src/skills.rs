@@ -215,7 +215,39 @@ fn scalar_text(node: &Doc) -> String {
 }
 
 /// Applies both passes to a document the JSON loader already settled.
-pub fn apply(merged: &mut Doc, security: &Security) {
+///
+/// [`normalise_document`] has already run on that path by the time this is called, so the
+/// document's `registries` is a mapping and the baseline arm below cannot fire here. It is
+/// kept identical rather than split in two because the two entry points differ only in
+/// whether the file passes run, and a reader should not have to prove that twice.
+pub fn apply(merged: &mut Doc, security: &Security, baseline: Option<&Doc>) {
+    rebuild(merged, Some(security), baseline);
+}
+
+/// The document-side half on its own: the pass Go runs **during** the JSON unmarshal, before
+/// the security file is opened at all.
+///
+/// This is the whole difference between "the file says nothing about `skills`" and "there is
+/// no file". The first is a `Security` with an empty document and the second is no `Security`;
+/// both leave the two merge passes with nothing to do, and only the second used to skip this
+/// rebuild as well -- so whether `config.json` came back normalised depended on whether an
+/// unrelated file happened to exist, and the common install has no `.security.yml` at all.
+///
+/// `baseline` is the `tools.skills.registries` node from `default_config` **before** the
+/// document was merged over it, because Go decodes into the defaults and a document whose
+/// `registries` is not a mapping leaves them standing:
+///
+/// | document `registries` | Go's loaded value |
+/// | --- | --- |
+/// | a mapping | that mapping, normalised |
+/// | an array or scalar | the array ignored, `clawhub` + `github` at their **defaults** |
+/// | `null` | the baseline's **names** at **zero** values, the document's own entries gone |
+/// | absent | untouched -- Go's decoder is never called for a key that is not there |
+pub fn normalise_document(merged: &mut Doc, baseline: Option<&Doc>) {
+    rebuild(merged, None, baseline);
+}
+
+fn rebuild(merged: &mut Doc, security: Option<&Security>, baseline: Option<&Doc>) {
     let Some(target) = merged
         .get_mut_at("tools")
         .and_then(|tools| tools.get_mut_at("skills"))
@@ -228,7 +260,7 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     // whether the two merge passes below run; returning here when the file has no `skills`
     // section made whether `config.json` is normalised depend on whether an unrelated file
     // happens to exist -- and the common install has no `.security.yml` at all.
-    let file_skills = match security.document.get("skills") {
+    let file_skills = match security.and_then(|s| s.document.get("skills")) {
         Some(node @ Doc::Object(_)) => Some(node),
         // A non-mapping `skills` value is the divergence recorded under "loads a non-mapping
         // skills value Go refuses": no pass below can read it, and the doc-side rebuild still
@@ -236,21 +268,48 @@ pub fn apply(merged: &mut Doc, security: &Security) {
         _ => None,
     };
 
-    // The registries the document already carries, in the shape Go holds them.
-    let mut registries: Vec<(String, Registry)> = target
-        .get("registries")
-        .and_then(Doc::as_object)
-        .map(|entries| {
-            entries
-                .iter()
-                .map(|(name, node)| {
-                    let mut registry = Registry::default();
-                    registry.read(node);
-                    (name.clone(), registry)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // The registries the document already carries, in the shape Go holds them -- or, when the
+    // node is there but is not a mapping, the baseline's, because Go's decoder leaves the
+    // defaults standing rather than replacing them with what it could not read.
+    //
+    // `null` is its own arm and it is not the same answer: `SkillsRegistriesConfig` assigns a
+    // fresh slice built from the *names it already had*, so the entries come back at zero
+    // values (`{"base_url":"","enabled":false}`) and any registry the document named but the
+    // baseline does not is gone. A non-mapping that is not null -- the JSON array shape, a
+    // scalar -- is ignored outright, so the baseline's own values stand.
+    let document_registries = target.get("registries");
+    let mut registries: Vec<(String, Registry)> = match document_registries {
+        Some(Doc::Object(entries)) => entries
+            .iter()
+            .map(|(name, node)| {
+                let mut registry = Registry::default();
+                registry.read(node);
+                (name.clone(), registry)
+            })
+            .collect(),
+        // `null` and the JSON array shape are the same answer, measured: Go's decoder ignores
+        // a node it cannot read into the map and the builtins stand at their defaults. A
+        // `null` that *wipes* is the security file's, below -- the two are easy to confuse and
+        // only one of them replaces.
+        Some(Doc::Null) | Some(Doc::Array(_)) => baseline
+            .and_then(Doc::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(name, node)| {
+                        let mut registry = Registry::default();
+                        registry.read(node);
+                        (name.clone(), registry)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // A scalar where the mapping belongs is the one shape not measured against Go: its
+        // decoder reports a type error at a stage this crate refuses nothing at, so the
+        // document keeps the shape it was given rather than an answer invented here.
+        Some(_) => Vec::new(),
+        None => Vec::new(),
+    };
 
     // Pass 1 -- `registries`, cloned-by-name then decoded.
     //
@@ -261,6 +320,36 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     // decodes element 1. Reading only the mapping form silently leaves such a registry at
     // its defaults -- a different config rather than a refused one, which is worse than the
     // refusals this pass does raise.
+    // A `registries:` header that is **null** is a wipe, and an empty mapping is not. Measured
+    // against `LoadConfig` with a document carrying `custom`:
+    //
+    // | the file's `registries` | Go's loaded set |
+    // | --- | --- |
+    // | `registries:` (nothing after the colon, so `!!null`) | the baseline's names at **zero** values, `custom` gone |
+    // | `registries: null` | the same |
+    // | `registries: {}` | builtins at their **defaults** and `custom` kept -- no wipe at all |
+    // | no `registries` key | the document's set standing |
+    //
+    // The first two are one yaml node kind and the third is another, which is the whole
+    // difference: yaml short-circuits `!!null` into a nil slice, and an empty mapping decodes to
+    // a map that simply adds nothing. Reading them as one shape is what broke the fixed point
+    // through Go's own saved pair, where the file Go writes says `registries: {}`.
+    //
+    // The names come from the baseline because nothing else has them by then: the document's
+    // own entry is gone and the file names nothing.
+    let file_registries_node = file_skills.and_then(|skills| skills.get("registries"));
+    if matches!(file_registries_node, Some(Doc::Null)) {
+        registries = baseline
+            .and_then(Doc::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(name, _)| (name.clone(), Registry::default()))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
     let file_registries = file_skills.map(|f| registry_nodes(f.get("registries")));
     for (name, node) in file_registries.as_deref().unwrap_or(&[]) {
         let name = name.trim();
@@ -347,6 +436,9 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     }
 
     if registries.is_empty() {
+        // Nothing to write, and nothing to create: a document with no `registries` key at all
+        // never reaches Go's decoder. A `registries:` header that was present but unreadable
+        // is not this case -- the arms above produced the baseline's entries for it.
         return;
     }
     let mut out: Vec<(String, Doc)> = registries
@@ -424,7 +516,7 @@ mod tests {
     fn registries_after(security_yaml: &str, skills: Vec<(&str, Doc)>) -> Doc {
         let security = crate::yaml::parse(security_yaml).expect("the snippet must parse");
         let mut doc = document(skills);
-        apply(&mut doc, &security);
+        apply(&mut doc, &security, None);
         doc.path(&["tools", "skills", "registries"])
             .cloned()
             .unwrap_or(Doc::Null)
