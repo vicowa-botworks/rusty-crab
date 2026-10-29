@@ -256,6 +256,27 @@ pub(crate) fn is_empty_by_go(value: &Doc, schema: &Schema) -> bool {
 /// `is_empty_by_go`, so which definition applied to a given value depended on which
 /// stage touched it first. One rule, one place.
 pub(crate) fn is_dropped_by_omit(schema: &Schema, value: &Doc) -> bool {
+    // A `SecureString` is never written by `encoding/json`, whatever it holds. Its
+    // `omitzero` option calls its `IsZero`, and that returns true for every caller
+    // except the yaml encoder -- on the type's own comment, "to prevent marshal this
+    // field". So the rule cannot come out of the omit option alone: `omitzero` on an
+    // ordinary struct means "zero when every field is", and a `SecureString` holding a
+    // token is not that. It has to come from the type.
+    //
+    // Answering before the option is read also prices `omitempty` on the same type, and
+    // it buys the same silence: `omitempty` asks `isEmpty`, and `isEmpty(SecureString{v})`
+    // is `v == ""` only for the yaml encoder, which is not the caller here. Every field
+    // of this type in the schema today spells the option `omitzero`, so the two spellings
+    // agree only because nothing has tried the other one yet -- a future `omitempty`
+    // SecureString is dropped by this arm, not written.
+    //
+    // The one value that *must* survive is the hand-written `[NOT_HERE]` in
+    // `skills::Registry::to_doc`, and it does because `registries` is an object under a
+    // slice schema, so `apply_omit` never reaches this function for it. That is a
+    // coupling, not a coincidence; both sides say so.
+    if matches!(schema.name(), Some("SecureString") | Some("SecureStrings")) {
+        return true;
+    }
     match schema.omit() {
         None => false,
         Some("omitzero") => is_go_zero(schema, value),

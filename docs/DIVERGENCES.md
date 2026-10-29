@@ -45,18 +45,21 @@ package, a module split that does not match a directory -- are not divergences i
 this file as long as observable behaviour is identical. They belong in
 `ARCHITECTURE.md`, next to the reason.
 
-### `crates/crab-config` drops the `web` and `skills` sections of `.security.yml`
+### `crates/crab-config` drops the `web` section of `.security.yml`
 
 - Go: `loadSecurityConfig` unmarshals the whole file into `Config`, and `Tools` is tagged
-  `yaml:",inline"`, so a top-level `web:` or `skills:` in the security file lands on
-  `tools.web` / `tools.skills` and overrides the JSON config. Both sections are written by
-  `saveSecurityConfig` whenever a search provider has an API key or a skill registry has an
-  auth token, so they are present in most real files.
-- Rust: they are reached and then dropped. `apply_security` does walk the inline branch --
+  `yaml:",inline"`, so a top-level `web:` in the security file lands on `tools.web` and
+  overrides the JSON config. The section is written by `saveSecurityConfig` whenever a search
+  provider has an API key, so it is present in most real files.
+- Rust: it is reached and then dropped. `apply_security` does walk the inline branch --
   it takes `tools`' own yaml list from the dump and hands each child to `merge_filling` --
   but `merge_filling` decides whether a key is a field by asking the **root** `Config`
-  schema, where `web` and `skills` are not fields of anything: they are fields of `Tools`,
-  one level down. The key is skipped and the section is gone.
+  schema, where `web` is not a field of anything: it is a field of `Tools`, one level down.
+  The key is skipped and the section is gone.
+- Scope note: `skills` used to be listed here as well. It is applied now, by
+  `skills::apply` (the legacy lift plus both registry passes); what is still open on that
+  section is its own entry below, and it is about the *builtin registry materialisation*, not
+  about the inline walk.
 - Why it is still open: the fix is the architecture rule this file already states -- thread
   the target's schema through the walk instead of resolving field knowledge once at the
   root -- and `merge_filling` is also the function the channel `settings` merge goes
@@ -116,6 +119,60 @@ this file as long as observable behaviour is identical. They belong in
 - Closes with: the singleton registry and the streaming rules carried in the dump (the same
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
+
+### A scalar at a document's `registries` is refused by Go and loads here
+
+- Go: `tools.skills.registries` is decoded through the `jsontext` map reader, so a scalar is a
+  type error naming its own line and column -- measured at picoclaw `1a4e1edf`, whose
+  `pkg/config` loader differs from the `01635da3` the review ran at only by `schema_dump.go`
+  and a test file:
+  `config.json type error at line 1, column 3: expected map[string]jsontext.Value but got
+  string`, with the offending line quoted and a caret under the path. A sequence is *not* in
+  that family: it is ignored, and the builtin registries stand at their defaults.
+- Rust: `skills::rebuild` treats a sequence as "ignored, baseline stands" (pinned by
+  `a_non_mapping_registries_node_leaves_the_builtins_standing`, which covers both that and a
+  document `null`) and leaves a scalar in the document untouched rather than refusing it,
+  because this crate has no stage that raises Go's `jsontext` type error at all -- the
+  unknown-field validator reports names, not kinds, and the two sentences differ.
+- Why it is left: inventing a refusal here would be inventing its wording too, and the
+  measured Go sentence -- `config.json type error at line 1, column 1: expected
+  map[string]jsontext.Value but got number`, at picoclaw `01635da3` -- belongs to a loader
+  stage this crate has not ported. The blast radius
+  is a config that should not load, loading with a scalar where a registry map belongs; the
+  registries themselves come back as the baseline's, so nothing silently gains a credential.
+- Closes with: the type-error stage, which is the same missing stage as the `SecureString`
+  number refusal in vicowa-botworks/rusty-crab#15.
+- Recorded: 2026-10-28, #8 round 4. The entry this replaces -- "a null or non-mapping
+  `registries` section cannot be answered without the builtin registries" -- was wrong about
+  its own cause: the names and defaults are in the embedded `defaults.json`, which is the
+  baseline `load` merges into, so both arms were four lines each and they are now landed
+  (`normalise_document` for the document side, the null-header wipe for the file's).
+
+
+### `crates/crab-config` loads a non-mapping skills value Go refuses
+
+- Go: `applyLegacySkillsSecurityNode` (`pkg/config/security.go:124`) decodes every value in
+  the security file's `skills` mapping into a `SkillRegistryConfig`, and that decoder
+  decodes into a `map[string]any`. A scalar or sequence there is a decode failure, so
+  `skills: {github: ghp_direct}` is a config the shipped binary will not load.
+- Rust: `skills::apply` answers a non-mapping node by ignoring it, so the file loads. The
+  token really is dropped: an earlier round printed the bare scalar as a token, which made
+  the port *manufacture* a credential (`auth_token: "[NOT_HERE]"`) on a config Go refuses --
+  a worse divergence than the one recorded here, and fixed in #8 round 2.
+- Why: the one corpus case in this area, `security_a_scalar_under_registries_loads_unchanged`,
+  pins the file that *does* load -- `registries` is skipped by name before the decode, which
+  is the only reason it survives. No case pins a non-`registries` key holding a scalar, so
+  refusing now would be writing an error path against bytes nobody recorded, including which
+  diagnostic wins when several keys are wrong.
+- Blast radius: a hand-edited `.security.yml` with a typo that puts a token where a registry
+  mapping belongs loads under the port with the token dropped, and is refused by the shipped
+  binary. Nothing is silently rewritten -- the file is simply accepted that should not be --
+  but it is the class of divergence that turns a rejected config into a running one.
+- Closes with: one corpus case per shape (scalar, sequence) under a legacy skills key, then
+  an error type on this pass. The `registries` skip itself stays unpinnable until then: with
+  the skip removed this port still replays green, because it never reaches the refusal the
+  skip exists to avoid.
+- Recorded: 2026-10-27.
 
 ### The version probe's error has no preview block
 

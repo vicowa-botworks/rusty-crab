@@ -194,11 +194,11 @@ impl Report {
             self.origin,
         );
         for f in self.failures.iter().take(show) {
+            let (expected, got) = (f.expected.to_string(), f.got.to_string());
             msg.push_str(&format!(
-                "  {}\n    go:   {}\n    rust: {}\n    in:   {}\n",
+                "  {}\n{}\n    in:   {}\n",
                 f.case,
-                truncate(&f.expected.to_string(), 400),
-                truncate(&f.got.to_string(), 400),
+                divergence(&expected, &got),
                 truncate(&f.input, 400),
             ));
         }
@@ -215,6 +215,52 @@ impl Report {
         ));
         panic!("{msg}");
     }
+}
+
+/// Where two renderings first disagree, with a window around it.
+///
+/// The loaded value of a config case is several kilobytes, and the first four
+/// hundred characters of it are identical on both sides -- so printing a prefix
+/// of each, which is what this used to do, shows the reader two lines that look
+/// the same and hides the one byte that is not. The offset plus a window either
+/// side is what actually locates it.
+fn divergence(expected: &str, got: &str) -> String {
+    let e: Vec<char> = expected.chars().collect();
+    let g: Vec<char> = got.chars().collect();
+    let at = e
+        .iter()
+        .zip(g.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| std::cmp::min(e.len(), g.len()));
+    let from = at.saturating_sub(90);
+    let window = |v: &[char]| -> String {
+        let end = at.saturating_add(90).min(v.len());
+        let mut s = String::new();
+        if from > 0 {
+            s.push('…');
+        }
+        s.extend(v[from..end].iter());
+        if end < v.len() {
+            s.push('…');
+        }
+        s
+    };
+    let head = if at == std::cmp::min(e.len(), g.len()) && e.len() != g.len() {
+        format!(
+            "    they agree for {} chars, then one ends: go {} chars, rust {}",
+            at,
+            e.len(),
+            g.len()
+        )
+    } else {
+        format!(
+            "    first difference at char {}: go {:?}, rust {:?}",
+            at,
+            e.get(at),
+            g.get(at)
+        )
+    };
+    format!("{head}\n    go:   {}\n    rust: {}", window(&e), window(&g))
 }
 
 fn truncate(s: &str, max: usize) -> String {
