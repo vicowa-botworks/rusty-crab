@@ -44,3 +44,95 @@ Structural deviations -- a function living in a different crate than its Go
 package, a module split that does not match a directory -- are not divergences in
 this file as long as observable behaviour is identical. They belong in
 `ARCHITECTURE.md`, next to the reason.
+
+### `crates/crab-config` drops the `web` and `skills` sections of `.security.yml`
+
+- Go: `loadSecurityConfig` unmarshals the whole file into `Config`, and `Tools` is tagged
+  `yaml:",inline"`, so a top-level `web:` or `skills:` in the security file lands on
+  `tools.web` / `tools.skills` and overrides the JSON config. Both sections are written by
+  `saveSecurityConfig` whenever a search provider has an API key or a skill registry has an
+  auth token, so they are present in most real files.
+- Rust: they are reached and then dropped. `apply_security` does walk the inline branch --
+  it takes `tools`' own yaml list from the dump and hands each child to `merge_filling` --
+  but `merge_filling` decides whether a key is a field by asking the **root** `Config`
+  schema, where `web` and `skills` are not fields of anything: they are fields of `Tools`,
+  one level down. The key is skipped and the section is gone.
+- Why it is still open: the fix is the architecture rule this file already states -- thread
+  the target's schema through the walk instead of resolving field knowledge once at the
+  root -- and `merge_filling` is also the function the channel `settings` merge goes
+  through, whose `settings`/`api_keys` exemptions exist only because of the same root
+  lookup. Threading it correctly changes bytes on cases that are green today, so it is its
+  own change rather than a line in this one.
+- Why not refuse them instead: that was the first behaviour, and it was the wrong direction
+  -- refusing makes the loader reject a file the shipped binary loads, and the failure lands
+  on every install that has ever saved a search key. Ignoring is the smaller divergence and
+  it is visible here rather than in a user's running agent.
+- Blast radius: an install that keeps a web-search key or a registry token in
+  `.security.yml` gets a config where that key is absent, so a search tool that works under
+  Go reports "not configured" under the port. Secrets are not leaked or written anywhere new
+  -- they are read and dropped.
+- Closes with: `merge_filling` taking the schema of the node it is merging into. The dump
+  already carries every field list needed, so no Go-side work is required.
+  `web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema` fails on the
+  day it does, and this entry goes with it.
+- Recorded: 2026-10-26, #5; mechanism corrected 2026-10-28, #11.
+
+### The version probe's error has no preview block
+
+- Go: the version probe (`config.go:1311`, `json.Unmarshal` into
+  `struct { Version int }`) hands its error to `wrapJSONError` (`diagnostics.go:64`), which
+  for an `UnmarshalTypeError` returns the summary line *and*, when the offset lands on a
+  non-blank line, a second block: `   1 | {"version":"3"}` and a caret under the offending
+  column, dimmed and colour-bolded when `diagnosticsUseColor()` says the stream is a
+  terminal.
+- Rust: `version_type_diagnostic` returns the summary line only. The line, the column, the
+  field name, the expected type and the value word (`string`, `bool`, `number 3.5`) all
+  match; the preview is absent.
+- Why: the preview is a rendering decision, not a decoding one -- it depends on whether
+  stderr is a TTY, and on `trimDiagnosticLine`'s windowing around the caret. The corpus
+  records no error text at all (a failing case adds `error_op_index` and nothing else), so
+  there is nothing to pin it against and everything to get wrong.
+- Blast radius: anyone printing the error sees one line instead of two-then-two, and anyone
+  pattern-matching the *first* line is unaffected. `DiagnosticSummary` in Go strips the
+  preview for logs, so the summary the port does reproduce is the half Go treats as the
+  message.
+- Closes with: a preview renderer in `crab-config` plus a TTY probe, if anything ever needs
+  the two-line form. Nothing in the port prints config errors today.
+- Recorded: 2026-10-28, #11.
+
+### A migrated document's security file is merged as data, and only its `model_list` half is ported
+
+- Go: `LoadConfig` calls `loadSecurityConfig` only for a document already at
+  `CurrentVersion`. A legacy document goes through `loadConfigMap` (migration.go:404),
+  which unmarshals `.security.yml` as a plain `map[string]any`, rewrites it
+  (`mergeModelListsWithMap` consumes `model_list` by name; `web`/`skills` are lifted into
+  `tools`, replacing any `tools` the file itself carried), merges it into config.json with
+  the generic `mergeMap`, and hands the re-marshalled result to the ordinary decoder.
+- Rust: the version decides the two edges that are observable today -- a key the decoder
+  cannot place is ignored at v3 and refused at v2, and a `model_list` that is not a mapping
+  is a type error at v3 and deleted at v2 -- and the `model_list` merge itself runs on both
+  paths. What is not ported is the generic `mergeMap` over the rest of a legacy document:
+  there, a security `channel_list` entry replaces what is in the config rather than filling
+  into it, and a scalar the two files both name goes to the security file.
+- Why: the merge happens in a stage this crate reaches only for documents below
+  `CurrentVersion`, and it is a different function from the typed one -- `mergeMap` on
+  untyped data, before `migrateV1ToV2`, with its own ordering. Porting the typed merge and
+  calling it done is what produced the two wrong edges above, both of which read the file as
+  though one loader owned it.
+- Blast radius: an install whose `config.json` is still on version 1 or 2 and which has a
+  `.security.yml` with a `channel_list` entry. The port loads the secrets it needs and
+  differs from Go on the non-secret keys the same entry carries. A current-version install
+  -- every install that has saved once -- is unaffected.
+- Why no recorded case can show it: every corpus case that has a `.security.yml` is a v3
+  document, because the file is written by a v3 save; and the three `migrate_*` cases have
+  no security file at all. `migrate_backs_up_both_files` is the single case with a legacy
+  document *and* a security file, and it is deferred on the `save` half. Its load prefix is
+  replayed -- `migrate_backs_up_both_files` is in `KNOWN_LOAD_GAPS`, where the stage named
+  for it is `channel_settings` -- but that replay only licenses a difference in the channel
+  settings, so it witnesses the loader's *other* gaps and says nothing about this one. It is
+  the closest the fixture currently comes, and it is not evidence about the data merge. (An
+  earlier version of this entry called the label `security_data_merge`; no such label exists
+  in the harness, and a reader who greps for it finds only this file.) Closing this needs a Go-side case: a v2
+  `config.json` plus a `.security.yml` whose `channel_list` entry names keys the config also
+  sets.
+- Recorded: 2026-10-28, #11.
