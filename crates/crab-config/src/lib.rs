@@ -373,12 +373,89 @@ fn migration_view(security: &yaml::Security) -> Doc {
         for name in ["web", "skills"] {
             if present(name) {
                 if let Some(value) = security.document.get(name) {
-                    lifted.push((name.to_string(), value.clone()));
+                    let value = if name == "skills" {
+                        rewrite_skills(value.clone())
+                    } else {
+                        value.clone()
+                    };
+                    lifted.push((name.to_string(), value));
                 }
             }
         }
         entries.push(("tools".to_string(), Doc::Object(lifted)));
     }
+    Doc::Object(entries)
+}
+
+/// The two registry spellings `migration.go:437-454` performs on the lifted `skills` node.
+///
+/// Both exist because the registry *map* is newer than the file format being migrated: an old
+/// security file spells a registry at the top of `skills`, and the migration rewrites it into
+/// `skills.registries` before anything looks at the result. Skipping the rewrite stopped being
+/// cosmetic the moment this view became a validator input: `skills` is a **struct** node, so a
+/// key that is not one of its fields is refused with config.json's own sentence --
+/// `config.json contains unknown field(s): tools.skills.clawhub` -- on exactly the installs the
+/// migration exists to serve. Go never refuses them, at either version.
+///
+/// The two halves are not symmetric, and the asymmetry is the behaviour:
+///
+/// * `clawhub` **replaces** `registries` wholesale (`m["registries"] = map[string]any{"clawhub":
+///   m["clawhub"]}`), so a `registries` the file already carried is discarded when `clawhub` is
+///   present. A `clawhub` that is present but null is left where it is -- the `delete` is inside
+///   the `!= nil` guard.
+/// * `github` is **copied, not moved**: `skills.github` stays and `registries.github` is a copy
+///   with `auth_token` set from `token` when `token` is there (and `token` itself stays in the
+///   copy). That is the second half of why a legacy `skills.github.token` reaches the registry
+///   twice on the save side.
+/// * a `registries` that is not a mapping is replaced rather than merged into, because Go's type
+///   assertion yields nil and the code then builds a fresh map.
+///
+/// What the rewrite does *not* do is make the node permissive: `skills` stays a struct node, so
+/// a key that is neither a field nor one of these two spellings is still refused.
+fn rewrite_skills(skills: Doc) -> Doc {
+    let Doc::Object(mut entries) = skills else {
+        return skills;
+    };
+
+    if let Some(pos) = entries.iter().position(|(k, _)| k == "clawhub") {
+        if !matches!(entries[pos].1, Doc::Null) {
+            let value = entries.remove(pos).1;
+            entries.retain(|(k, _)| k != "registries");
+            entries.push((
+                "registries".to_string(),
+                Doc::Object(vec![("clawhub".to_string(), value)]),
+            ));
+        }
+    }
+
+    let github = entries
+        .iter()
+        .find(|(k, _)| k == "github")
+        .map(|(_, value)| value.clone());
+    if let Some(Doc::Object(mut github_registry)) = github {
+        let token = github_registry
+            .iter()
+            .find(|(k, _)| k == "token")
+            .map(|(_, value)| value.clone());
+        if let Some(token) = token {
+            match github_registry.iter_mut().find(|(k, _)| k == "auth_token") {
+                Some(slot) => slot.1 = token,
+                None => github_registry.push(("auth_token".to_string(), token)),
+            }
+        }
+        let mut registries: Vec<(String, Doc)> = entries
+            .iter()
+            .find(|(k, _)| k == "registries")
+            .and_then(|(_, value)| value.as_object().cloned())
+            .unwrap_or_default();
+        match registries.iter_mut().find(|(k, _)| k == "github") {
+            Some(slot) => slot.1 = Doc::Object(github_registry),
+            None => registries.push(("github".to_string(), Doc::Object(github_registry))),
+        }
+        entries.retain(|(k, _)| k != "registries");
+        entries.push(("registries".to_string(), Doc::Object(registries)));
+    }
+
     Doc::Object(entries)
 }
 
@@ -479,6 +556,17 @@ fn version_type_diagnostic(text: &str, value: &Doc) -> String {
         .err()
         .map(|e| (e.line(), e.column()))
         .unwrap_or((1, 1));
+    // A container needs one added. Go's decoder refuses a `version` the moment it reads the
+    // value's **opening** byte -- it never descends into the array -- so its column is that
+    // byte, and it does not move with the value's length: `{"version":[]}` and
+    // `{"version":[[1],{"a":"}"}]}` both read 12. serde reports the byte *before* it, the
+    // colon, so the two disagree by exactly one for `[...]` and `{...}` and agree for every
+    // scalar, where both land on the literal's last byte. Measured against `LoadConfig` at
+    // picoclaw `1a4e1edf` for all four container shapes.
+    let column = match value {
+        Doc::Array(_) | Doc::Object(_) => column + 1,
+        _ => column,
+    };
     // Go's `UnmarshalTypeError.Value`: the type name for a string or bool, and the literal
     // text for a number, so `3.5` reads back as `number 3.5` and `1e10` as `number 1e10`.
     let got = match value {
@@ -518,7 +606,8 @@ fn number_literal(text: &str, line: usize, column: usize) -> String {
 /// does: `LoadConfig`'s migration arms merge the two files as **plain data** in
 /// `loadConfigMap`, migrate the result, and hand the re-marshalled bytes to the ordinary
 /// decoder -- so for a migrated document only the `model_list` merge below runs (Go's
-/// `mergeModelListsWithMap`, which is the same matching by the same rule) and the rest of
+/// `mergeModelListsWithMap`, whose matching is *not* the same rule -- see the branch in
+/// [`apply_security`]) and the rest of
 /// this function's work would be inventing a merge that happens somewhere else, differently
 /// and earlier. What the data merge does instead is recorded in `docs/DIVERGENCES.md`.
 ///
@@ -566,13 +655,22 @@ fn apply_security(
         if let Some(list) = merged.get_mut_at("model_list").and_then(Doc::as_array_mut) {
             // The file keys entries `name:index`; the document holds a sequence.
             //
-            // `SecureModelList.UnmarshalYAML` (config_struct.go:326) walks the models the
-            // JSON loader produced and asks the security map for each one's `name:index`
-            // key, falling back to the bare name for a file written before the index was
-            // added. Three things follow, all measured against `LoadConfig` rather than read
-            // off the type:
+            // **Two loaders, two shapes.** The current version runs
+            // `SecureModelList.UnmarshalYAML` (config_struct.go:326), which walks the models
+            // the JSON loader produced and asks the security map for each one's `name:index`
+            // key, falling back to the bare name per position. A migrated document runs
+            // `mergeModelListsWithMap` (migration.go:497) instead, which builds a key set --
+            // `name:index` for every position, and the bare name **only for the first
+            // position carrying it** -- and iterates the security map. The two agree on every
+            // shape except one, and it is measurable rather than theoretical: two models both
+            // named `m1` with the file keyed `m1:` give v3 `["[NOT_HERE]", "[NOT_HERE]"]` and
+            // a migrated config `["[NOT_HERE]", "<nil>"]` -- the bare name resolves to the
+            // first position only. Measured at picoclaw `1a4e1edf`, one process per scenario,
+            // with `model` present on every entry so the required-field stage is not what is
+            // answering. So the loop below is chosen by `migrated`, and the three rules that
+            // both loaders share are stated once, after the branch.
             //
-            // * **An entry naming no model is ignored, not appended.** The loop runs over the
+            // * **An entry naming no model is ignored, not appended.** Both loaders agree. The loop runs over the
             //   models, not over the map, so a leftover `m9:0` against a config that lists
             //   only `m1` contributes nothing. Appending it instead invents a model with an
             //   empty name: the next `save` writes it into `config.json`, names it `:0` in
@@ -586,6 +684,51 @@ fn apply_security(
             // * **The assignment is unconditional when the entry matches**, so a matching
             //   entry with no `api_keys` clears the model's keys rather than leaving them
             //   alone.
+            if migrated {
+                let mut positions: Vec<(String, usize)> = Vec::new();
+                let mut counts: Vec<(String, usize)> = Vec::new();
+                for (position, item) in list.iter().enumerate() {
+                    let name = item
+                        .get("model_name")
+                        .and_then(Doc::as_str)
+                        .unwrap_or_default();
+                    let index = match counts.iter_mut().find(|(n, _)| n == name) {
+                        Some(slot) => {
+                            slot.1 += 1;
+                            slot.1 - 1
+                        }
+                        None => {
+                            counts.push((name.to_string(), 1));
+                            0
+                        }
+                    };
+                    positions.push((format!("{name}:{index}"), position));
+                    if !positions.iter().any(|(key, _)| key == name) {
+                        positions.push((name.to_string(), position));
+                    }
+                }
+                for (spelled, entry) in entries {
+                    let Some(position) = positions
+                        .iter()
+                        .find(|(key, _)| key == spelled)
+                        .map(|(_, position)| *position)
+                    else {
+                        // Go logs `model_name not found in main config: <key>` and moves on.
+                        continue;
+                    };
+                    // Only a mapping entry assigns anything: `if vv, ok := v.(map[string]any)`.
+                    let Doc::Object(fields) = entry else { continue };
+                    match fields.iter().find(|(key, _)| key == "api_keys") {
+                        Some((_, value)) => list[position].set("api_keys", value.clone()),
+                        // `mVal["api_keys"] = vv["api_keys"]` assigns nil for a missing key.
+                        None => {
+                            list[position].remove("api_keys");
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
             let keys = yaml::to_name_index(list);
             for (position, key) in keys.iter().enumerate() {
                 let name = list[position]
@@ -1239,9 +1382,12 @@ mod tests {
         // config Go refuses came out looking migrated.
         //
         // The sentence is Go's, measured from `LoadConfig` rather than composed: the probe
-        // decodes into a typed struct and `wrapJSONError` restates the type error with the
-        // position of the value's last byte. The three shapes below are the three ways a
-        // version can be wrong, and the column moves with the literal's length.
+        // decodes into a typed struct and `wrapJSONError` restates the type error with a
+        // position that depends on the value's kind: for a **scalar** the last byte of the
+        // literal, so the column moves with its length; for a **container** the opening byte,
+        // because the decoder refuses on seeing `[` or `{` and never descends -- which is why
+        // the two array shapes below differ elevenfold in length and read the same column 12.
+        // Every shape here is measured from `LoadConfig`, not composed.
         for (document, want) in [
             (
                 r#"{"version":"3"}"#,
@@ -1257,6 +1403,26 @@ mod tests {
                 r#"{"version":3.5}"#,
                 "config.json type error at line 1, column 14 for field \"version\": \
                  expected int but got number 3.5",
+            ),
+            (
+                r#"{"version":[1]}"#,
+                "config.json type error at line 1, column 12 for field \"version\": \
+                 expected int but got array",
+            ),
+            (
+                r#"{"version":{}}"#,
+                "config.json type error at line 1, column 12 for field \"version\": \
+                 expected int but got object",
+            ),
+            (
+                r#"{"version":[]}"#,
+                "config.json type error at line 1, column 12 for field \"version\": \
+                 expected int but got array",
+            ),
+            (
+                r#"{"version":[[1],{"a":"}"}]}"#,
+                "config.json type error at line 1, column 12 for field \"version\": \
+                 expected int but got array",
             ),
         ] {
             let (_dir, path) = write_temp(document);
@@ -1503,6 +1669,37 @@ mod tests {
         );
     }
 
+    /// The same rule on the legacy path, which is the half the v3 test above leaves unwitnessed.
+    /// A legacy document is merged with the security file **as data** before the strict pass
+    /// (`config.go:1474` `mergeMap`), and it is tempting to conclude that a data merge copies
+    /// every key the config entry lacks. It does not: measured against `LoadConfig` at v2 with
+    /// `provider: other`, `model: othermodel`, `rpm: 77` and `api_keys` in the same entry, the
+    /// loaded model keeps `provider`, `model` and `rpm` from the document and gains only the
+    /// keys -- byte-identical to v3. The merge is generic, but the security file's own typed
+    /// decode has already narrowed the entry to `api_keys` by the time it is data.
+    #[test]
+    fn a_legacy_document_narrows_the_security_entry_to_its_keys_too() {
+        // What narrows the entry here is **not** a typed decode: `loadConfigMap` reads the
+        // security file into a `map[string]any`, so nothing has consulted `ModelConfig` by the
+        // time the entry is data. The narrowing is the single assignment
+        // `mVal["api_keys"] = vv["api_keys"]` at migration.go:524, inside the loop that walks
+        // the security map -- the migrated path takes `api_keys` and nothing else because that
+        // is the only field it names. (An earlier round of this PR's write-up credited the
+        // file's "own typed decode", which is the v3 mechanism; the commit message of
+        // 31043aec carries the same slip and is left as history rather than rewritten.)
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let (_dir, path) = write_pair(
+            legacy,
+            "model_list:\n    m1:0:\n      provider: anthropic\n      api_keys: [sk-1]\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        assert_eq!(
+            model_field(&cfg.document, 0, "provider"),
+            Some(&Doc::String("openai".to_string())),
+            "the data merge does not widen what a secrets file may set"
+        );
+    }
+
     #[test]
     fn an_entry_naming_no_model_is_ignored_rather_than_appended() {
         // The phantom this port used to invent: an entry keyed for a model the document does
@@ -1640,6 +1837,32 @@ mod tests {
         );
         load(&path, "/home/oracle").expect("the lifted sections are legal");
 
+        // The pre-`registries` spelling, which the lift alone does not make legal. Go rewrites
+        // `skills.clawhub` into `skills.registries.clawhub` before anything validates the view,
+        // and `registries` is a **slice** node -- so the object under it is never field-checked,
+        // while the same object under the `skills` struct node is. Without the rewrite this
+        // config is refused as `tools.skills.clawhub`, a refusal Go does not make at either
+        // version, on the install the migration exists to serve.
+        let (_dir, path) = write_pair(legacy, "skills:\n  clawhub:\n    token: ch\n");
+        load(&path, "/home/oracle").expect("the clawhub spelling is rewritten, not refused");
+
+        // Go's own written `.security.yml` is the same shape, and it is the case that matters
+        // operationally: a file this crate would have to read back after saving it.
+        let (_dir, path) = write_pair(
+            legacy,
+            "skills:\n  registries:\n    clawhub:\n      auth_token: ch\n",
+        );
+        load(&path, "/home/oracle").expect("the current spelling loads, as it always did");
+
+        // And the rewrite is not a licence: `skills` is still a struct node, so a key that is
+        // neither one of its fields nor one of the two spellings is still named.
+        let (_dir, path) = write_pair(legacy, "skills:\n  bogus:\n    token: x\n");
+        let err = load(&path, "/home/oracle").expect_err("skills.bogus has no field to hold it");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "tools.skills.bogus"),
+            "the rewrite rewrites, it does not relax: {err}"
+        );
+
         // Without the lift the same `tools` content is refused, which is what makes the
         // above a fact about the lift rather than about `bogus` being accepted.
         let (_dir, path) = write_pair(legacy, "tools:\n  bogus: 1\n");
@@ -1728,6 +1951,120 @@ mod tests {
     }
 
     #[test]
+    fn the_legacy_view_rewrites_both_registry_spellings_and_keeps_their_asymmetry() {
+        // The rewrite is only observable through the view, because the view is what the
+        // strict validator sees; the data merge that carries these values into a migrated
+        // document is a separate, recorded divergence. So this test asks the view directly.
+        let view = |security: &str| {
+            migration_view(&yaml::parse(security).expect("the security file parses"))
+        };
+        let registry = |view: &Doc, name: &str| {
+            view.get("tools")
+                .and_then(|tools| tools.get("skills"))
+                .and_then(|skills| skills.get("registries"))
+                .and_then(|registries| registries.get(name))
+                .cloned()
+        };
+
+        // `clawhub` MOVES: `m["registries"] = map[string]any{"clawhub": m["clawhub"]}` and
+        // `delete(m, "clawhub")`. Asserting the value arrived is what makes this a fact about
+        // the rewrite -- a pass that merely deleted the key would load too.
+        let moved = view("skills:\n  clawhub:\n    token: ch\n");
+        let moved_entry = registry(&moved, "clawhub");
+        assert_eq!(
+            moved_entry
+                .as_ref()
+                .and_then(|entry| entry.get("token"))
+                .and_then(Doc::as_str),
+            Some("ch"),
+            "the entry is rewritten into `registries`, not dropped: {moved:?}"
+        );
+        assert!(
+            moved
+                .get("tools")
+                .and_then(|tools| tools.get("skills"))
+                .and_then(|skills| skills.get("clawhub"))
+                .is_none(),
+            "`skills.clawhub` is deleted, so nothing is left to refuse"
+        );
+
+        // The replacement is wholesale: with both spellings in one file, Go's assignment
+        // discards the `registries` the file already carried (measured: `other` is gone from
+        // the loaded value, `clawhub` is present).
+        let replaced = view(
+            "skills:\n  clawhub:\n    token: ch\n  registries:\n    other:\n      base_url: u\n",
+        );
+        assert!(
+            registry(&replaced, "other").is_none(),
+            "`clawhub` replaces `registries`, it does not join it: {replaced:?}"
+        );
+        assert!(
+            registry(&replaced, "clawhub").is_some(),
+            "and the replacement holds the moved entry: {replaced:?}"
+        );
+
+        // `github` is COPIED, not moved, and the copy carries `auth_token` set from `token`
+        // while `token` itself stays -- which is the second half of why a legacy
+        // `skills.github.token` reaches the registry twice on the save side (masked
+        // `auth_token` plus plaintext `token`, both measured in Go's loaded value).
+        let copied = view("skills:\n  github:\n    token: gh\n");
+        let github = registry(&copied, "github").expect("`registries.github` is created");
+        assert_eq!(
+            github.get("auth_token").and_then(Doc::as_str),
+            Some("gh"),
+            "the copy carries `auth_token` from `token`: {github:?}"
+        );
+        assert_eq!(
+            github.get("token").and_then(Doc::as_str),
+            Some("gh"),
+            "and keeps `token`, which is why the value arrives twice: {github:?}"
+        );
+        assert!(
+            copied
+                .get("tools")
+                .and_then(|tools| tools.get("skills"))
+                .and_then(|skills| skills.get("github"))
+                .is_some(),
+            "`skills.github` itself is left in place -- a copy, not a move"
+        );
+
+        // No `token`, no `auth_token`: the assignment is inside `if token, ok := …`.
+        let untouched = view("skills:\n  github:\n    base_url: u\n");
+        let github = registry(&untouched, "github").expect("the copy is made regardless");
+        assert!(
+            github.get("auth_token").is_none(),
+            "a `github` entry with no `token` gains no credential: {github:?}"
+        );
+        assert_eq!(
+            github.get("base_url").and_then(Doc::as_str),
+            Some("u"),
+            "and the copy carries the entry's own keys: {github:?}"
+        );
+
+        // Both spellings in the order Go applies them: `clawhub` replaces first, then
+        // `github` is added to the map that replacement built.
+        let both = view("skills:\n  clawhub:\n    token: ch\n  github:\n    token: gh\n");
+        assert!(
+            registry(&both, "clawhub").is_some() && registry(&both, "github").is_some(),
+            "the second rewrite joins the map the first one built: {both:?}"
+        );
+
+        // The one shape the rewrite does NOT rescue, measured at picoclaw `1a4e1edf`: a
+        // `clawhub:` with no value is nil, so the `!= nil` guard skips it and the `delete`
+        // inside the guard never runs -- the key stays, and Go refuses the file with
+        // exactly this sentence. A rewrite that deleted unconditionally would load.
+        let (_dir, path) = write_pair(
+            r#"{"version":2,"model_list":[{"model_name":"m1","model":"x","provider":"openai"}]}"#,
+            "skills:\n  clawhub:\n",
+        );
+        let err = load(&path, "/home/oracle").expect_err("a null clawhub is left where it is");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "tools.skills.clawhub"),
+            "Go refuses it as an unknown field, and so do we: {err}"
+        );
+    }
+
+    #[test]
     fn an_empty_registries_mapping_in_the_file_is_not_a_wipe() {
         // The other half of the same node-kind distinction, and the one that broke a fixed
         // point through Go's own saved pair when the two were read as one shape: the file Go
@@ -1774,6 +2111,65 @@ mod tests {
                     "github": {"base_url": "https://github.com", "enabled": true},
                 }),
                 "{shape} at `registries` is ignored, not echoed over the builtins"
+            );
+        }
+    }
+
+    #[test]
+    fn a_duplicate_model_name_takes_the_security_entry_at_the_first_position_only_when_migrated() {
+        // The one place the two loaders' matching shapes disagree, measured at picoclaw
+        // `1a4e1edf` with `model` on every entry so the required-field stage is not what
+        // answers: two models both named `m1`, the file keyed by the bare name.
+        //
+        // | version | Go's `api_keys` per position |
+        // | --- | --- |
+        // | 3 | set, set |
+        // | 2 | set, **absent** |
+        //
+        // v3 asks per position and each position falls back to the bare name; the migrated path
+        // builds `indexedKeys`, where the bare name is inserted only for the first position
+        // that carries it (`if _, ok := indexedKeys[nameStr]; !ok`), and iterates the file.
+        // Keying the second position explicitly agrees on both versions, which is the control
+        // that keeps this a fact about the bare-name fallback rather than about duplicates.
+        let duplicate = r#"{"version":%VERSION%,"model_list":[
+            {"model_name":"m1","model":"x1","provider":"a"},
+            {"model_name":"m1","model":"x2","provider":"b"}]}"#;
+        let keys_at = |document: &Doc, position: usize| -> bool {
+            document
+                .get("model_list")
+                .and_then(Doc::as_array)
+                .and_then(|list| list.get(position))
+                .is_some_and(|entry| entry.get("api_keys").is_some())
+        };
+
+        for version in ["2", "3"] {
+            let (_dir, path) = write_pair(
+                &duplicate.replace("%VERSION%", version),
+                "model_list:\n  m1:\n    api_keys: [sk-1]\n",
+            );
+            let cfg = load(&path, "/home/oracle").expect("the pair loads");
+            assert!(
+                keys_at(&cfg.document, 0),
+                "v{version}: the first `m1` always takes the entry"
+            );
+            assert_eq!(
+                keys_at(&cfg.document, 1),
+                version == "3",
+                "v{version}: only the current version's per-position fallback reaches the                  second `m1`"
+            );
+        }
+
+        // The explicit spelling resolves to the same position on both versions, so the
+        // disagreement above is the bare-name fallback and not duplicate handling in general.
+        for version in ["2", "3"] {
+            let (_dir, path) = write_pair(
+                &duplicate.replace("%VERSION%", version),
+                "model_list:\n  m1:1:\n    api_keys: [sk-1]\n",
+            );
+            let cfg = load(&path, "/home/oracle").expect("the pair loads");
+            assert!(
+                !keys_at(&cfg.document, 0) && keys_at(&cfg.document, 1),
+                "v{version}: `m1:1` is the second position at both versions"
             );
         }
     }
