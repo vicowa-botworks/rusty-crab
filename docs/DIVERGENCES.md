@@ -126,9 +126,13 @@ this file as long as observable behaviour is identical. They belong in
 - Why no recorded case can show it: every corpus case that has a `.security.yml` is a v3
   document, because the file is written by a v3 save; and the three `migrate_*` cases have
   no security file at all. `migrate_backs_up_both_files` is the single case with a legacy
-  document *and* a security file, and it is deferred on the `save` half -- its load prefix
-  is replayed and labelled `security_data_merge` in `tests/conformance.rs`, which is the
-  closest the fixture currently comes. Closing this needs a Go-side case: a v2
+  document *and* a security file, and it is deferred on the `save` half. Its load prefix is
+  replayed -- `migrate_backs_up_both_files` is in `KNOWN_LOAD_GAPS`, where the stage named
+  for it is `channel_settings` -- but that replay only licenses a difference in the channel
+  settings, so it witnesses the loader's *other* gaps and says nothing about this one. It is
+  the closest the fixture currently comes, and it is not evidence about the data merge. (An
+  earlier version of this entry called the label `security_data_merge`; no such label exists
+  in the harness, and a reader who greps for it finds only this file.) Closing this needs a Go-side case: a v2
   `config.json` plus a `.security.yml` whose `channel_list` entry names keys the config also
   sets.
 - Recorded: 2026-10-28, #11.

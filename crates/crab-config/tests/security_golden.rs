@@ -15,7 +15,14 @@
 //! because the emptiness test saw a two-entry slice.
 //!
 //! The loader half is the mirror image: the secrets that file carries are *invisible* in
-//! the value a config loads to, because `SecureString`/`SecureStrings` marshal to nothing.
+//! the value a config loads to. Not because they marshal to nothing -- `SecureString`'s
+//! `MarshalJSON` returns the literal `"[NOT_HERE]"`, which is non-empty -- but because
+//! every one of those fields carries `omitzero` over a type whose `IsZero` reports true
+//! whenever the caller is not yaml.v3, so encoding/json drops the key before the mask is
+//! ever written. Two things the old wording blurred: the drop belongs to the **rendering**
+//! rather than to the value, so a migrated document -- whose security entry arrives as data
+//! into `Param`, where no omit rule applies -- records the secret in plain text; and
+//! yaml.v3 passes the caller check, so this very file is what a json rendering cannot show.
 //! A case that compares loaded values therefore cannot tell a security merge that worked
 //! from one that never ran -- which is why the corpus's security cases grade a `save`, and
 //! why `go_records_no_secrets_in_the_loaded_value` pins the rule from the recorded
