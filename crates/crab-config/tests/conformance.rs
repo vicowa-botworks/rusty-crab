@@ -158,17 +158,17 @@ fn run_ops(case: &str, ops: &[Op], stop_at_save: bool) -> Value {
 /// matching Go fails the test with its name in the message, so the list cannot quietly
 /// outlive the gap, and a new divergence fails it too.
 ///
-/// All four have the same cause, so one stage closes all four: `InitChannelList`
-/// (`config_channel.go:728`) decodes each channel's `settings` into the typed struct for
-/// that channel's `type` and the loaded value then marshals the struct, not the stored
-/// JSON. So Go emits every field of `TelegramSettings` -- `{"base_url":"","proxy":"",
-/// "use_markdown_v2":false,"media_group_delay_ms":500}` -- where this crate echoes the
-/// two keys the default table happens to carry, and writes no `settings` key at all for a
-/// channel like `dingtalk` whose entry is empty. The per-type field lists are in the
-/// schema dump as `settings_schemas` (22 types), which is why the gap is portable and not
-/// merely unknown.
+/// The three that remain are not loader work. `InitChannelList` is ported (see
+/// [`crab_config`]'s `channels` module) and closed `load_current_version_minimal` on its
+/// own, which is the proof that the typed-settings decode was the only gap on the
+/// load-only side. What these three need is what `LoadConfig` *writes* when it migrates:
+/// `SaveConfig` defers to the last `case 0..=2` arm, so a migration leaves three files
+/// behind -- the migrated `config.json`, a `.security.yml` carrying each channel type's
+/// `settings: {}`, and `config.json.<date>.bak` with the original bytes -- and this crate
+/// does not implement `save` yet. `saveSecurityConfig` is reached from `SaveConfig`
+/// (`config.go:1691`), so the same work also unblocks the ten cases the harness defers
+/// outright for using `save`.
 const KNOWN_UNPORTED: &[&str] = &[
-    "load_current_version_minimal",
     "migrate_v0_api_key_becomes_api_keys",
     "migrate_v1_channels_renamed",
     "migrate_v2_channels_to_channel_list",
@@ -302,7 +302,7 @@ fn loading_matches_what_go_returned() {
         fixture.cases.len() - deferred.len(),
     );
     eprintln!(
-        "known gaps (InitChannelList): {}
+        "known gaps (migration persistence): {}
 deferred until `save` is ported ({}): {}",
         gaps.join(", "),
         deferred.len(),
@@ -340,28 +340,21 @@ fn document(value: &str) -> Value {
 /// that every named stage is *load-bearing*. A stage that stops mattering fails the run,
 /// exactly like a case that leaves `KNOWN_UNPORTED` stale.
 const KNOWN_LOAD_GAPS: &[(&str, &[&str])] = &[
-    ("save_writes_the_document", &["channel_settings"]),
-    ("save_bumps_an_old_version", &["channel_settings"]),
-    ("session_omitted_when_empty", &["channel_settings"]),
-    ("migrate_backs_up_both_files", &["channel_settings"]),
-    (
-        "unparseable_security_file_is_refused",
-        &["channel_settings"],
-    ),
-    (
-        "security_entry_replaces_the_json_model",
-        &["channel_settings"],
-    ),
-    ("security_seq_form_is_refused", &["channel_settings"]),
-    ("save_writes_both_halves", &["channel_settings"]),
-    (
-        "virtual_key_models_are_written_back_once",
-        &["channel_settings", "model_list"],
-    ),
-    (
-        "save_then_load_then_save_is_stable",
-        &["channel_settings", "model_list"],
-    ),
+    // Every `channel_settings` label here went empty when the base's `apply_omit` work merged
+    // in: eight of these ten save cases now match Go byte for byte on the load side too, and
+    // the two that still differ do so on `model_list`, not on channel settings. The harness
+    // fails on a label that no longer explains anything exactly as loudly as it fails on a
+    // difference nobody accounted for, so an empty list is a claim, not a placeholder.
+    ("save_writes_the_document", &[]),
+    ("save_bumps_an_old_version", &[]),
+    ("session_omitted_when_empty", &[]),
+    ("migrate_backs_up_both_files", &[]),
+    ("unparseable_security_file_is_refused", &[]),
+    ("security_entry_replaces_the_json_model", &[]),
+    ("security_seq_form_is_refused", &[]),
+    ("save_writes_both_halves", &[]),
+    ("virtual_key_models_are_written_back_once", &["model_list"]),
+    ("save_then_load_then_save_is_stable", &["model_list"]),
 ];
 
 /// Removes what one unported stage is responsible for.

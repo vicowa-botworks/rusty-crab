@@ -45,6 +45,7 @@
 //! entries and the rest of `DefaultConfig()`. It is transcribed from the Go source, and
 //! the fixture is what notices when the source moves.
 
+mod channels;
 mod defaults;
 mod doc;
 mod marshal;
@@ -131,6 +132,9 @@ pub enum Error {
     /// that an unported position emits something plausible, and a plausible wrong file
     /// is the failure mode this whole seam is arranged to prevent.
     NotPorted(String),
+    /// A channel the registry does not know, or settings its typed struct cannot hold.
+    /// `InitChannelList`'s two refusals, with Go's sentence.
+    Channel(String),
     Io(String),
 }
 
@@ -147,6 +151,7 @@ impl std::fmt::Display for Error {
             }
             Self::VersionType(m) => write!(f, "{m}"),
             Self::NotPorted(m) => write!(f, "not ported: {m}"),
+            Self::Channel(m) => write!(f, "{m}"),
             Self::Io(m) => write!(f, "{m}"),
         }
     }
@@ -298,7 +303,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         return Err(Error::UnknownField(issues.join(", ")));
     }
     let mut merged = default_config(home);
-    merge_over(&mut merged, &document);
+    merge_over(&mut merged, &document, &config_schema());
 
     if let Some(security) = &security {
         // Not wrapped. `Error::SecurityType` and `Error::UnparseableSecurity` are the two
@@ -306,6 +311,12 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // would report a type error as a read failure.
         apply_security(&mut merged, security, migrated)?;
     }
+
+    // `InitChannelList`, which sits here in Go too -- after the security merge, before
+    // the session scope. It is the stage that makes a loaded config more than the file:
+    // every channel's `settings` is replaced by what its typed struct marshals, so the
+    // fields the file left out appear and the keys come back in declaration order.
+    channels::init_channel_list(&mut merged, &config_schema())?;
 
     // The last two stages of LoadConfig, and the reason a loaded config can carry a
     // dm_scope the file never mentioned.
@@ -778,7 +789,10 @@ fn apply_security(
 fn merge_filling(base: &mut Doc, overlay: &Doc) {
     let (Some(base_entries), Some(overlay_entries)) = (base.as_object_mut(), overlay.as_object())
     else {
-        merge_over(base, overlay);
+        // Not an object on both sides, so there is nothing to fill: the security value
+        // is the whole new value for this position, exactly as Go's yaml decode assigns
+        // the decoded node rather than merging into what was there.
+        *base = overlay.clone();
         return;
     };
     let schema = schema::config_schema();
@@ -1159,18 +1173,57 @@ fn upsert(entries: &mut Vec<(String, Doc)>, key: &str, value: Doc) {
 /// wholesale part at a scalar or array is what the security file does too, and it is the
 /// part a "smart" merge would get wrong -- see the corpus case
 /// `security_entry_replaces_the_json_model`.
-fn merge_over(base: &mut Doc, overlay: &Doc) {
-    match (base, overlay) {
-        (Doc::Object(base_entries), Doc::Object(overlay_entries)) => {
+/// Fills in what the document does not say, following Go's decode into a populated
+/// `DefaultConfig()`.
+///
+/// The schema decides whether a position merges or replaces, and the two answers sit
+/// one level apart:
+///
+/// * A **struct** merges field by field, which is why a file that says only
+///   `{"agents":{"defaults":{"model_name":"m"}}}` keeps every other default.
+/// * A **map** replaces the entry. `encoding/json` decodes an object into a map by
+///   allocating a fresh element (`reflect.New(t.Elem())`) and assigning it, so an
+///   existing entry is never handed to the decoder. That is what makes a user's
+///   `channel_list.telegram` *the whole channel*: the default telegram entry's
+///   `typing: {enabled: true}` and `media_group_delay_ms: 500` do not survive it, and a
+///   port that deep-merges writes a channel the user never configured -- with their
+///   typing indicator on and their own `settings` keys quietly merged into the ones the
+///   struct does not have.
+///
+/// A slice replaces too, for the same reason: the decoder assigns rather than appends.
+fn merge_over(base: &mut Doc, overlay: &Doc, schema: &Schema) {
+    let both_objects = base.as_object_mut().is_some() && overlay.as_object().is_some();
+    if both_objects {
+        if matches!(schema, Schema::Struct { .. }) {
+            let overlay_entries = overlay.as_object().expect("checked").clone();
+            let base_entries = base.as_object_mut().expect("checked");
             for (k, v) in overlay_entries {
-                match base_entries.iter_mut().find(|(bk, _)| bk == k) {
-                    Some(slot) => merge_over(&mut slot.1, v),
-                    None => base_entries.push((k.clone(), v.clone())),
+                let child = schema.field(&k);
+                match base_entries.iter_mut().find(|(bk, _)| *bk == k) {
+                    Some(slot) => match child {
+                        Some(child) => merge_over(&mut slot.1, &v, child),
+                        None => slot.1 = v,
+                    },
+                    None => base_entries.push((k, v)),
                 }
             }
+            return;
         }
-        (slot, v) => *slot = v.clone(),
+        // A map's entries are allocated fresh, so only the *keys* the document omits
+        // come from the defaults.
+        if matches!(schema, Schema::Map { .. }) {
+            let overlay_entries = overlay.as_object().expect("checked").clone();
+            let base_entries = base.as_object_mut().expect("checked");
+            for (k, v) in overlay_entries {
+                match base_entries.iter_mut().find(|(bk, _)| *bk == k) {
+                    Some(slot) => slot.1 = v,
+                    None => base_entries.push((k, v)),
+                }
+            }
+            return;
+        }
     }
+    *base = overlay.clone();
 }
 
 #[cfg(test)]
@@ -1204,10 +1257,69 @@ mod tests {
         assert_eq!(cfg.document, default_config("/home/oracle"));
     }
 
+    /// The `load` wiring, pinned here rather than left to the corpus: the coercion runs on the
+    /// merged document before `InitChannelList`, so a scalar in the file is already a list by
+    /// the time anything reads the loaded value. Without the call in `load` this is the only
+    /// test that notices, and the corpus cases that would have caught it live above this
+    /// branch.
+    #[test]
+    fn a_bare_allow_from_loads_as_a_list() {
+        let (_dir, path) = write_temp(
+            r#"{"version":3,"session":{"dm_scope":"per-channel"},"channel_list":{"telegram":{"allow_from":"alice"}}}"#,
+        );
+        let cfg = load(&path, "/home/oracle").expect("load");
+        assert_eq!(
+            cfg.document
+                .path(&["channel_list", "telegram", "allow_from"]),
+            Some(&Doc::Array(vec![Doc::String("alice".to_string())]))
+        );
+    }
+
+    /// The other half of the Slice arm. `group_trigger.prefixes` is a plain `[]string`, and
+    /// the `FlexibleStringSlice` coercion is an *override* over the stored value, not a
+    /// replacement of it. Matching the coercion alone projected every non-flexible slice to
+    /// `Null`, so a user's trigger prefixes disappeared from the loaded value with no error
+    /// at all -- and `prefixes` appears in no corpus case, so the replay stays green.
+    #[test]
+    fn a_plain_slice_in_channel_settings_still_projects() {
+        let (_dir, path) = write_temp(
+            r#"{"version":3,"session":{"dm_scope":"per-channel"},"channel_list":{"telegram":{"group_trigger":{"prefixes":["!","?"],"mention_only":true}}}}"#,
+        );
+        let cfg = load(&path, "/home/oracle").expect("load");
+        // Both keys, in `GroupTriggerConfig`'s declaration order rather than the file's.
+        assert_eq!(
+            cfg.document
+                .path(&["channel_list", "telegram", "group_trigger"])
+                .map(Doc::to_compact_json),
+            Some(r#"{"mention_only":true,"prefixes":["!","?"]}"#.to_string())
+        );
+    }
+
+    /// A bare bool or object at a `FlexibleStringSlice` falls through every arm of Go's
+    /// decoder, which refuses it naming the type. The override restored that by falling back
+    /// to the stored document, whose value then lands in the mismatch arm; before it, the
+    /// field projected to `Null`, `omitzero` dropped it, and the load *succeeded* with the
+    /// field absent -- a silently different config, the case the `Struct` arm exists for one
+    /// arm over.
+    #[test]
+    fn a_bool_or_object_at_a_flexible_slice_is_refused() {
+        for value in ["true", r#"{"a":"b"}"#] {
+            let document = format!(
+                r#"{{"version":3,"session":{{"dm_scope":"per-channel"}},"channel_list":{{"telegram":{{"allow_from":{value}}}}}}}"#
+            );
+            let (_dir, path) = write_temp(&document);
+            let err = load(&path, "/home/oracle")
+                .expect_err("a bool or object at a FlexibleStringSlice is refused, not erased");
+            assert!(
+                err.to_string().contains("FlexibleStringSlice"),
+                "{value}: got {err}"
+            );
+        }
+    }
+
     #[test]
     fn a_version_that_is_not_an_integer_is_refused_by_name() {
-        // `{"version":"3"}` is the case `unwrap_or(0)` got wrong: filed as v0, the whole
-        // migration ladder ran over the document and `needs_version_bump` was set, so a
+        // `{"version":"3"}` is the case `unwrap_or(0)` got wrong: filed as v0, the whole        // migration ladder ran over the document and `needs_version_bump` was set, so a
         // config Go refuses came out looking migrated.
         //
         // The sentence is Go's, measured from `LoadConfig` rather than composed: the probe
@@ -1369,7 +1481,7 @@ mod tests {
         // unknown key does not keep the api_keys it did not mention.
         let mut base = from_json(r#"{"list":[{"api_keys":["sk-1"],"name":"m"}]}"#).into_doc();
         let overlay = from_json(r#"{"list":[{"zzz":1}]}"#).into_doc();
-        merge_over(&mut base, &overlay);
+        merge_over(&mut base, &overlay, &config_schema());
         assert_eq!(
             base.path(&["list"]).and_then(Doc::as_array).expect("list")[0].to_compact_json(),
             r#"{"zzz":1}"#
