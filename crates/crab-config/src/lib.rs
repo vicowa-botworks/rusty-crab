@@ -759,6 +759,14 @@ fn load_config_map(config: &Doc, security: &Doc) -> Result<Doc, Error> {
     let mut m2 = security.clone();
 
     if let Doc::Object(entries) = &mut m2 {
+        // Go asks `m2[key] != nil` twice over: once to decide whether the lift runs at all
+        // (`migration.go:425`), and again **per key** inside it (`:429`, `:433`). So a
+        // null-valued section does not join the lift even when its sibling triggers it -- it
+        // stays in the merged document, where the strict validator names it. Testing only
+        // presence in the loop is the permissive half of that, and it loads a file
+        // `LoadConfig` refuses: measured, `web:` (null) beside a `skills:` mapping is refused
+        // by Go as `unknown field(s): web` and by the reverse shape as `unknown field(s):
+        // skills`. A hand-edited `.security.yml` with a bare `skills:` line is this shape.
         let present = |key: &str| {
             entries
                 .iter()
@@ -767,7 +775,10 @@ fn load_config_map(config: &Doc, security: &Doc) -> Result<Doc, Error> {
         if present("web") || present("skills") {
             let mut tools: Vec<(String, Doc)> = Vec::new();
             for key in ["web", "skills"] {
-                if let Some(position) = entries.iter().position(|(k, _)| k == key) {
+                if let Some(position) = entries
+                    .iter()
+                    .position(|(k, v)| k == key && !matches!(v, Doc::Null))
+                {
                     let (_, value) = entries.remove(position);
                     let mut value = value;
                     if key == "skills" {
@@ -2223,6 +2234,58 @@ mod tests {
     }
 
     #[test]
+    fn a_null_section_is_left_for_the_validator_even_when_its_sibling_is_lifted() {
+        // The per-key half of the lift's guard. Go's outer test is `m2["web"] != nil ||
+        // m2["skills"] != nil`, but each branch then asks the same question about *its own*
+        // key (`migration.go:429`, `:433`), so a null section is never lifted and the strict
+        // validator names it. Measured against Go at `f03fbd20`, one process per shape, on a
+        // legacy document that is valid at both versions (`model_name` *and* `model`, because
+        // `ModelConfig.Validate` requires both):
+        //
+        //   web: (null) + skills: mapping  -> unknown field(s): web
+        //   web: mapping + skills: (null)  -> unknown field(s): skills
+        //   both null                      -> unknown field(s): skills, web
+        //   tools: {} alone                -> loads
+        //
+        // The mixed rows are the whole point: the outer guard is satisfied either way, so a
+        // lift that tests only presence loads a document Go refuses.
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","model":"openai/gpt-4o"}]}"#;
+
+        let (_dir, path) = write_pair(legacy, "web:\nskills:\n  github:\n    token: gh\n");
+        let err = load(&path, "/home/oracle").expect_err("a null `web` is still a key");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "web"),
+            "Go refuses `unknown field(s): web`: {err}"
+        );
+
+        let (_dir, path) = write_pair(legacy, "web:\n  brave:\n    api_keys: [bk]\nskills:\n");
+        let err = load(&path, "/home/oracle").expect_err("a null `skills` is still a key");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "skills"),
+            "Go refuses `unknown field(s): skills`: {err}"
+        );
+
+        // Both null: the lift does not run at all, and each key is named on its own. Go's
+        // order is `skills, web`; the port's is whatever the document holds, so the assert
+        // names both without pinning an order Go gets from a map.
+        let (_dir, path) = write_pair(legacy, "web:\nskills:\n");
+        let err = load(&path, "/home/oracle").expect_err("neither null lifts");
+        assert!(
+            matches!(&err, Error::UnknownField(paths)
+                if paths.contains("web") && paths.contains("skills")),
+            "both nulls are named: {err}"
+        );
+
+        // Control: with no null in the file the same two sections lift and load, so the three
+        // refusals above are about `null` and not about a legacy document carrying them.
+        let (_dir, path) = write_pair(
+            legacy,
+            "web:\n  brave:\n    api_keys: [bk]\nskills:\n  github:\n    token: gh\n",
+        );
+        load(&path, "/home/oracle").expect("two present sections lift, as they always did");
+    }
+
+    #[test]
     fn web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema() {
         // `Tools` is `yaml:",inline"`, so the file's top-level `web:` and `skills:` are
         // `tools` fields and Go applies them. This port reaches them -- `apply_security`
@@ -2260,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_view_lifts_web_and_skills_into_tools() {
+    fn the_legacy_data_merge_lifts_web_and_skills_into_tools() {
         // `Config.Tools` is `yaml:",inline"`, so `web` and `skills` are tools fields and the
         // lift keeps them legal under the strict validator. The lift also *replaces* the
         // file's own `tools` section -- `m2["tools"] = m3`, where `m3` holds only the two

@@ -49,36 +49,9 @@ this file as long as observable behaviour is identical. They belong in
 
 - Go: `loadSecurityConfig` unmarshals the whole file into `Config`, and `Tools` is tagged
   `yaml:",inline"`, so a top-level `web:` in the security file lands on `tools.web` and
-  overrides the JSON config. `saveSecurityConfig` writes the section whenever a search
-  provider has an API key, so it is present in most real files -- and it is present even
-  when empty, because the writer emits every provider.
-- Rust: `yaml::parse` accepts the section and `apply_security` does not read it, so it is
-  parsed and then discarded. Its sibling `skills:` **is** applied now (see the two skills
-  entries below); `web` is the one that remains.
-- Why the asymmetry is the right shape rather than half a job: `skills` is observable
-  through a load, because `SkillRegistryConfig.MarshalJSON` hand-builds its output and
-  re-emits the registries into the loaded value. `web` is not. Every field under it that
-  could carry a key is a `SecureStrings`, and `SecureStrings.IsZero` reports true for any
-  caller but the YAML encoder, so `encoding/json` never writes one -- a security file's
-  `web.brave.api_keys` leaves the loaded value **byte-identical** to no security file at
-  all. A case added for it would structurally be unable to see its own subject.
-- Why not refuse it instead: that was the first behaviour, and it was the wrong direction
-  -- refusing makes the loader reject a file the shipped binary loads, and the failure
-  lands on every install that has ever saved a search key. Ignoring is the smaller
-  divergence and it is visible here rather than in a user's running agent.
-- Blast radius: an install that keeps a web-search key in `.security.yml` gets a config
-  where that key is absent at the point the port reports the loaded value, so a search
-  tool that works under Go reports "not configured" under the port. Secrets are not
-  leaked or written anywhere new -- they are read and dropped. The gap becomes observable
-  the moment `save` is compared, because the merge is what decides what gets written back
-  into `tools.web`.
-- Closes with: `apply_security` growing the section, in the same step as the `save` cases
-  that can witness it. The schema dump already carries the field list, so no Go-side work
-  is needed -- a corpus case is, and it has to be a save case.
-- Recorded: 2026-10-26, #5; narrowed to `web` on 2026-10-27 once `skills` landed.
-=======
   overrides the JSON config. The section is written by `saveSecurityConfig` whenever a search
-  provider has an API key, so it is present in most real files.
+  provider has an API key, so it is present in most real files -- and present even when empty,
+  because the writer emits every provider.
 - Rust: it is reached and then dropped. `apply_security` does walk the inline branch --
   it takes `tools`' own yaml list from the dump and hands each child to `merge_filling` --
   but `merge_filling` decides whether a key is a field by asking the **root** `Config`
@@ -88,25 +61,34 @@ this file as long as observable behaviour is identical. They belong in
   `skills::apply` (the legacy lift plus both registry passes); what is still open on that
   section is its own entry below, and it is about the *builtin registry materialisation*, not
   about the inline walk.
+- Why no case can witness it: every field under `web` that could carry a key is a
+  `SecureStrings`, and `SecureStrings.IsZero` reports true for any caller but the YAML
+  encoder, so `encoding/json` never writes one -- a security file's `web.brave.api_keys`
+  leaves the loaded value **byte-identical** to no security file at all. A load case added
+  for it would structurally be unable to see its own subject. `skills` earned its cases
+  precisely because `SkillRegistryConfig.MarshalJSON` hand-builds its output and re-emits the
+  registries into the loaded value, which is a difference in observability, not in care.
 - Why it is still open: the fix is the architecture rule this file already states -- thread
   the target's schema through the walk instead of resolving field knowledge once at the
   root -- and `merge_filling` is also the function the channel `settings` merge goes
   through, whose `settings`/`api_keys` exemptions exist only because of the same root
   lookup. Threading it correctly changes bytes on cases that are green today, so it is its
   own change rather than a line in this one.
-- Why not refuse them instead: that was the first behaviour, and it was the wrong direction
+- Why not refuse it instead: that was the first behaviour, and it was the wrong direction
   -- refusing makes the loader reject a file the shipped binary loads, and the failure lands
   on every install that has ever saved a search key. Ignoring is the smaller divergence and
   it is visible here rather than in a user's running agent.
-- Blast radius: an install that keeps a web-search key or a registry token in
-  `.security.yml` gets a config where that key is absent, so a search tool that works under
-  Go reports "not configured" under the port. Secrets are not leaked or written anywhere new
-  -- they are read and dropped.
+- Blast radius: an install that keeps a web-search key in `.security.yml` gets a config where
+  that key is absent, so a search tool that works under Go reports "not configured" under the
+  port. Secrets are not leaked or written anywhere new -- they are read and dropped. The gap
+  becomes observable the moment `save` is compared, because the merge is what decides what
+  gets written back into `tools.web`.
 - Closes with: `merge_filling` taking the schema of the node it is merging into. The dump
   already carries every field list needed, so no Go-side work is required.
   `web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema` fails on the
   day it does, and this entry goes with it.
-- Recorded: 2026-10-26, #5; mechanism corrected 2026-10-28, #11.
+- Recorded: 2026-10-26, #5; narrowed to `web` on 2026-10-27 once `skills` landed; mechanism
+  corrected 2026-10-28, #11.
 
 ### `crates/crab-config` does not apply the Telegram streaming env-compat shims
 
@@ -250,4 +232,20 @@ this file as long as observable behaviour is identical. They belong in
   the two-line form. Nothing in the port prints config errors today.
 - Recorded: 2026-10-28, #11.
 
-### A migrated document's security file is merged as data, and only its `model_list` half is ported
+### A security `model_list` naming one slot two ways is decided by Go's map order
+
+- Go: `mergeModelListsWithMap` iterates `for k, v := range secML` (`migration.go:520`), so
+  when a `.security.yml` carries both spellings of the same slot -- `m1:0:` and `m1:`, each
+  with its own `api_keys` -- the winner is whichever key the map hands over last. Five
+  processes on one input and one binary gave `[b] [b] [a] [b] [b]`.
+- Rust: the port walks the document in file order, so it is deterministically `[b]`, the key
+  that comes later in the file.
+- Why this is recorded rather than fixed: there is no Go behaviour to reproduce. A corpus case
+  pinning either answer pins a coin flip, and it reads as a flaky test the first time the
+  iterator disagrees.
+- Blast radius: nobody running the port, which is the deterministic side. Anyone who tries to
+  witness this shape in the corpus, or who diffs a hand-edited security file against Go and
+  sees different keys for two files that look identical.
+- Closes with: nothing. If Go ever sorts the iteration this becomes an ordinary merge and the
+  corpus can pin it.
+- Recorded: 2026-10-30, #9 round 4.
