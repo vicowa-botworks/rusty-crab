@@ -428,6 +428,73 @@ pub fn validate_against(document: &Doc, schema: &Schema) -> Result<(), Vec<Strin
     }
 }
 
+/// `FlexibleStringSlice.UnmarshalJSON` (`config_struct.go:22`) is a `[]string` that also
+/// accepts a bare string and a bare number, and formats the elements of a mixed array one at
+/// a time. Go runs it while decoding into the typed struct, so the loaded value holds a list
+/// even where the file held a scalar: `"alice"` loads as `["alice"]` and `123456789` as
+/// `["123456789"]`. A port that only *accepts* those files keeps the file's bytes and
+/// disagrees with every recorded value at one of those fields, so the coercion -- not just the
+/// tolerance -- has to be modelled.
+///
+/// The schema is what identifies the field: the dump carries the named type on the slice
+/// (`{"kind":"slice","name":"FlexibleStringSlice"}`), so nothing needs a list of field names.
+///
+/// Three parts of Go's own decoder are not symmetric, and each is easy to flatten:
+///
+///   * `null` is answered before anything else and sets the slice to nil, which marshals back
+///     as `null` -- it is not a one-element list. The empty string is a value and does become
+///     `[""]`.
+///   * a number goes through `%.0f`, which rounds half to even (1.5 and 2.5 are both `"2"`)
+///     and keeps the sign of a value that rounds to zero (-0.4 is `"-0"`).
+///   * only an *element* of an array reaches `%v`. A bare object or bool at the field falls
+///     through every arm of Go's decoder and is a load error naming the type, which is what
+///     the caller still reports.
+pub(crate) const FLEXIBLE_STRING_SLICE: &str = "FlexibleStringSlice";
+
+/// One element of the list Go ends up with: a string passes through, a number takes the
+/// `%.0f` arm, everything else takes `%v`.
+pub(crate) fn flexible_element_text(value: &Doc) -> Doc {
+    let text = match value {
+        Doc::String(s) => s.clone(),
+        // `encoding/json` hands the type a `float64` for *every* number, so an integer is
+        // `%.0f` of a float: past 2^53 the value moves, and matching that is the difference
+        // between Go's `["12345678901234568"]` and a faithful-looking `["12345678901234567"]`.
+        Doc::Int(i) => format!("{:.0}", *i as f64),
+        Doc::Float(f) => format!("{f:.0}"),
+        other => go_percent_v(other),
+    };
+    Doc::String(text)
+}
+
+/// `fmt.Sprintf("%v", ..)` over a value that came out of `encoding/json`, which is the only
+/// shape this is ever asked about: maps print with their keys sorted, slices with their
+/// elements space-separated, and a nil as `<nil>`.
+fn go_percent_v(value: &Doc) -> String {
+    match value {
+        Doc::String(s) => s.clone(),
+        Doc::Int(i) => i.to_string(),
+        Doc::Float(f) => format!("{f}"),
+        Doc::Bool(b) => b.to_string(),
+        Doc::Null => "<nil>".to_string(),
+        Doc::Array(items) => format!(
+            "[{}]",
+            items.iter().map(go_percent_v).collect::<Vec<_>>().join(" ")
+        ),
+        Doc::Object(entries) => {
+            // Go sorts the *keys*, not the rendered `key:value` pairs: `{"a":1,"a!":2}` is
+            // `map[a:1 a!:2]`, and sorting the pairs would put `a!` first because `!` sorts
+            // before `:`.
+            let mut ordered: Vec<&(String, Doc)> = entries.iter().collect();
+            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            let parts: Vec<String> = ordered
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", go_percent_v(value)))
+                .collect();
+            format!("map[{}]", parts.join(" "))
+        }
+    }
+}
+
 /// `collectUnknownJSONFields`, arm by arm.
 fn collect(raw: &Doc, target: &Schema, path: &str, issues: &mut Vec<String>) {
     match target {
@@ -478,6 +545,7 @@ fn append_json_path(path: &str, segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::doc::from_json;
 
@@ -501,6 +569,79 @@ mod tests {
             issues.is_empty(),
             "the default table carries keys the schema refuses: {issues:?}"
         );
+    }
+
+    /// What the decode of `Channel.allow_from` holds for a file that says `value`, through the
+    /// stage that actually runs it. `None` means the key is not in the loaded value at all.
+    fn flexible(value: &str) -> Option<Doc> {
+        let mut document = doc(&format!(
+            r#"{{"version":3,"channel_list":{{"telegram":{{"allow_from":{value}}}}}}}"#
+        ));
+        crate::channels::init_channel_list(&mut document, &schema())
+            .expect("telegram is a known channel type");
+        document
+            .path(&["channel_list", "telegram", "allow_from"])
+            .cloned()
+    }
+
+    fn strings(items: &[&str]) -> Doc {
+        Doc::Array(
+            items
+                .iter()
+                .map(|s| Doc::String((*s).to_string()))
+                .collect(),
+        )
+    }
+
+    /// The two arms that make a scalar a list at all. A port that only *accepts* a scalar keeps
+    /// the file's bytes and fails every corpus case that reaches the field.
+    #[test]
+    fn a_flexible_slice_wraps_a_bare_string_or_number() {
+        assert_eq!(flexible(r#""alice""#), Some(strings(&["alice"])));
+        assert_eq!(flexible("123456789"), Some(strings(&["123456789"])));
+    }
+
+    /// Elements are formatted one at a time and the arms differ: a number takes `%.0f`, which
+    /// rounds half to even (1.5 and 2.5 are both `2`) and keeps the sign of a value that rounds
+    /// to zero (-0.4 is `-0`), while anything else takes `%v` -- hence `true`, `<nil>`, and Go's
+    /// map and slice syntax. Byte-for-byte the corpus case
+    /// `a_flexible_string_slice_formats_its_elements_individually`.
+    #[test]
+    fn a_flexible_slice_formats_each_element_by_its_own_kind() {
+        assert_eq!(
+            flexible(r#"[1.5,2.5,-0.4,true,null,{"a":1},"s",["x"]]"#),
+            Some(strings(&[
+                "2", "2", "-0", "true", "<nil>", "map[a:1]", "s", "[x]"
+            ]))
+        );
+    }
+
+    /// `null` is answered before every other arm and sets the slice to nil, so it is not a
+    /// one-element list -- and a nil slice under `omitempty` is not in the loaded value at all.
+    /// The empty string beside it is a value and does survive as `[""]`.
+    #[test]
+    fn a_null_flexible_slice_is_nil_not_a_one_element_list() {
+        assert_eq!(flexible("null"), None);
+        assert_eq!(flexible(r#""""#), Some(strings(&[""])));
+    }
+
+    /// The second site, and the reason the settings walk cannot be the root walk. A channel's
+    /// `settings` is a raw node that `InitChannelList` decodes by JSON rules, so the same type
+    /// is reached at a different depth through a different schema -- the per-type one, which is
+    /// the only place `channels` and `request_caps` exist.
+    #[test]
+    fn a_flexible_slice_inside_channel_settings_is_coerced_by_the_settings_decode() {
+        let mut document = doc(
+            r#"{"version":3,"channel_list":{"irc":{"settings":{"channels":"picoclaw","request_caps":9}}}}"#,
+        );
+        crate::channels::init_channel_list(&mut document, &schema())
+            .expect("`irc` is a known channel type");
+        let settings = document
+            .path(&["channel_list", "irc", "settings"])
+            .cloned()
+            .expect("`irc` settings must survive the stage");
+        assert_eq!(settings.get("channels"), Some(&strings(&["picoclaw"])));
+        assert_eq!(settings.get("request_caps"), Some(&strings(&["9"])));
     }
 
     #[test]

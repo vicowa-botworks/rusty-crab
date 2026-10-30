@@ -31,17 +31,25 @@
 //!
 //! ## What the corpus cannot see
 //!
-//! Injecting faults into this module and replaying the config seam leaves three that no
-//! case fails. Two are equivalent and one is a gap in this port, and the three should not
-//! be remembered as the same kind of thing:
+//! Injecting faults into this module and replaying the config seam leaves faults that no
+//! case fails, and they are not all the same kind of thing -- an equivalence, a survivor, and
+//! a gap need different responses. Re-derived at this commit rather than carried forward,
+//! because the last tally here was wrong in both directions:
 //!
-//! * **Writing `auth_token` over one that is already set** is equivalent, because every
-//!   `SecureString` marshals to the same `[NOT_HERE]`. No document can tell "kept the
-//!   stored token" from "replaced it with the legacy one"; only the file that `save`
-//!   writes back could, and `save` is not ported yet.
-//! * **Letting the file's `github.token` win over one already in config.json** is the
-//!   same equivalence seen from the other field: both are invisible in the loaded value
-//!   (see `marshal`'s SecureString rule) and both qualify the registry identically.
+//! * **Writing `auth_token` over one that is already set is a survivor, not an equivalence.**
+//!   Making the legacy pass write unconditionally (dropping `if current.auth_token.is_empty()`)
+//!   leaves the unit tests and the replay green, because every `SecureString` marshals to the
+//!   same `[NOT_HERE]` -- but the *effective* credential differs, and the effective credential
+//!   is exactly what `save` writes back to `.security.yml`. This seam has already carried one
+//!   bug of that shape (`security_registry_token_save_splits_masked_and_real`), so "invisible
+//!   in the loaded value" is not a claim of equivalence, only of where the witness has to
+//!   live: a `save`-side case. Until one exists this is an uncovered branch, and it should be
+//!   read that way rather than as harmless.
+//! * **Letting the file's `github.token` win over one already in config.json is not a fault at
+//!   all any more.** It has been the shipped behaviour since the file's value was made to
+//!   *replace* the document's, and its opposite (fill-only) is killed by
+//!   `the_files_github_token_replaces_the_documents`. It stayed on this list after that commit
+//!   changed what it described, which is how a counted "equivalent" survived a round.
 //! * **Dropping the `registries` skip is a gap, not an equivalent.** Go refuses a file
 //!   whose legacy skills value is not a mapping -- `valueNode.Decode` into a
 //!   `SkillRegistryConfig` decodes into a `map[string]any`, and a scalar is not one. This
@@ -110,7 +118,24 @@ impl Registry {
                         self.base_url = s.clone();
                     }
                 }
-                "auth_token" => self.auth_token = scalar_text(v),
+                "auth_token" => {
+                    // A yaml null is not a value: `yaml.v3` short-circuits `!!null` before it
+                    // asks a custom unmarshaler, so `SecureString.UnmarshalYAML` never sees
+                    // the node and the field keeps what the decode is writing *into*. `""` is
+                    // a value and does clear. The two assignment sites in this pass need the
+                    // same guard; `a_null_leaves_a_credential_the_document_already_holds`
+                    // pins both, and pins the empty string beside them so the pair cannot
+                    // agree by construction.
+                    //
+                    // The JSON document is the opposite rule, and this function reads both:
+                    // `encoding/json` does call `UnmarshalJSON` for `null`, and
+                    // `SecureString.fromRaw("")` resolves it to empty. That is invisible
+                    // here because the document side always starts from
+                    // `Registry::default()`, where keep and clear are the same string.
+                    if !matches!(v, Doc::Null) {
+                        self.auth_token = scalar_text(v);
+                    }
+                }
                 // Hydrates the SecureString only; never persisted as a param.
                 "_auth_token" | "param" | "name" => {}
                 _ => self.set_param(k, v),
@@ -171,10 +196,12 @@ impl Registry {
 /// A null is the one shape that never reaches `UnmarshalYAML` at all: yaml.v3 short-circuits
 /// `!!null` for a type with a custom unmarshaler and zeroes the target, so `fromRaw` is
 /// never called and the `SecureString` stays empty. Printing the node would give `"null"`,
-/// which is a credential -- `security_legacy_null_token_creates_no_credential` and
-/// `security_legacy_empty_token_creates_no_credential` pin the registry existing with no
-/// `auth_token` key at all. Numbers are the opposite case: `42` and `1.5` are both printed
-/// scalars, so both create one.
+/// which is a credential. `a_null_or_empty_legacy_token_creates_no_credential` pins the
+/// registry existing with no `auth_token` key at all; the corpus cases of the same shape
+/// (`security_legacy_null_token_creates_no_credential`,
+/// `security_legacy_empty_token_creates_no_credential`) exist only at picoclaw `origin/main`,
+/// so until the fixture moves the unit test is the whole pin. Numbers are the opposite case:
+/// `42` and `1.5` are both printed scalars, so both create one.
 fn scalar_text(node: &Doc) -> String {
     match node {
         Doc::String(s) => s.clone(),
@@ -188,10 +215,51 @@ fn scalar_text(node: &Doc) -> String {
 }
 
 /// Applies both passes to a document the JSON loader already settled.
-pub fn apply(merged: &mut Doc, security: &Security) {
-    let Some(file_skills) = security.document.get("skills") else {
-        return;
-    };
+///
+/// [`normalise_document`] has already run on that path by the time this is called, so the
+/// document's `registries` is a mapping and the baseline arm below cannot fire here. It is
+/// kept identical rather than split in two because the two entry points differ only in
+/// whether the file passes run, and a reader should not have to prove that twice.
+pub fn apply(merged: &mut Doc, security: &Security, baseline: Option<&Doc>) {
+    rebuild(merged, Some(security), baseline);
+}
+
+/// The document-side half on its own: the pass Go runs **during** the JSON unmarshal, before
+/// the security file is opened at all.
+///
+/// This is the whole difference between "the file says nothing about `skills`" and "there is
+/// no file". The first is a `Security` with an empty document and the second is no `Security`;
+/// both leave the two merge passes with nothing to do, and only the second used to skip this
+/// rebuild as well -- so whether `config.json` came back normalised depended on whether an
+/// unrelated file happened to exist, and the common install has no `.security.yml` at all.
+///
+/// `baseline` is the `tools.skills.registries` node from `default_config` **before** the
+/// document was merged over it, because Go decodes into the defaults and a document whose
+/// `registries` is not a mapping leaves them standing:
+///
+/// | document `registries` | Go's loaded value |
+/// | --- | --- |
+/// | a mapping | that mapping, merged over the builtins and normalised |
+/// | `null` | `clawhub` + `github` at their **defaults** -- the same answer as an array |
+/// | an array | the array ignored, the builtins standing at their **defaults** |
+/// | a number | refused outright, see the scalar arm in [`rebuild`] |
+/// | absent | untouched -- Go's decoder is never called for a key that is not there |
+///
+/// Measured at picoclaw `01635da3`, one process per shape, no `.security.yml` on disk:
+/// `null`, `[{enabled:true,name:github}]` and an absent key all give
+/// `{clawhub:{base_url:"https://clawhub.ai",enabled:true}, github:{...}}`, and a mapping
+/// `{"custom":{base_url:"u"}}` keeps both builtins and adds `custom` at zero values.
+///
+/// **Do not read the `null` row as the file's null header.** A `registries:` with nothing
+/// after the colon in `.security.yml` is a different pass and a different answer -- the
+/// baseline's *names* at **zero** values, with the document's own registries gone. That one
+/// is pinned by `a_null_registries_header_in_the_file_wipes_to_the_builtins_at_zero_values`;
+/// this pass never wipes, and the two are the easiest pair on this seam to confuse.
+pub fn normalise_document(merged: &mut Doc, baseline: Option<&Doc>) {
+    rebuild(merged, None, baseline);
+}
+
+fn rebuild(merged: &mut Doc, security: Option<&Security>, baseline: Option<&Doc>) {
     let Some(target) = merged
         .get_mut_at("tools")
         .and_then(|tools| tools.get_mut_at("skills"))
@@ -199,21 +267,64 @@ pub fn apply(merged: &mut Doc, security: &Security) {
         return;
     };
 
-    // The registries the document already carries, in the shape Go holds them.
-    let mut registries: Vec<(String, Registry)> = target
-        .get("registries")
-        .and_then(Doc::as_object)
-        .map(|entries| {
-            entries
-                .iter()
-                .map(|(name, node)| {
-                    let mut registry = Registry::default();
-                    registry.read(node);
-                    (name.clone(), registry)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // The gate is the *document*, not the security file. Go runs `SkillsRegistriesConfig`'s
+    // decoder whenever `tools.skills.registries` is there to decode, and the file only decides
+    // whether the two merge passes below run; returning here when the file has no `skills`
+    // section made whether `config.json` is normalised depend on whether an unrelated file
+    // happens to exist -- and the common install has no `.security.yml` at all.
+    let file_skills = match security.and_then(|s| s.document.get("skills")) {
+        Some(node @ Doc::Object(_)) => Some(node),
+        // A non-mapping `skills` value is the divergence recorded under "loads a non-mapping
+        // skills value Go refuses": no pass below can read it, and the doc-side rebuild still
+        // runs, which is the half that has nothing to do with the file.
+        _ => None,
+    };
+
+    // The registries the document already carries, in the shape Go holds them -- or, when the
+    // node is there but is not a mapping, the baseline's, because Go's decoder leaves the
+    // defaults standing rather than replacing them with what it could not read.
+    //
+    // `null` is its own arm and it is not the same answer: `SkillsRegistriesConfig` assigns a
+    // fresh slice built from the *names it already had*, so the entries come back at zero
+    // values (`{"base_url":"","enabled":false}`) and any registry the document named but the
+    // baseline does not is gone. A non-mapping that is not null -- the JSON array shape, a
+    // scalar -- is ignored outright, so the baseline's own values stand.
+    let document_registries = target.get("registries");
+    let mut registries: Vec<(String, Registry)> = match document_registries {
+        Some(Doc::Object(entries)) => entries
+            .iter()
+            .map(|(name, node)| {
+                let mut registry = Registry::default();
+                registry.read(node);
+                (name.clone(), registry)
+            })
+            .collect(),
+        // `null` and the JSON array shape are the same answer, measured: Go's decoder ignores
+        // a node it cannot read into the map and the builtins stand at their defaults. A
+        // `null` that *wipes* is the security file's, below -- the two are easy to confuse and
+        // only one of them replaces.
+        Some(Doc::Null) | Some(Doc::Array(_)) => baseline
+            .and_then(Doc::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(name, node)| {
+                        let mut registry = Registry::default();
+                        registry.read(node);
+                        (name.clone(), registry)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // A number where the mapping belongs is the one shape Go refuses here, measured at
+        // picoclaw `01635da3`: `config.json type error at line 1, column 1: expected
+        // map[string]jsontext.Value but got number`. That sentence belongs to a loader stage
+        // this crate has not ported -- it refuses nothing at this depth -- so the document
+        // keeps the shape it was given rather than an answer invented here, and the
+        // divergence is recorded in `docs/DIVERGENCES.md` rather than papered over.
+        Some(_) => Vec::new(),
+        None => Vec::new(),
+    };
 
     // Pass 1 -- `registries`, cloned-by-name then decoded.
     //
@@ -224,7 +335,38 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     // decodes element 1. Reading only the mapping form silently leaves such a registry at
     // its defaults -- a different config rather than a refused one, which is worse than the
     // refusals this pass does raise.
-    for (name, node) in registry_nodes(file_skills.get("registries")) {
+    // A `registries:` header that is **null** is a wipe, and an empty mapping is not. Measured
+    // against `LoadConfig` with a document carrying `custom`:
+    //
+    // | the file's `registries` | Go's loaded set |
+    // | --- | --- |
+    // | `registries:` (nothing after the colon, so `!!null`) | the baseline's names at **zero** values, `custom` gone |
+    // | `registries: null` | the same |
+    // | `registries: {}` | builtins at their **defaults** and `custom` kept -- no wipe at all |
+    // | no `registries` key | the document's set standing |
+    //
+    // The first two are one yaml node kind and the third is another, which is the whole
+    // difference: yaml short-circuits `!!null` into a nil slice, and an empty mapping decodes to
+    // a map that simply adds nothing. Reading them as one shape is what broke the fixed point
+    // through Go's own saved pair, where the file Go writes says `registries: {}`.
+    //
+    // The names come from the baseline because nothing else has them by then: the document's
+    // own entry is gone and the file names nothing.
+    let file_registries_node = file_skills.and_then(|skills| skills.get("registries"));
+    if matches!(file_registries_node, Some(Doc::Null)) {
+        registries = baseline
+            .and_then(Doc::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(name, _)| (name.clone(), Registry::default()))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    let file_registries = file_skills.map(|f| registry_nodes(f.get("registries")));
+    for (name, node) in file_registries.as_deref().unwrap_or(&[]) {
         let name = name.trim();
         if name.is_empty() {
             continue;
@@ -238,25 +380,36 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     // It is invisible in the loaded value -- `SecureString` marshals to nothing there --
     // and its only observable effect is the registry it fills in below.
     //
-    // The file's value *replaces* the document's whenever the key is present, and that
-    // includes replacing it with nothing: pass 1 is `yaml.Unmarshal(data, cfg)`, and yaml
-    // decodes a struct field into the existing value, so `SecureString.UnmarshalYAML`
-    // assigns whatever the node holds. `security_github_file_token_empty_overwrites_the_documents`
-    // is the only case that can see the difference -- with both sides non-empty the mask
-    // renders `[NOT_HERE]` either way -- and it shows `token: ""` in the file removing the
-    // document's token, while `security_github_file_token_absent_keeps_the_documents` shows
-    // an absent key keeping it. Fill-only would pass both of the obvious cases and fail
-    // exactly that pair.
+    // The file's value *replaces* the document's whenever the key is present with a value,
+    // and that includes replacing it with nothing: pass 1 is `yaml.Unmarshal(data, cfg)`, and
+    // yaml decodes a struct field into the existing value, so `SecureString.UnmarshalYAML`
+    // assigns whatever the node holds. The difference is only visible when one side is empty
+    // -- with both sides non-empty the mask renders `[NOT_HERE]` either way -- and it is
+    // pinned here by `the_files_github_token_replaces_the_documents` and
+    // `a_null_leaves_a_credential_the_document_already_holds`. The two corpus cases that name
+    // the pair exactly, `security_github_file_token_empty_overwrites_the_documents` and
+    // `security_github_file_token_absent_keeps_the_documents`, are not in this repo's fixture
+    // yet (they are at picoclaw `origin/main`), so the unit tests are the whole pin until the
+    // fixture moves. Fill-only would pass both of the obvious cases and fail exactly that
+    // pair.
+    //
+    // A null is the third state, and it belongs with "absent", not with "empty": yaml
+    // short-circuits `!!null` before the unmarshaler, so the field keeps the document's value
+    // and the plaintext `token` param still records the null the file spelled. Clearing here
+    // deleted a credential the shipped binary keeps.
     let mut github_token = target
         .path(&["github", "token"])
         .map(scalar_text)
         .unwrap_or_default();
-    if let Some(token) = file_skills.path(&["github", "token"]) {
+    if let Some(token) = file_skills
+        .and_then(|f| f.path(&["github", "token"]))
+        .filter(|t| !matches!(t, Doc::Null))
+    {
         github_token = scalar_text(token);
     }
 
     // Pass 2 -- every other key in the file's `skills` mapping is a registry.
-    if let Doc::Object(entries) = file_skills {
+    if let Some(Doc::Object(entries)) = file_skills {
         for (key, node) in entries {
             let name = key.trim();
             if name.is_empty() || name == "registries" {
@@ -298,6 +451,9 @@ pub fn apply(merged: &mut Doc, security: &Security) {
     }
 
     if registries.is_empty() {
+        // Nothing to write, and nothing to create: a document with no `registries` key at all
+        // never reaches Go's decoder. A `registries:` header that was present but unreadable
+        // is not this case -- the arms above produced the baseline's entries for it.
         return;
     }
     let mut out: Vec<(String, Doc)> = registries
@@ -375,7 +531,7 @@ mod tests {
     fn registries_after(security_yaml: &str, skills: Vec<(&str, Doc)>) -> Doc {
         let security = crate::yaml::parse(security_yaml).expect("the snippet must parse");
         let mut doc = document(skills);
-        apply(&mut doc, &security);
+        apply(&mut doc, &security, None);
         doc.path(&["tools", "skills", "registries"])
             .cloned()
             .unwrap_or(Doc::Null)
@@ -394,6 +550,63 @@ mod tests {
 
     fn has_token(registry: &Doc) -> bool {
         registry.get("auth_token").is_some()
+    }
+
+    /// The document's own `registries` is normalised by Go's decoder whether or not a
+    /// `.security.yml` exists -- and the common install has none. Gating the whole pass on the
+    /// file left these three shapes echoed back as written: a nested `param` kept under a
+    /// `param` key instead of flattened into the marshaler's top level, a `name` that
+    /// `MarshalJSON` never writes, and an `auth_token` the document spelled `null`. Putting
+    /// the `skills` key back in the security file made the first and third agree again, which
+    /// is what makes the *gate* the bug rather than the shapes themselves.
+    #[test]
+    fn the_documents_registries_are_normalised_without_a_security_file() {
+        let registries = registries_after(
+            "",
+            vec![(
+                "registries",
+                Doc::Object(vec![
+                    (
+                        "flattened".to_string(),
+                        Doc::Object(vec![
+                            ("enabled".to_string(), Doc::Bool(true)),
+                            (
+                                "param".to_string(),
+                                Doc::Object(vec![("a".to_string(), Doc::Int(1))]),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "renamed".to_string(),
+                        Doc::Object(vec![
+                            ("name".to_string(), Doc::String("named".to_string())),
+                            ("enabled".to_string(), Doc::Bool(true)),
+                        ]),
+                    ),
+                    (
+                        "nulled".to_string(),
+                        Doc::Object(vec![
+                            ("enabled".to_string(), Doc::Bool(true)),
+                            ("auth_token".to_string(), Doc::Null),
+                        ]),
+                    ),
+                ]),
+            )],
+        );
+        let flattened = registry_of(&registries, "flattened");
+        assert_eq!(flattened.get("a"), Some(&Doc::Int(1)), "{flattened:?}");
+        assert!(
+            flattened.get("param").is_none(),
+            "`param` survived: {flattened:?}"
+        );
+        assert!(
+            registry_of(&registries, "renamed").get("name").is_none(),
+            "`name` is not a field Go marshals"
+        );
+        assert!(
+            !has_token(&registry_of(&registries, "nulled")),
+            "a null `auth_token` became a key"
+        );
     }
 
     /// yaml.v3 short-circuits `!!null` for a type with a custom unmarshaler, so the
@@ -465,6 +678,85 @@ mod tests {
         assert!(
             has_token(&registry_of(&kept, "github")),
             "an absent file token dropped the document's credential: {kept:?}"
+        );
+    }
+
+    /// The third state, which is neither "absent" nor "empty". yaml.v3 short-circuits `!!null`
+    /// before it asks a custom unmarshaler, so a null `github.token` never reaches
+    /// `SecureString.UnmarshalYAML` and the field keeps the document's value -- while the
+    /// plaintext `token` param still records the null the file spelled, because the registry
+    /// is created and the param walk is not type-guarded. Clearing here deleted a credential
+    /// the shipped binary keeps, and lost that param with it.
+    #[test]
+    fn a_null_github_token_keeps_the_documents_and_prints_itself() {
+        let with_document_token = || {
+            vec![(
+                "github",
+                Doc::Object(vec![(
+                    "token".to_string(),
+                    Doc::String("ghp_doc".to_string()),
+                )]),
+            )]
+        };
+        for file in [
+            "skills:\n  github:\n    token:\n",
+            "skills:\n  github:\n    token: null\n",
+            "skills:\n  github:\n    token: ~\n",
+        ] {
+            let registries = registries_after(file, with_document_token());
+            let github = registry_of(&registries, "github");
+            // The mask is the only face a kept credential has in a loaded value --
+            // `SkillRegistryConfig.MarshalJSON` writes the literal for the key whatever the
+            // value is -- so the discriminator against clearing is that the key is there.
+            assert_eq!(
+                github.get("auth_token"),
+                Some(&Doc::String("[NOT_HERE]".to_string())),
+                "`{file}` cleared a credential Go keeps"
+            );
+            assert_eq!(
+                github.get("token"),
+                Some(&Doc::Null),
+                "`{file}` lost the plaintext null param that comes with the key"
+            );
+        }
+    }
+
+    /// The same rule at the other assignment site -- the `auth_token` a `registries` entry
+    /// names -- with the empty string beside it, because a test that only checks the null
+    /// passes when both nulls and empties clear.
+    #[test]
+    fn a_null_leaves_a_credential_the_document_already_holds() {
+        let with_document_token = || {
+            vec![(
+                "registries",
+                Doc::Object(vec![(
+                    "github".to_string(),
+                    Doc::Object(vec![(
+                        "auth_token".to_string(),
+                        Doc::String("ghp_doc".to_string()),
+                    )]),
+                )]),
+            )]
+        };
+        for file in [
+            "skills:\n  registries:\n    github:\n      auth_token:\n",
+            "skills:\n  registries:\n    github:\n      auth_token: null\n",
+        ] {
+            let registries = registries_after(file, with_document_token());
+            assert_eq!(
+                registry_of(&registries, "github").get("auth_token"),
+                Some(&Doc::String("[NOT_HERE]".to_string())),
+                "`{file}` cleared a credential Go keeps"
+            );
+        }
+
+        let cleared = registries_after(
+            "skills:\n  registries:\n    github:\n      auth_token: \"\"\n",
+            with_document_token(),
+        );
+        assert!(
+            !has_token(&registry_of(&cleared, "github")),
+            "an empty string must still clear the credential: {cleared:?}"
         );
     }
 
