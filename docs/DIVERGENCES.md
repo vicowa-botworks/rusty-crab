@@ -50,7 +50,8 @@ this file as long as observable behaviour is identical. They belong in
 - Go: `loadSecurityConfig` unmarshals the whole file into `Config`, and `Tools` is tagged
   `yaml:",inline"`, so a top-level `web:` in the security file lands on `tools.web` and
   overrides the JSON config. The section is written by `saveSecurityConfig` whenever a search
-  provider has an API key, so it is present in most real files.
+  provider has an API key, so it is present in most real files -- and present even when empty,
+  because the writer emits every provider.
 - Rust: it is reached and then dropped. `apply_security` does walk the inline branch --
   it takes `tools`' own yaml list from the dump and hands each child to `merge_filling` --
   but `merge_filling` decides whether a key is a field by asking the **root** `Config`
@@ -60,25 +61,34 @@ this file as long as observable behaviour is identical. They belong in
   `skills::apply` (the legacy lift plus both registry passes); what is still open on that
   section is its own entry below, and it is about the *builtin registry materialisation*, not
   about the inline walk.
+- Why no case can witness it: every field under `web` that could carry a key is a
+  `SecureStrings`, and `SecureStrings.IsZero` reports true for any caller but the YAML
+  encoder, so `encoding/json` never writes one -- a security file's `web.brave.api_keys`
+  leaves the loaded value **byte-identical** to no security file at all. A load case added
+  for it would structurally be unable to see its own subject. `skills` earned its cases
+  precisely because `SkillRegistryConfig.MarshalJSON` hand-builds its output and re-emits the
+  registries into the loaded value, which is a difference in observability, not in care.
 - Why it is still open: the fix is the architecture rule this file already states -- thread
   the target's schema through the walk instead of resolving field knowledge once at the
   root -- and `merge_filling` is also the function the channel `settings` merge goes
   through, whose `settings`/`api_keys` exemptions exist only because of the same root
   lookup. Threading it correctly changes bytes on cases that are green today, so it is its
   own change rather than a line in this one.
-- Why not refuse them instead: that was the first behaviour, and it was the wrong direction
+- Why not refuse it instead: that was the first behaviour, and it was the wrong direction
   -- refusing makes the loader reject a file the shipped binary loads, and the failure lands
   on every install that has ever saved a search key. Ignoring is the smaller divergence and
   it is visible here rather than in a user's running agent.
-- Blast radius: an install that keeps a web-search key or a registry token in
-  `.security.yml` gets a config where that key is absent, so a search tool that works under
-  Go reports "not configured" under the port. Secrets are not leaked or written anywhere new
-  -- they are read and dropped.
+- Blast radius: an install that keeps a web-search key in `.security.yml` gets a config where
+  that key is absent, so a search tool that works under Go reports "not configured" under the
+  port. Secrets are not leaked or written anywhere new -- they are read and dropped. The gap
+  becomes observable the moment `save` is compared, because the merge is what decides what
+  gets written back into `tools.web`.
 - Closes with: `merge_filling` taking the schema of the node it is merging into. The dump
   already carries every field list needed, so no Go-side work is required.
   `web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema` fails on the
   day it does, and this entry goes with it.
-- Recorded: 2026-10-26, #5; mechanism corrected 2026-10-28, #11.
+- Recorded: 2026-10-26, #5; narrowed to `web` on 2026-10-27 once `skills` landed; mechanism
+  corrected 2026-10-28, #11.
 
 ### `crates/crab-config` does not apply the Telegram streaming env-compat shims
 
@@ -174,6 +184,31 @@ this file as long as observable behaviour is identical. They belong in
   skip exists to avoid.
 - Recorded: 2026-10-27.
 
+### `crates/crab-config` names a migration backup by the UTC date
+
+- Go: `MakeBackup` builds the suffix from `time.Now().Format("20060102")`, and `time.Now()`
+  is the **local** calendar date. `config.json.20261027.bak` is the day as the user's own
+  wall clock reads it.
+- Rust: `today()` derives the date from `SystemTime::now()` as UTC. The crate carries no date
+  dependency and this is the only calendar date it needs, so it does the civil-from-days
+  arithmetic itself.
+- Why: the corpus cannot see the difference, in either direction. Config cases run with the
+  environment cleared, so `TZ` is UTC in the generator as well as in the replay; and the
+  eight date digits of a backup name are masked by the generator's clock rule anyway, because
+  a timestamp at or after the generator process started is the code's own. A case here would
+  compare `<date>` with `<date>`.
+- Blast radius: only a migration writes a backup, so this is a once-per-upgrade file, and only
+  for a user whose local date differs from UTC at that moment. West of UTC that is the last
+  hours of the local day, and there **two migrations on consecutive local days fall inside one
+  UTC day, so the second backup overwrites the first that Go would have kept** -- the one
+  direction in which this loses data. East of UTC, in the first hours of the local day, the
+  port names the file with the previous day instead, which only leaves more files behind than
+  Go does. No config content changes, and the newest backup always exists.
+- Closes with: a local-time source in `today()` -- a date dependency, or reading `TZ` and
+  `/etc/localtime` -- and even then no corpus case can pin it, because the clock is masked, so
+  treat this as permanent rather than deferred.
+- Recorded: 2026-10-28, #9.
+
 ### The version probe's error has no preview block
 
 - Go: the version probe (`config.go:1311`, `json.Unmarshal` into
@@ -197,39 +232,20 @@ this file as long as observable behaviour is identical. They belong in
   the two-line form. Nothing in the port prints config errors today.
 - Recorded: 2026-10-28, #11.
 
-### A migrated document's security file is merged as data, and only its `model_list` half is ported
+### A security `model_list` naming one slot two ways is decided by Go's map order
 
-- Go: `LoadConfig` calls `loadSecurityConfig` only for a document already at
-  `CurrentVersion`. A legacy document goes through `loadConfigMap` (migration.go:404),
-  which unmarshals `.security.yml` as a plain `map[string]any`, rewrites it
-  (`mergeModelListsWithMap` consumes `model_list` by name; `web`/`skills` are lifted into
-  `tools`, replacing any `tools` the file itself carried), merges it into config.json with
-  the generic `mergeMap`, and hands the re-marshalled result to the ordinary decoder.
-- Rust: the version decides the two edges that are observable today -- a key the decoder
-  cannot place is ignored at v3 and refused at v2, and a `model_list` that is not a mapping
-  is a type error at v3 and deleted at v2 -- and the `model_list` merge itself runs on both
-  paths. What is not ported is the generic `mergeMap` over the rest of a legacy document:
-  there, a security `channel_list` entry replaces what is in the config rather than filling
-  into it, and a scalar the two files both name goes to the security file.
-- Why: the merge happens in a stage this crate reaches only for documents below
-  `CurrentVersion`, and it is a different function from the typed one -- `mergeMap` on
-  untyped data, before `migrateV1ToV2`, with its own ordering. Porting the typed merge and
-  calling it done is what produced the two wrong edges above, both of which read the file as
-  though one loader owned it.
-- Blast radius: an install whose `config.json` is still on version 1 or 2 and which has a
-  `.security.yml` with a `channel_list` entry. The port loads the secrets it needs and
-  differs from Go on the non-secret keys the same entry carries. A current-version install
-  -- every install that has saved once -- is unaffected.
-- Why no recorded case can show it: every corpus case that has a `.security.yml` is a v3
-  document, because the file is written by a v3 save; and the three `migrate_*` cases have
-  no security file at all. `migrate_backs_up_both_files` is the single case with a legacy
-  document *and* a security file, and it is deferred on the `save` half. Its load prefix is
-  replayed -- `migrate_backs_up_both_files` is in `KNOWN_LOAD_GAPS`, where the stage named
-  for it is `channel_settings` -- but that replay only licenses a difference in the channel
-  settings, so it witnesses the loader's *other* gaps and says nothing about this one. It is
-  the closest the fixture currently comes, and it is not evidence about the data merge. (An
-  earlier version of this entry called the label `security_data_merge`; no such label exists
-  in the harness, and a reader who greps for it finds only this file.) Closing this needs a Go-side case: a v2
-  `config.json` plus a `.security.yml` whose `channel_list` entry names keys the config also
-  sets.
-- Recorded: 2026-10-28, #11.
+- Go: `mergeModelListsWithMap` iterates `for k, v := range secML` (`migration.go:520`), so
+  when a `.security.yml` carries both spellings of the same slot -- `m1:0:` and `m1:`, each
+  with its own `api_keys` -- the winner is whichever key the map hands over last. Five
+  processes on one input and one binary gave `[b] [b] [a] [b] [b]`.
+- Rust: the port walks the document in file order, so it is deterministically `[b]`, the key
+  that comes later in the file.
+- Why this is recorded rather than fixed: there is no Go behaviour to reproduce. A corpus case
+  pinning either answer pins a coin flip, and it reads as a flaky test the first time the
+  iterator disagrees.
+- Blast radius: nobody running the port, which is the deterministic side. Anyone who tries to
+  witness this shape in the corpus, or who diffs a hand-edited security file against Go and
+  sees different keys for two files that look identical.
+- Closes with: nothing. If Go ever sorts the iteration this becomes an ordinary merge and the
+  corpus can pin it.
+- Recorded: 2026-10-30, #9 round 4.
