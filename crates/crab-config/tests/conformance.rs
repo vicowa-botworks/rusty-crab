@@ -7,22 +7,48 @@
 //! re-serialises identically — key order, `omitzero` behaviour and the `session` shadow
 //! included.
 //!
-//! ## Why only some cases run
+//! ## Every case runs
 //!
-//! Ten of the twenty-five call `save`, and [`crab_config::save`] is a stub: the loader
-//! stages it has not ported (`env.Parse`, `InitChannelList`, `expandMultiKeyModels`, the
-//! two `Validate*` passes) all change what a save writes, so a replay that skipped them
-//! would compare a partial pipeline against Go's full one and pass for the wrong reason.
-//! Those cases are counted and named in the failure output rather than dropped silently,
-//! and the `.security.yml` half of `save` is pinned directly by `security_golden.rs`,
-//! which needs no loader.
+//! `KNOWN_UNPORTED` is empty and nothing is deferred: the ten `save` cases and the three
+//! `migrate_*` cases that used to sit here went green when [`crab_config::save`] and the
+//! migration's own persistence landed. The list is kept rather than deleted because it is
+//! the crate's own statement of what is missing, and the assertion below is what keeps it
+//! honest — a name that outlives its gap hides the next one.
 //!
 //! ## What a failure here means
 //!
 //! The comparison is byte-exact, so a failure is a real divergence, not a formatting
-//! difference. When a case fails because of a stage listed above, say which stage in the
-//! commit message — the fixture cannot tell "wrong" from "not implemented yet", and a
-//! green run must not be read as "the loader is done".
+//! difference.
+//!
+//! ## Faults the corpus cannot see
+//!
+//! A green replay is only evidence that the recorded bytes match. The save, backup and
+//! migration path was therefore mutated fault by fault, and six faults walked through
+//! 53/53. They are recorded here rather than left as a green run, because "the corpus does
+//! not catch it" and "the behaviour does not matter" are different claims:
+//!
+//! * `SaveConfig`'s own `version` bump. Unreachable through `load`, because every version
+//!   below the current one either migrates (which sets it) or errors. Defence in depth,
+//!   like the `registries` name skip in the legacy skills pass.
+//! * The deferred restore of the unfiltered model list. Visible only to a caller that
+//!   keeps using the same `*Config` after a save; the corpus re-reads from disk.
+//! * `MakeBackup`'s missing-file short-circuit. The file always exists after a successful
+//!   load, so no case can reach it.
+//! * A virtual entry's `api_keys`. The entry itself is filtered out of both files, so what
+//!   it carries is invisible from outside the process.
+//! * `enabled` on a generated entry. Go's copy does not name the field, but keeping it
+//!   changes no bytes either, because `omitempty` drops `false`.
+//! * The ladder's `clawhub` to `registries` rewrite. Redundant with the security pass that
+//!   runs after it on the same file.
+//!
+//! Six *other* survivors were real corpus gaps and are not equivalents: a security
+//! `model_list` entry that exists without `api_keys` (Go clears the model's keys); one
+//! carrying a real model field such as `provider`; a `channel_list` settings node that
+//! differs from the defaults; a `channel_list` naming a channel the config does not have;
+//! a legacy `skills.github.token` reaching the migration pre-merge, where the plaintext
+//! duplicate is unpinned; and a security file holding both `tools:` and `web:`, the only
+//! shape where Go's `m2["tools"] = m3` assignment differs from a merge. Each needs a
+//! Go-side case before the Rust side may be said to hold.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -72,7 +98,7 @@ fn snapshot(dir: &Path) -> BTreeMap<String, String> {
         if !entry.path().is_file() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = mask_backup_date(&entry.file_name().to_string_lossy());
         files.insert(
             name,
             std::fs::read_to_string(entry.path()).unwrap_or_else(|_| "<binary>".to_string()),
@@ -87,34 +113,29 @@ fn snapshot(dir: &Path) -> BTreeMap<String, String> {
 /// error sentences quote absolute paths, so pinning them would compare paths, not
 /// behaviour.
 fn run_script(case: &str, ops: &[Op]) -> Value {
-    run_ops(case, ops, false)
-}
-
-/// The same script, stopped at its first `save`.
-///
-/// A case that saves is deferred whole because its `expected` holds files this crate
-/// cannot write yet -- and deferring it whole used to defer its `load` values with it.
-/// That is backwards: the loads are replayable today, and they are the only recorded
-/// witness of what the loader does with a `.security.yml`, which is what most of those
-/// cases were written to show.
-fn run_prefix(case: &str, ops: &[Op]) -> Value {
-    run_ops(case, ops, true)
-}
-
-fn run_ops(case: &str, ops: &[Op], stop_at_save: bool) -> Value {
     let dir = scratch_dir(case);
     let home = "/home/oracle";
     let schema = config_schema();
     let mut results = Vec::new();
     let mut error_op_index: Option<usize> = None;
+    // Bytes each `save` wrote, per file name, so a case that saves twice can say whether
+    // the second save produced the same document. Go's harness records the same map, and
+    // `save_stable` is derived from it in the fixture rather than asserted here: a config
+    // that drifts a little on every save is the failure mode this seam exists to catch,
+    // and the port is graded on reproducing the verdict either way.
+    let mut saves: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut loaded: Option<crab_config::Config> = None;
 
     for (index, op) in ops.iter().enumerate() {
-        if stop_at_save && op.op == "save" {
-            break;
-        }
         match op.op.as_str() {
             "defaults" => {
-                results.push(json!({"op": op.op, "op_index": index, "value": loaded_value(&default_config(home), &schema)}));
+                let document = default_config(home);
+                results.push(json!({"op": op.op, "op_index": index, "value": loaded_value(&document, &schema)}));
+                loaded = Some(crab_config::Config {
+                    document,
+                    needs_version_bump: false,
+                    virtual_models: Vec::new(),
+                });
             }
             "write_file" => {
                 let name = op.name.clone().expect("write_file names a file");
@@ -127,11 +148,34 @@ fn run_ops(case: &str, ops: &[Op], stop_at_save: bool) -> Value {
             "load" => {
                 let name = op.name.clone().expect("load names a file");
                 match load(&dir.join(&name), home) {
-                    Ok(cfg) => results.push(json!({
-                        "op": op.op,
-                        "op_index": index,
-                        "value": loaded_value(&cfg.document, &schema),
-                    })),
+                    Ok(cfg) => {
+                        results.push(json!({
+                            "op": op.op,
+                            "op_index": index,
+                            "value": loaded_value(&cfg.document, &schema),
+                        }));
+                        loaded = Some(cfg);
+                    }
+                    Err(_) => {
+                        error_op_index = Some(index);
+                        break;
+                    }
+                }
+            }
+            "save" => {
+                // Go's harness refuses a save with nothing loaded, because a harness that
+                // manufactures the thing a case is named for cannot pin its absence. Same
+                // rule here: panic rather than write a default config.
+                let cfg = loaded.as_mut().unwrap_or_else(|| {
+                    panic!("case {case} saves at op {index} without loading one")
+                });
+                let name = op.name.clone().expect("save names a file");
+                match crab_config::save(&dir.join(&name), cfg, home) {
+                    Ok(_) => {
+                        if let Ok(text) = std::fs::read_to_string(dir.join(&name)) {
+                            saves.entry(name).or_default().push(text);
+                        }
+                    }
                     Err(_) => {
                         error_op_index = Some(index);
                         break;
@@ -147,8 +191,44 @@ fn run_ops(case: &str, ops: &[Op], stop_at_save: bool) -> Value {
     if let Some(index) = error_op_index {
         got["error_op_index"] = json!(index);
     }
+    if let Some(verdict) = save_stable(&saves) {
+        got["save_stable"] = json!(verdict);
+    }
     let _ = std::fs::remove_dir_all(&dir);
     got
+}
+
+/// Go's `saveIsStable`: the question is asked only when one file was saved twice, and
+/// `stable` is vacuously true when it was not -- so `None` here means "not asked", which
+/// is the fixture's absence of the key rather than `false`.
+fn save_stable(saves: &BTreeMap<String, Vec<String>>) -> Option<bool> {
+    let mut asked = false;
+    for writes in saves.values() {
+        if writes.len() < 2 {
+            continue;
+        }
+        asked = true;
+        if writes[1..].iter().any(|w| *w != writes[0]) {
+            return Some(false);
+        }
+    }
+    asked.then_some(true)
+}
+
+/// The generator masks the eight date digits of a `MakeBackup` suffix, because a case
+/// that recorded the real date would disagree with itself after midnight. Same mask here,
+/// or a correct backup name would read as a divergence.
+fn mask_backup_date(name: &str) -> String {
+    const SUFFIX: &str = ".bak";
+    let Some(stem) = name.strip_suffix(SUFFIX) else {
+        return name.to_string();
+    };
+    let digits = stem.rsplit('.').next().unwrap_or_default();
+    if digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        let head = &stem[..stem.len() - 9];
+        return format!("{head}.<date>{SUFFIX}");
+    }
+    name.to_string()
 }
 
 /// Cases that replay today and disagree with Go for one known reason.
@@ -158,124 +238,32 @@ fn run_ops(case: &str, ops: &[Op], stop_at_save: bool) -> Value {
 /// matching Go fails the test with its name in the message, so the list cannot quietly
 /// outlive the gap, and a new divergence fails it too.
 ///
-/// The three that remain are not loader work. `InitChannelList` is ported (see
-/// [`crab_config`]'s `channels` module) and closed `load_current_version_minimal` on its
-/// own, which is the proof that the typed-settings decode was the only gap on the
-/// load-only side. What these three need is what `LoadConfig` *writes* when it migrates:
-/// `SaveConfig` defers to the last `case 0..=2` arm, so a migration leaves three files
-/// behind -- the migrated `config.json`, a `.security.yml` carrying each channel type's
-/// `settings: {}`, and `config.json.<date>.bak` with the original bytes -- and this crate
-/// does not implement `save` yet. `saveSecurityConfig` is reached from `SaveConfig`
-/// (`config.go:1691`), so the same work also unblocks the ten cases the harness defers
-/// outright for using `save`.
-const KNOWN_UNPORTED: &[&str] = &[
-    "migrate_v0_api_key_becomes_api_keys",
-    "migrate_v1_channels_renamed",
-    "migrate_v2_channels_to_channel_list",
-];
+/// It is empty, and it earned that. The last three entries were the migration cases, and
+/// they closed together when `load` learned to persist a migration (`MakeBackup` plus the
+/// deferred `SaveConfig`) -- they were never loader work on their own, which is why one
+/// stage cleared all three. Keeping a name here after it passes is not a harmless
+/// bookkeeping slip: the list is the crate's own statement of what is missing, so a stale
+/// entry makes a complete port look incomplete and hides the next real gap behind it.
+///
+/// The next thing that belongs here is a `save`-side gap, if one appears. The whole
+/// fixture replays now, so anything that lands here from now on is a divergence someone
+/// has to explain, not a stage that has not been written yet.
+const KNOWN_UNPORTED: &[&str] = &[];
 
 #[test]
 fn loading_matches_what_go_returned() {
     let fixture = Fixture::load("config_load_save.json");
     let mut report = Report::new(&fixture);
-    let mut deferred: Vec<&str> = Vec::new();
     let mut gaps: Vec<&str> = Vec::new();
-    let mut prefix_checked = 0usize;
-    let mut prefix_failed: Vec<String> = Vec::new();
+    let mut matched = 0;
 
     for case in &fixture.cases {
         let input: Script = case.parse();
-        if let Some(first_save) = input.ops.iter().position(|op| op.op == "save") {
-            // The whole script is out of reach until `save` is ported, but every recorded
-            // load before that save is not. Compare those, so a deferred case still
-            // witnesses the loader.
-            let got = run_prefix(&case.name, &input.ops);
-            let produced = got["results"].as_array().expect("results are an array");
-            let gaps = KNOWN_LOAD_GAPS
-                .iter()
-                .find(|(name, _)| *name == case.name.as_str())
-                .map(|(_, gaps)| *gaps)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{} is deferred for a `save` but is not in KNOWN_LOAD_GAPS, so its \
-                         load-side values are unaccounted for. Add it, naming the stages \
-                         that explain any difference (an empty list if none does).",
-                        case.name
-                    )
-                });
-            let want = case.expected["results"]
-                .as_array()
-                .expect("a scripted case records its results");
-            for entry in want.iter().filter(|r| {
-                r["op_index"]
-                    .as_u64()
-                    .is_some_and(|i| i < first_save as u64)
-            }) {
-                let index = entry["op_index"].as_u64().expect("op_index is a number");
-                prefix_checked += 1;
-                let recorded = entry["value"].as_str().unwrap_or_default();
-                let Some(produced) = produced
-                    .iter()
-                    .find(|r| r["op_index"].as_u64() == Some(index))
-                    .and_then(|r| r["value"].as_str())
-                else {
-                    prefix_failed.push(format!(
-                        "{} op {index}: this crate produced no value",
-                        case.name
-                    ));
-                    continue;
-                };
-                let (want_doc, got_doc) = (document(recorded), document(produced));
-                if want_doc == got_doc {
-                    if !gaps.is_empty() {
-                        panic!(
-                            "{} op {index} now matches Go exactly. Drop a label from \
-                             KNOWN_LOAD_GAPS -- a stage listed there that no longer explains \
-                             anything is a lie about what is still unported.",
-                            case.name
-                        );
-                    }
-                    continue;
-                }
-                if stripped(&want_doc, gaps) != stripped(&got_doc, gaps) {
-                    prefix_failed.push(format!(
-                        "{} op {index} differs for a reason outside {}\n    go:   {}\n    rust: {}",
-                        case.name,
-                        gaps.join(" + "),
-                        truncate(recorded),
-                        truncate(produced),
-                    ));
-                    continue;
-                }
-                // Every named stage has to be load-bearing, or the table is a list of
-                // excuses rather than a list of gaps.
-                for (position, label) in gaps.iter().enumerate() {
-                    let fewer: Vec<&str> = gaps
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| *i != position)
-                        .map(|(_, gap)| *gap)
-                        .collect();
-                    if stripped(&want_doc, &fewer) == stripped(&got_doc, &fewer) {
-                        prefix_failed.push(format!(
-                            "{} op {index}: `{label}` in KNOWN_LOAD_GAPS explains nothing here",
-                            case.name
-                        ));
-                    }
-                }
-            }
-            deferred.push(case.name.as_str());
-            continue;
-        }
 
         let got = run_script(&case.name, &input.ops);
         let known = KNOWN_UNPORTED.contains(&case.name.as_str());
         match (case.expected == got, known) {
-            // Recorded, not just counted. A success that never reaches the Report leaves
-            // `passed` at zero, and the summary line then reads "0 of 96 cases match" on
-            // a run where every case matched -- a number that looks like the seam is
-            // broken when it is the counter that is.
-            (true, false) => report.record(case, got),
+            (true, false) => matched += 1,
             (true, true) => panic!(
                 "{} now matches Go. Remove it from KNOWN_UNPORTED -- a case on that list \
                  that passes is a lie about what is still missing.",
@@ -297,119 +285,13 @@ fn loading_matches_what_go_returned() {
     // Printed before `finish`, which panics on the first disagreement: these two lines are
     // what a reader needs most, and they must not be the part that gets lost.
     eprintln!(
-        "{} of {} replayable cases match Go byte for byte",
-        report.passed(),
-        fixture.cases.len() - deferred.len(),
+        "{matched} of {} cases match Go byte for byte",
+        fixture.cases.len(),
     );
-    eprintln!(
-        "known gaps (migration persistence): {}
-deferred until `save` is ported ({}): {}",
-        gaps.join(", "),
-        deferred.len(),
-        deferred.join(", ")
-    );
-    eprintln!(
-        "load values replayed out of the deferred cases: {prefix_checked} compared, {} disagree \
-         for a reason outside the stages KNOWN_LOAD_GAPS names",
-        prefix_failed.len()
-    );
-    for failure in &prefix_failed {
-        eprintln!("  {failure}");
+    if gaps.is_empty() {
+        eprintln!("no case is listed as unported");
+    } else {
+        eprintln!("known gaps: {}", gaps.join(", "));
     }
     report.finish(8);
-    assert!(
-        prefix_failed.is_empty(),
-        "{} of the {} load values recorded before a deferred `save` disagree with Go for a \
-         reason outside the stages KNOWN_LOAD_GAPS names",
-        prefix_failed.len(),
-        prefix_checked
-    );
-}
-
-/// A recorded loaded value as a document. Something that is not JSON compares as its text.
-fn document(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into()))
-}
-
-/// The unported stages a deferred case's recorded `load` is allowed to differ by.
-///
-/// A case that saves is deferred whole, which used to defer its `load` values with it --
-/// so the ten save cases witnessed nothing at all about the loader, even though every load
-/// in them is replayable today. They are replayed now, and this table is what keeps that
-/// honest: each case names the stages that explain any difference, and the harness checks
-/// that every named stage is *load-bearing*. A stage that stops mattering fails the run,
-/// exactly like a case that leaves `KNOWN_UNPORTED` stale.
-const KNOWN_LOAD_GAPS: &[(&str, &[&str])] = &[
-    // Every `channel_settings` label here went empty when the base's `apply_omit` work merged
-    // in: eight of these ten save cases now match Go byte for byte on the load side too, and
-    // the two that still differ do so on `model_list`, not on channel settings. The harness
-    // fails on a label that no longer explains anything exactly as loudly as it fails on a
-    // difference nobody accounted for, so an empty list is a claim, not a placeholder.
-    ("save_writes_the_document", &[]),
-    ("save_bumps_an_old_version", &[]),
-    ("session_omitted_when_empty", &[]),
-    ("migrate_backs_up_both_files", &[]),
-    ("unparseable_security_file_is_refused", &[]),
-    ("security_entry_replaces_the_json_model", &[]),
-    ("security_seq_form_is_refused", &[]),
-    ("save_writes_both_halves", &[]),
-    ("virtual_key_models_are_written_back_once", &["model_list"]),
-    ("save_then_load_then_save_is_stable", &["model_list"]),
-];
-
-/// Removes what one unported stage is responsible for.
-///
-/// Every label is a *laxness*: stripping can only make a comparison easier to pass. So a
-/// match here is proof that nothing beyond the named stages is wrong, never proof that the
-/// loader is right -- which is the same bargain `KNOWN_UNPORTED` strikes, per case rather
-/// than per whole script.
-fn strip_gap(label: &str, value: &mut Value) {
-    match label {
-        // `InitChannelList` is not ported. Go marshals each channel's *settings struct*,
-        // so untagged and zero-valued fields appear and a `SecureString` inside them does
-        // not; the three telegram values this crate's `defaults.rs` adds land in the same
-        // three keys.
-        "channel_settings" => {
-            if let Some(channels) = value.get_mut("channel_list").and_then(Value::as_object_mut) {
-                for channel in channels.values_mut() {
-                    if let Some(fields) = channel.as_object_mut() {
-                        for key in ["settings", "typing", "placeholder"] {
-                            fields.remove(key);
-                        }
-                    }
-                }
-            }
-        }
-        // `expandMultiKeyModels` is not ported: Go turns one model holding two keys into
-        // `m1__key_1` and `m1__key_2`, so the list itself is a different length and a
-        // per-field strip cannot express it.
-        "model_list" => {
-            if let Some(fields) = value.as_object_mut() {
-                fields.remove("model_list");
-            }
-        }
-        other => panic!("{other} is not a gap this harness knows how to strip"),
-    }
-}
-
-/// Both sides with `gaps` removed, ready to compare.
-fn stripped(value: &Value, gaps: &[&str]) -> Value {
-    let mut copy = value.clone();
-    for gap in gaps {
-        strip_gap(gap, &mut copy);
-    }
-    copy
-}
-
-/// Enough of a loaded value to tell one from another in a failure line.
-fn truncate(value: &str) -> String {
-    const MAX: usize = 240;
-    let mut end = MAX.min(value.len());
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    if end == value.len() {
-        return value.to_string();
-    }
-    format!("{}…", &value[..end])
 }
