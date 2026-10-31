@@ -428,6 +428,153 @@ pub fn validate_against(document: &Doc, schema: &Schema) -> Result<(), Vec<Strin
     }
 }
 
+/// `FlexibleStringSlice.UnmarshalJSON` (`config_struct.go:22`) is a `[]string` that also
+/// accepts a bare string and a bare number, and formats the elements of a mixed array one at
+/// a time. Go runs it while decoding into the typed struct, so the loaded value holds a list
+/// even where the file held a scalar: `"alice"` loads as `["alice"]` and `123456789` as
+/// `["123456789"]`. A port that only *accepts* those files keeps the file's bytes and
+/// disagrees with every recorded value at one of those fields, so the coercion -- not just the
+/// tolerance -- has to be modelled.
+///
+/// The schema is what identifies the field: the dump carries the named type on the slice
+/// (`{"kind":"slice","name":"FlexibleStringSlice"}`), so nothing needs a list of field names.
+///
+/// Three parts of Go's own decoder are not symmetric, and each is easy to flatten:
+///
+///   * `null` is answered before anything else and sets the slice to nil, which marshals back
+///     as `null` -- it is not a one-element list. The empty string is a value and does become
+///     `[""]`.
+///   * a number goes through `%.0f`, which rounds half to even (1.5 and 2.5 are both `"2"`)
+///     and keeps the sign of a value that rounds to zero (-0.4 is `"-0"`).
+///   * only an *element* of an array reaches `%v`. A bare object or bool at the field falls
+///     through every arm of Go's decoder and is a load error naming the type, which is what
+///     the caller still reports.
+pub(crate) const FLEXIBLE_STRING_SLICE: &str = "FlexibleStringSlice";
+
+/// One element of the list Go ends up with: a string passes through, a number takes the
+/// `%.0f` arm, everything else takes `%v`.
+pub(crate) fn flexible_element_text(value: &Doc) -> Doc {
+    let text = match value {
+        Doc::String(s) => s.clone(),
+        // `encoding/json` hands the type a `float64` for *every* number, so an integer is
+        // `%.0f` of a float: past 2^53 the value moves, and matching that is the difference
+        // between Go's `["12345678901234568"]` and a faithful-looking `["12345678901234567"]`.
+        Doc::Int(i) => format!("{:.0}", *i as f64),
+        Doc::Float(f) => format!("{f:.0}"),
+        other => go_percent_v(other),
+    };
+    Doc::String(text)
+}
+
+/// `fmt.Sprintf("%v", ..)` over a value that came out of `encoding/json`, which is the only
+/// shape this is ever asked about: maps print with their keys sorted, slices with their
+/// elements space-separated, and a nil as `<nil>`.
+fn go_percent_v(value: &Doc) -> String {
+    match value {
+        Doc::String(s) => s.clone(),
+        Doc::Int(i) => i.to_string(),
+        Doc::Float(f) => go_percent_v_float(*f),
+        Doc::Bool(b) => b.to_string(),
+        Doc::Null => "<nil>".to_string(),
+        Doc::Array(items) => format!(
+            "[{}]",
+            items.iter().map(go_percent_v).collect::<Vec<_>>().join(" ")
+        ),
+        Doc::Object(entries) => {
+            // Go sorts the *keys*, not the rendered `key:value` pairs: `{"a":1,"a!":2}` is
+            // `map[a:1 a!:2]`, and sorting the pairs would put `a!` first because `!` sorts
+            // before `:`.
+            let mut ordered: Vec<&(String, Doc)> = entries.iter().collect();
+            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            let parts: Vec<String> = ordered
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", go_percent_v(value)))
+                .collect();
+            format!("map[{}]", parts.join(" "))
+        }
+    }
+}
+
+/// `fmt`'s `%v` for a `float64`, which is `%g` at the shortest precision.
+///
+/// Go and Rust agree on the *digits* -- each prints the shortest decimal that reads back
+/// as the same `float64` -- and disagree on the *notation*: Rust's `Display` is always
+/// positional, while Go leaves positional notation outside a window. So `1e15` arrives as
+/// `1000000000000000` here and `1e+15` there, and a config that renders such a float
+/// through [`go_percent_v`] writes a string the shipped binary would never produce.
+///
+/// The window is a property of `strconv`'s decision, not of the digit algorithm, so it is
+/// pinned by measurement rather than by recall: `tests/fixtures/go_percent_v.txt` is Go's
+/// own `%v` output for 228 values (every boundary this function branches on, plus a seeded
+/// random spread), and `go_percent_v_matches_go_across_a_measured_table` replays it. The
+/// rule that table pins is `exp < -4 || exp >= 6` on `exp = dp - 1`, where `dp` is the
+/// decimal-point position of the shortest digits -- `strconv`'s `eprec = 6` for the
+/// shortest form. Guessing that boundary would have been worse than leaving the gap
+/// documented, because a wrong rule looks authoritative and fails quietly at the edge.
+fn go_percent_v_float(value: f64) -> String {
+    // Not reachable from a JSON document -- `encoding/json` has no literal for either and
+    // neither does this crate's `Doc` -- but Go prints these words, so the port says the
+    // same words rather than Rust's `inf`.
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-Inf"
+        } else {
+            "+Inf"
+        }
+        .to_string();
+    }
+    // Go keeps the sign of a negative zero, which `value == 0.0` alone would flatten.
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let magnitude = value.abs();
+    if magnitude == 0.0 {
+        return format!("{sign}0");
+    }
+
+    // Rust's `Display` is shortest *and* positional, so the significant digits and the
+    // position of the point can be read straight off it.
+    let text = format!("{magnitude}");
+    let (integer, fraction) = text.split_once('.').unwrap_or((text.as_str(), ""));
+    let all: Vec<char> = format!("{integer}{fraction}").chars().collect();
+    let point = integer.len();
+    let first = all.iter().position(|c| *c != '0').unwrap_or(all.len());
+    let mut digits = all[first..].to_vec();
+    // `strconv` drops trailing zeros at the shortest precision, and it does not move the
+    // point when it does: `100` is the digit `1` at `dp = 3`, not the digits `100` at 3.
+    while digits.last() == Some(&'0') {
+        digits.pop();
+    }
+    let dp = point as isize - first as isize;
+    let exp = dp - 1;
+    let digits: String = digits.iter().collect();
+
+    let rendered = if !(-4..6).contains(&exp) {
+        // Exponent form: one leading digit, a fraction only when there is one, and an
+        // exponent of at least two digits -- Go's width, from `1e+06` to `1e+308`.
+        let mantissa = match digits.split_at(1) {
+            (head, "") => head.to_string(),
+            (head, tail) => format!("{head}.{tail}"),
+        };
+        let (esign, emag) = if exp < 0 { ('-', -exp) } else { ('+', exp) };
+        let emag = emag as usize;
+        if emag < 100 {
+            format!("{mantissa}e{esign}{emag:02}")
+        } else {
+            format!("{mantissa}e{esign}{emag}")
+        }
+    } else if dp <= 0 {
+        format!("0.{}{digits}", "0".repeat(-dp as usize))
+    } else if dp as usize >= digits.len() {
+        format!("{digits}{}", "0".repeat(dp as usize - digits.len()))
+    } else {
+        let (head, tail) = digits.split_at(dp as usize);
+        format!("{head}.{tail}")
+    };
+    format!("{sign}{rendered}")
+}
+
 /// `collectUnknownJSONFields`, arm by arm.
 fn collect(raw: &Doc, target: &Schema, path: &str, issues: &mut Vec<String>) {
     match target {
@@ -478,6 +625,7 @@ fn append_json_path(path: &str, segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::doc::from_json;
 
@@ -501,6 +649,79 @@ mod tests {
             issues.is_empty(),
             "the default table carries keys the schema refuses: {issues:?}"
         );
+    }
+
+    /// What the decode of `Channel.allow_from` holds for a file that says `value`, through the
+    /// stage that actually runs it. `None` means the key is not in the loaded value at all.
+    fn flexible(value: &str) -> Option<Doc> {
+        let mut document = doc(&format!(
+            r#"{{"version":3,"channel_list":{{"telegram":{{"allow_from":{value}}}}}}}"#
+        ));
+        crate::channels::init_channel_list(&mut document, &schema())
+            .expect("telegram is a known channel type");
+        document
+            .path(&["channel_list", "telegram", "allow_from"])
+            .cloned()
+    }
+
+    fn strings(items: &[&str]) -> Doc {
+        Doc::Array(
+            items
+                .iter()
+                .map(|s| Doc::String((*s).to_string()))
+                .collect(),
+        )
+    }
+
+    /// The two arms that make a scalar a list at all. A port that only *accepts* a scalar keeps
+    /// the file's bytes and fails every corpus case that reaches the field.
+    #[test]
+    fn a_flexible_slice_wraps_a_bare_string_or_number() {
+        assert_eq!(flexible(r#""alice""#), Some(strings(&["alice"])));
+        assert_eq!(flexible("123456789"), Some(strings(&["123456789"])));
+    }
+
+    /// Elements are formatted one at a time and the arms differ: a number takes `%.0f`, which
+    /// rounds half to even (1.5 and 2.5 are both `2`) and keeps the sign of a value that rounds
+    /// to zero (-0.4 is `-0`), while anything else takes `%v` -- hence `true`, `<nil>`, and Go's
+    /// map and slice syntax. Byte-for-byte the corpus case
+    /// `a_flexible_string_slice_formats_its_elements_individually`.
+    #[test]
+    fn a_flexible_slice_formats_each_element_by_its_own_kind() {
+        assert_eq!(
+            flexible(r#"[1.5,2.5,-0.4,true,null,{"a":1},"s",["x"]]"#),
+            Some(strings(&[
+                "2", "2", "-0", "true", "<nil>", "map[a:1]", "s", "[x]"
+            ]))
+        );
+    }
+
+    /// `null` is answered before every other arm and sets the slice to nil, so it is not a
+    /// one-element list -- and a nil slice under `omitempty` is not in the loaded value at all.
+    /// The empty string beside it is a value and does survive as `[""]`.
+    #[test]
+    fn a_null_flexible_slice_is_nil_not_a_one_element_list() {
+        assert_eq!(flexible("null"), None);
+        assert_eq!(flexible(r#""""#), Some(strings(&[""])));
+    }
+
+    /// The second site, and the reason the settings walk cannot be the root walk. A channel's
+    /// `settings` is a raw node that `InitChannelList` decodes by JSON rules, so the same type
+    /// is reached at a different depth through a different schema -- the per-type one, which is
+    /// the only place `channels` and `request_caps` exist.
+    #[test]
+    fn a_flexible_slice_inside_channel_settings_is_coerced_by_the_settings_decode() {
+        let mut document = doc(
+            r#"{"version":3,"channel_list":{"irc":{"settings":{"channels":"picoclaw","request_caps":9}}}}"#,
+        );
+        crate::channels::init_channel_list(&mut document, &schema())
+            .expect("`irc` is a known channel type");
+        let settings = document
+            .path(&["channel_list", "irc", "settings"])
+            .cloned()
+            .expect("`irc` settings must survive the stage");
+        assert_eq!(settings.get("channels"), Some(&strings(&["picoclaw"])));
+        assert_eq!(settings.get("request_caps"), Some(&strings(&["9"])));
     }
 
     #[test]
@@ -573,5 +794,61 @@ mod tests {
         let document = doc(r#"{"bogus":1}"#);
         let err = validate_against(&document, &schema()).expect_err("bogus must be refused");
         assert_eq!(err, ["bogus"]);
+    }
+
+    /// The notation rule, replayed against Go's own output.
+    ///
+    /// `tests/fixtures/go_percent_v.txt` is `<float64 bits in hex> <go's %v>`, one value
+    /// per line, produced by a throwaway Go program over the boundary set (`0`, `±0`,
+    /// `±Inf`, `NaN`, every value at each side of both switch points, the subnormals,
+    /// `MaxFloat64`) plus a seeded random spread so the interior is covered too. It is
+    /// checked in as bytes rather than transcribed, because the whole point of the fixture
+    /// is that the boundary is not something this file remembers.
+    ///
+    /// The digits themselves are not in question -- Rust's shortest decimal and Go's agree
+    /// on every one of the 228 rows -- so a failure here is a notation failure, not a
+    /// formatting-precision one.
+    #[test]
+    fn go_percent_v_matches_go_across_a_measured_table() {
+        let table = include_str!("../tests/fixtures/go_percent_v.txt");
+        let mut checked = 0;
+        for line in table.lines() {
+            let (bits, want) = line
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("fixture row {line:?} is not `<bits-hex> <go's %v>`"));
+            let value = f64::from_bits(
+                u64::from_str_radix(bits, 16)
+                    .unwrap_or_else(|e| panic!("fixture row {line:?} has no hex bits: {e}")),
+            );
+            let got = go_percent_v(&Doc::Float(value));
+            assert_eq!(got, want, "{value:?} (bits {bits})");
+            checked += 1;
+        }
+        // A fixture that silently stopped being read would pass every loop above by never
+        // running, so the row count is asserted as well.
+        assert_eq!(checked, 228, "the fixture stopped being what it is");
+    }
+
+    /// The two switch points, named rather than left to the table's statistics.
+    ///
+    /// `999_999` and `1_000_000` sit either side of the upper one and `1e-4`/`1e-5` either
+    /// side of the lower, and each pair differs only in notation -- which is exactly the
+    /// distinction `Display` cannot make. These are the four rows a fault that reverted to
+    /// `format!("{f}")` has to fail; the table test alone would also fail, but on a
+    /// generated value whose relevance a reader would have to take on trust.
+    #[test]
+    fn the_notation_switches_at_go_s_two_boundaries() {
+        for (value, want) in [
+            (999_999_f64, "999999"),
+            (1_000_000_f64, "1e+06"),
+            (1e-4, "0.0001"),
+            (1e-5, "1e-05"),
+            (1e15, "1e+15"),
+            (1e20, "1e+20"),
+            (-0.0, "-0"),
+            (1.5, "1.5"),
+        ] {
+            assert_eq!(go_percent_v(&Doc::Float(value)), want, "{value:?}");
+        }
     }
 }

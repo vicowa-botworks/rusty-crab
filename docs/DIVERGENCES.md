@@ -85,6 +85,36 @@ this file as long as observable behaviour is identical. They belong in
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
 
+### A scalar at a document's `registries` is refused by Go and loads here
+
+- Go: `tools.skills.registries` is decoded through the `jsontext` map reader, so a scalar is a
+  type error naming its own line and column -- measured at picoclaw `1a4e1edf`, whose
+  `pkg/config` loader differs from the `01635da3` the review ran at only by `schema_dump.go`
+  and a test file:
+  `config.json type error at line 1, column 3: expected map[string]jsontext.Value but got
+  string`, with the offending line quoted and a caret under the path. A sequence is *not* in
+  that family: it is ignored, and the builtin registries stand at their defaults.
+- Rust: `skills::rebuild` treats a sequence as "ignored, baseline stands" (pinned by
+  `a_non_mapping_registries_node_leaves_the_builtins_standing`, which covers both that and a
+  document `null`) and leaves a scalar in the document untouched rather than refusing it,
+  because this crate has no stage that raises Go's `jsontext` type error at all -- the
+  unknown-field validator reports names, not kinds, and the two sentences differ.
+- Why it is left: inventing a refusal here would be inventing its wording too, and the
+  measured Go sentence -- `config.json type error at line 1, column 1: expected
+  map[string]jsontext.Value but got number`, at picoclaw `01635da3` -- belongs to a loader
+  stage this crate has not ported. The blast radius
+  is a config that should not load, loading with a scalar where a registry map belongs; the
+  registries themselves come back as the baseline's, so nothing silently gains a credential.
+- Closes with: the type-error stage, which is the same missing stage as the `SecureString`
+  number refusal in vicowa-botworks/rusty-crab#15.
+- Recorded: 2026-10-28, #8 round 4. The entry this replaces -- "a null or non-mapping
+  `registries` section cannot be answered without the builtin registries" -- was wrong about
+  its own cause: the names and defaults are in the embedded `defaults.json`, which is the
+  baseline `load` merges into, so both arms were four lines each and they are now landed
+  (`normalise_document` for the document side, the null-header wipe for the file's).
+
+
+
 ### `crates/crab-config` loads a non-mapping value *inside* a legacy skills key
 
 - Go: `applyLegacySkillsSecurityNode` (`pkg/config/security.go:124`) decodes every value in
@@ -114,6 +144,30 @@ this file as long as observable behaviour is identical. They belong in
   skip exists to avoid.
 - Recorded: 2026-10-27, re-scoped and restored 2026-10-28 (#10 round 3) after this head
   deleted it while the behaviour it describes was still live.
+
+### The version probe's error has no preview block
+
+- Go: the version probe (`config.go:1311`, `json.Unmarshal` into
+  `struct { Version int }`) hands its error to `wrapJSONError` (`diagnostics.go:64`), which
+  for an `UnmarshalTypeError` returns the summary line *and*, when the offset lands on a
+  non-blank line, a second block: `   1 | {"version":"3"}` and a caret under the offending
+  column, dimmed and colour-bolded when `diagnosticsUseColor()` says the stream is a
+  terminal.
+- Rust: `version_type_diagnostic` returns the summary line only. The line, the column, the
+  field name, the expected type and the value word (`string`, `bool`, `number 3.5`) all
+  match; the preview is absent.
+- Why: the preview is a rendering decision, not a decoding one -- it depends on whether
+  stderr is a TTY, and on `trimDiagnosticLine`'s windowing around the caret. The corpus
+  records no error text at all (a failing case adds `error_op_index` and nothing else), so
+  there is nothing to pin it against and everything to get wrong.
+- Blast radius: anyone printing the error sees one line instead of two-then-two, and anyone
+  pattern-matching the *first* line is unaffected. `DiagnosticSummary` in Go strips the
+  preview for logs, so the summary the port does reproduce is the half Go treats as the
+  message.
+- Closes with: a preview renderer in `crab-config` plus a TTY probe, if anything ever needs
+  the two-line form. Nothing in the port prints config errors today.
+- Recorded: 2026-10-28, #11.
+
 
 ### `crates/crab-config` names a migration backup by the UTC date
 
