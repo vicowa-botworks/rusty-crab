@@ -131,11 +131,7 @@ fn run_script(case: &str, ops: &[Op]) -> Value {
             "defaults" => {
                 let document = default_config(home);
                 results.push(json!({"op": op.op, "op_index": index, "value": loaded_value(&document, &schema)}));
-                loaded = Some(crab_config::Config {
-                    document,
-                    needs_version_bump: false,
-                    virtual_models: Vec::new(),
-                });
+                loaded = Some(crab_config::Config::from_document(document));
             }
             "write_file" => {
                 let name = op.name.clone().expect("write_file names a file");

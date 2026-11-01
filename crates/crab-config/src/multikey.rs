@@ -14,10 +14,13 @@
 //! Both the primary entry and each virtual one are built by naming fields, not by
 //! cloning. Two consequences the struct tags do not suggest:
 //!
-//! * **`enabled` is not in the list**, so a multi-key model that was disabled comes back
-//!   enabled. A single-key model is returned *as it was* — the `len(keys) <= 1` arm
-//!   appends the same pointer — so `enabled` survives there and not here. That is Go's
-//!   behaviour and this module reproduces it rather than improving it.
+//! * **`enabled` is not in the list**, so the copy's struct leaves it false where the user
+//!   had written true. A single-key model is returned *as it was* — the `len(keys) <= 1`
+//!   arm appends the same pointer — so its `Enabled` survives. That difference is in the
+//!   struct and not in the file: `enabled` is `omitempty`, so false is dropped and a reader
+//!   sees the absent key as enabled either way. It is stated here because the code reads
+//!   like an oversight otherwise, and because a port that copies `enabled` would diverge
+//!   from Go in memory while matching it on disk.
 //! * **The virtual entries come first.** The loop appends each `name__key_N` and the
 //!   primary is appended after the loop, so a two-key `m1` loads as `[m1__key_1, m1]`,
 //!   not `[m1, m1__key_1]`. Order is observable: it is the order `json.Marshal` writes
@@ -69,9 +72,11 @@ pub(crate) fn expand(document: &mut Doc, schema: &Schema) -> Vec<usize> {
     for entry in source {
         let keys = api_keys(&entry);
         if keys.len() <= 1 {
-            // The same entry, untouched. Not a copy: a single-key model keeps whatever
-            // fields the file gave it, including `enabled`.
-            expanded.push(entry);
+            // The same entry, and not a copy: a single-key model keeps whatever the file
+            // gave it, including `enabled`. "The same entry" is the same *struct*, though,
+            // and a struct marshals every field that is not omitted -- so a file that never
+            // mentioned `provider` still writes `"provider": ""`. Hence materialise.
+            expanded.push(materialise(entry, elem));
             continue;
         }
 
@@ -198,6 +203,61 @@ fn api_keys(entry: &Doc) -> Vec<Doc> {
 }
 
 /// `model_list`'s element schema, the one position this stage reads the dump for.
+/// Rebuilds a `model_list` entry in the order and with the fields `ModelConfig` has.
+///
+/// It fills in what the struct has and the file omitted; it does **not** drop what the file
+/// has and the omit option would. Both directions look like the same job and only one of
+/// them is this function's: emptiness is the marshaller's rule, applied where the bytes are
+/// written, and it is applied to both files. A fault that ignores `field.omit` here passes
+/// the whole corpus, which is the proof that the two are one rule and not two — so the check
+/// lives in `marshal` alone and this function only reorders and fills.
+///
+/// The JSON loader decodes each entry into a struct, and `json.Marshal` then writes every
+/// field whose omit option cannot fire -- `model_name`, `model` and `provider` carry no
+/// option at all, so a config that never mentions `provider` still comes back with
+/// `"provider": ""`. Echoing the file's keys instead gets that wrong in the direction that
+/// matters most for this seam: the port's output is then *smaller* than the document the
+/// shipped binary writes, and a user who loads and saves loses the field from their file.
+///
+/// `api_keys` is carried through untouched rather than projected. It is a `SecureStrings`,
+/// which `encoding/json` never writes -- but the `.security.yml` asks the type directly and
+/// gets the values, and the port renders both files from this one document. Projecting it
+/// away would write a security file with no keys in it, which is the one file that must not
+/// be wrong.
+fn materialise(entry: Doc, elem: &Schema) -> Doc {
+    let stored = match &entry {
+        Doc::Object(entries) => entries.clone(),
+        // Not a mapping. Go's decode would have refused the document before this stage, so
+        // there is no Go behaviour to match and no reason to invent one.
+        _ => return entry,
+    };
+    let lookup = |key: &str| stored.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+
+    let mut out: Vec<(String, Doc)> = Vec::with_capacity(stored.len());
+    for field in elem.json_fields() {
+        let value = lookup(field.json);
+        if field.json == "api_keys" {
+            if let Some(value) = value {
+                out.push((field.json.to_string(), value.clone()));
+            }
+            continue;
+        }
+        let Some(value) = value else {
+            // The field is not in the file. A struct marshals it anyway when no omit option
+            // can fire, which is the whole reason this function exists: `provider` is one of
+            // the three fields with no option, and a config that never mentions it still
+            // writes `"provider": ""`.
+            if field.omit.is_none() {
+                out.push((field.json.to_string(), zero_for(elem, field.json)));
+            }
+            continue;
+        };
+        out.push((field.json.to_string(), value.clone()));
+    }
+    Doc::Object(out)
+}
+
+/// `model_list`'s element schema -- the one position this stage reads the dump for.
 fn model_elem(schema: &Schema) -> Option<&Schema> {
     schema
         .field("model_list")
@@ -232,7 +292,10 @@ mod tests {
         )
         .doc;
         assert!(expand(&mut doc, &config_schema()).is_empty());
-        // The same entry, so `enabled` -- which the copy drops -- is still here.
+        // The document keeps `enabled`. Dropping it is the marshaller's rule, applied where
+        // the bytes are written, and `model_entry_drops_its_empty_optional_fields` pins the
+        // byte-level half -- this one pins that the stage does not pre-empt it. The two
+        // assertions together are the reason there is no omit check in `materialise`.
         assert_eq!(
             doc.get("model_list")
                 .and_then(first)

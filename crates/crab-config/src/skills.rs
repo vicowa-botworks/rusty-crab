@@ -62,6 +62,7 @@
 
 use crate::doc::Doc;
 use crate::yaml::Security;
+use crate::Error;
 
 /// What `SkillRegistryConfig.MarshalJSON` writes for any non-empty `SecureString`.
 const NOT_HERE: &str = "[NOT_HERE]";
@@ -216,12 +217,26 @@ fn scalar_text(node: &Doc) -> String {
 
 /// Applies both passes to a document the JSON loader already settled.
 ///
+/// Hands back the `auth_token` each surviving registry really holds. The document cannot
+/// carry it: `SkillRegistryConfig.MarshalJSON` writes the literal `[NOT_HERE]` for that key,
+/// and the port's document *is* the JSON rendering, so the secret has nowhere to live once
+/// the pass is done. `saveSecurityConfig` writes the other rendering -- `yaml.Marshal` asks
+/// `SecureString` itself, which answers with the value -- so the one file whose entire purpose
+/// is holding secrets would otherwise record a placeholder. Go keeps the real value in the
+/// struct and masks only at marshal time; with the document standing in for the struct, the
+/// mask has to be undone by the save path from this list. Same reason `Config::virtual_models`
+/// exists: state the loader knows and the document cannot hold.
+///
 /// [`normalise_document`] has already run on that path by the time this is called, so the
 /// document's `registries` is a mapping and the baseline arm below cannot fire here. It is
 /// kept identical rather than split in two because the two entry points differ only in
 /// whether the file passes run, and a reader should not have to prove that twice.
-pub fn apply(merged: &mut Doc, security: &Security, baseline: Option<&Doc>) {
-    rebuild(merged, Some(security), baseline);
+pub fn apply(
+    merged: &mut Doc,
+    security: &Security,
+    baseline: Option<&Doc>,
+) -> Result<Vec<(String, String)>, Error> {
+    rebuild(merged, Some(security), baseline)
 }
 
 /// The document-side half on its own: the pass Go runs **during** the JSON unmarshal, before
@@ -255,16 +270,49 @@ pub fn apply(merged: &mut Doc, security: &Security, baseline: Option<&Doc>) {
 /// baseline's *names* at **zero** values, with the document's own registries gone. That one
 /// is pinned by `a_null_registries_header_in_the_file_wipes_to_the_builtins_at_zero_values`;
 /// this pass never wipes, and the two are the easiest pair on this seam to confuse.
-pub fn normalise_document(merged: &mut Doc, baseline: Option<&Doc>) {
-    rebuild(merged, None, baseline);
+pub fn normalise_document(merged: &mut Doc, baseline: Option<&Doc>) -> Vec<(String, String)> {
+    // The `Err` half is unreachable through this entry point: the refusal inside [`rebuild`]
+    // needs a `skills` node *in the security file*, and there is no file here.
+    //
+    // The token list is NOT discarded. This is the pass that masks a document's own
+    // `registries.*.auth_token`, so on its own it is the only place the effective credential
+    // is still in hand -- which stopped being theoretical the moment the migration path
+    // started running it: `load_config_map` merges the security file in as data, so a legacy
+    // `skills.github.token` arrives here already lifted into `registries.github.auth_token`,
+    // and the typed pass that would otherwise collect it is skipped for a migrated document
+    // (`apply_security` returns an empty list under `migrated`). Dropping it wrote the literal
+    // `[NOT_HERE]` into the user's `.security.yml` on the next save -- caught by the corpus
+    // case `security_legacy_token_on_the_migration_path`.
+    rebuild(merged, None, baseline).unwrap_or_default()
 }
 
-fn rebuild(merged: &mut Doc, security: Option<&Security>, baseline: Option<&Doc>) {
+fn rebuild(
+    merged: &mut Doc,
+    security: Option<&Security>,
+    baseline: Option<&Doc>,
+) -> Result<Vec<(String, String)>, Error> {
+    // A value that is not a mapping fails the whole load, and `null` is not one of them.
+    // Go decodes this section into the typed `SkillsToolsConfig`, so yaml.v3 refuses a
+    // scalar, a sequence and a number -- three shapes, three corpus cases, because a port
+    // that handles the scalar still accepts the other two. A null it unmarshals into the
+    // zero value without complaint, which is why "refuse anything that is not an object" is
+    // wrong in the other direction: it rejects `skills: null`, a file the shipped binary
+    // loads. Pinned by `security_skills_null_loads_unchanged`. Gated on there being a file
+    // at all, because the document-side entry point has no `skills` node to refuse.
+    if let Some(file_skills) = security.and_then(|file| file.document.get("skills")) {
+        if !matches!(file_skills, Doc::Object(_) | Doc::Null) {
+            return Err(Error::SecurityType(format!(
+                "cannot unmarshal {} into config.SkillsToolsConfig",
+                go_yaml_kind(file_skills)
+            )));
+        }
+    }
+
     let Some(target) = merged
         .get_mut_at("tools")
         .and_then(|tools| tools.get_mut_at("skills"))
     else {
-        return;
+        return Ok(Vec::new());
     };
 
     // The gate is the *document*, not the security file. Go runs `SkillsRegistriesConfig`'s
@@ -450,11 +498,18 @@ fn rebuild(merged: &mut Doc, security: Option<&Security>, baseline: Option<&Doc>
         }
     }
 
+    let tokens: Vec<(String, String)> = registries
+        .iter()
+        .filter(|(_, registry)| !registry.auth_token.is_empty())
+        .map(|(name, registry)| (name.clone(), registry.auth_token.clone()))
+        .collect();
+
     if registries.is_empty() {
         // Nothing to write, and nothing to create: a document with no `registries` key at all
         // never reaches Go's decoder. A `registries:` header that was present but unreadable
-        // is not this case -- the arms above produced the baseline's entries for it.
-        return;
+        // is not this case -- the arms above produced the baseline's entries for it. The token
+        // list is empty here for the same reason: it is read off `registries` just above.
+        return Ok(tokens);
     }
     let mut out: Vec<(String, Doc)> = registries
         .iter()
@@ -468,6 +523,20 @@ fn rebuild(merged: &mut Doc, security: Option<&Security>, baseline: Option<&Doc>
             Some(slot) => slot.1 = Doc::Object(out),
             None => entries.push(("registries".to_string(), Doc::Object(out))),
         }
+    }
+    Ok(tokens)
+}
+
+/// Go's yaml type name for a node, as it appears in an unmarshal error: `!!str`, `!!int`,
+/// `!!seq`, `!!bool`, `!!float`. Only reached on the refusal above, so the wording is Go's
+/// for whoever reads the message rather than something the corpus grades.
+fn go_yaml_kind(value: &Doc) -> &'static str {
+    match value {
+        Doc::Bool(_) => "!!bool",
+        Doc::Int(_) => "!!int",
+        Doc::Float(_) => "!!float",
+        Doc::Array(_) => "!!seq",
+        _ => "!!str",
     }
 }
 
@@ -531,7 +600,10 @@ mod tests {
     fn registries_after(security_yaml: &str, skills: Vec<(&str, Doc)>) -> Doc {
         let security = crate::yaml::parse(security_yaml).expect("the snippet must parse");
         let mut doc = document(skills);
-        apply(&mut doc, &security, None);
+        // The verdict is not what this helper is for: the refusals have their own tests on
+        // the `Result`. A rejected node leaves the document untouched either way, which is
+        // exactly what the callers below assert.
+        let _ = apply(&mut doc, &security, None);
         doc.path(&["tools", "skills", "registries"])
             .cloned()
             .unwrap_or(Doc::Null)

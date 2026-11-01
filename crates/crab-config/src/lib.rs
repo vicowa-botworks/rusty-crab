@@ -178,10 +178,46 @@ pub struct Config {
     ///
     /// It lives here rather than in the document because a marker key would be a field
     /// the schema does not have, and the loader's own validator refuses those.
-    pub virtual_models: Vec<usize>,
+    pub(crate) virtual_models: Vec<usize>,
+    /// The real `auth_token` behind each `tools.skills.registries` entry, which the
+    /// document holds masked because that is what `MarshalJSON` emits. Only `save` reads
+    /// it: the security file is the YAML rendering, where `SecureString` answers with the
+    /// value rather than the placeholder. See [`skills`].
+    pub(crate) secure_tokens: Vec<(String, String)>,
 }
 
 impl Config {
+    /// A config holding `document` and no loader side-state -- what Go's `DefaultConfig()`
+    /// returns before any file has been read.
+    ///
+    /// The constructor exists so that the two side-state fields can stay `pub(crate)`. They
+    /// are the loader's notes to the save path, not part of a config's value: a caller that
+    /// builds a `Config` by naming every field has to be told which of them are load-bearing
+    /// (`virtual_models` decides what gets written to `config.json`, `secure_tokens` decides
+    /// what lands in `.security.yml`), and a test that leaves both empty by writing
+    /// `Vec::new()` twice is a test that silently cannot exercise either.
+    #[must_use]
+    pub fn from_document(document: Doc) -> Self {
+        Self {
+            document,
+            needs_version_bump: false,
+            virtual_models: Vec::new(),
+            secure_tokens: Vec::new(),
+        }
+    }
+
+    /// Which `model_list` entries the loader invented; see the field's own documentation.
+    #[must_use]
+    pub fn virtual_models(&self) -> &[usize] {
+        &self.virtual_models
+    }
+
+    /// The registry names the loader holds a real token for, in the order it met them.
+    #[must_use]
+    pub fn secure_tokens(&self) -> &[(String, String)] {
+        &self.secure_tokens
+    }
+
     /// The document's `version`, as the loader reads it (absent is 0).
     #[must_use]
     pub fn version(&self) -> i64 {
@@ -227,10 +263,12 @@ impl Config {
 /// pinned against. The split is not cosmetic: the first half happens during Go's JSON
 /// unmarshal, so it runs when there is no `.security.yml` at all.
 ///
-/// One section Go applies is still dropped: `web`, which reaches `tools.web` through
-/// `Tools`' `yaml:",inline"`. That is a divergence and is recorded in `docs/DIVERGENCES.md`
-/// with its real mechanism: the inline branch runs, and `merge_filling` refuses the key
-/// because it asks the root schema what is a field. Refusing both sections instead was the
+/// No section Go applies is dropped any more. `web` reaches `tools.web` through `Tools`'
+/// `yaml:",inline"`, and for that the inline branch has to be handed the schema of the node
+/// it is merging into: `web` is a field of `Tools`, one level down, so a walk that does not
+/// see it walks straight past the section. That was the recorded divergence, and
+/// `the_web_section_of_the_security_file_reaches_tools` is the positive pin -- see that test
+/// for which fault kills which assertion. Refusing both sections instead was the
 /// earlier behaviour and it was worse: every `.security.yml` the shipped binary has ever
 /// written carries them, so refusing made the loader reject the normal case. A key the
 /// struct does not name at all is ignored, because `loadSecurityConfig` calls plain
@@ -255,6 +293,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
                 document: default_config(home),
                 needs_version_bump: false,
                 virtual_models: Vec::new(),
+                secure_tokens: Vec::new(),
             })
         }
         Err(e) => return Err(Error::Io(e.to_string())),
@@ -282,6 +321,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
             document: default_config(home),
             needs_version_bump: false,
             virtual_models: Vec::new(),
+            secure_tokens: Vec::new(),
         });
     }
 
@@ -330,12 +370,11 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // the validated bytes a second time: the merge above already put its keys in `document`.
     validate_against(&document, &config_schema())
         .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
-    // The settings each channel carried *in the file*, before defaults are merged under
-    // it. `Channel.Settings` is a `RawNode`, and a RawNode only ever holds what the file
-    // said -- the defaults live in the typed struct, which is a separate slot. The
-    // security merge deep-merges into the RawNode, so reproducing it needs the file's
-    // settings and not the defaults-filled ones. See [`apply_security_channels`].
-    let file_channel_settings = stored_channel_settings(&document);
+    // That is also why the security file is never folded into the validated bytes a second
+    // time: the merge above already put its keys in `document`. Validating a projection of
+    // the file alongside the document -- the shape used before `load_config_map` existed --
+    // reports one unknown key twice, `config.json contains unknown field(s): nonsense,
+    // nonsense`, the same doubled-seam failure the security *merge* had.
     let mut merged = default_config(home);
     // The baseline `tools.skills.registries` before the document is merged over it. Go decodes
     // the file *into* the defaults, so a document whose `registries` is not a mapping leaves
@@ -346,7 +385,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // `SkillsRegistriesConfig`'s decoder, which Go runs as part of the JSON unmarshal -- that
     // is, before the security file is opened. It is the document-side half of the skills pass
     // and it does not ask whether a `.security.yml` exists; the merge below does.
-    skills::normalise_document(&mut merged, baseline_registries.as_ref());
+    let mut secure_tokens = skills::normalise_document(&mut merged, baseline_registries.as_ref());
 
     // The typed security pass, with the version gate Go puts on it: `LoadConfig` calls
     // `loadSecurityConfig` in `case CurrentVersion` and nowhere else, because the `case
@@ -362,12 +401,15 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // kinds this stage can raise and both name themselves; folding them into `Error::Io`
         // would report a type error as a read failure.
         let security = yaml::parse(text)?;
-        apply_security(
-            &mut merged,
-            &security,
-            &file_channel_settings,
-            baseline_registries.as_ref(),
-        )?;
+        secure_tokens = apply_security(&mut merged, &security, baseline_registries.as_ref())?;
+        // Assigning rather than extending is what the call-site gate buys: the typed pass
+        // rebuilds the same `registries` the document-side pass just rebuilt, so for a
+        // current-version document its list *supersedes* the one above -- the file may have
+        // replaced an entry whose credential was just collected, or wiped the section to the
+        // builtins, and keeping the stale pair would write a credential Go no longer holds.
+        // A migrated document must keep the document-side list, because that is where
+        // `load_config_map` lifted the legacy `skills.github.token` out of the file; this
+        // block never runs for one, so it cannot clobber it.
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before
@@ -391,6 +433,7 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         document: merged,
         needs_version_bump: migrated,
         virtual_models,
+        secure_tokens,
     };
 
     // A migration is not only in memory. Each `case 0..=2` arm of `LoadConfig` runs
@@ -611,9 +654,8 @@ fn number_literal(text: &str, line: usize, column: usize) -> String {
 fn apply_security(
     merged: &mut Doc,
     security: &yaml::Security,
-    file_channel_settings: &BTreeMap<String, Doc>,
     baseline_registries: Option<&Doc>,
-) -> Result<(), Error> {
+) -> Result<Vec<(String, String)>, Error> {
     let schema = schema::config_schema();
 
     // A `model_list` that is not a mapping: the JSON shape copied into a YAML file, or
@@ -702,37 +744,52 @@ fn apply_security(
                     // Two passes of its own, neither of them a merge: see [`skills`].
                     continue;
                 }
-                if let Some(value) = security.document.get(child.json) {
+                // `child.name`, not `child.json`: the file is keyed by the names `yaml.v3`
+                // writes and the document by the JSON tags. See the note on the top-level
+                // lookup below for why that distinction is not pedantry.
+                if let Some(value) = security.document.get(child.name) {
                     if let Some(slot) = target.get_mut_at(child.json) {
-                        merge_filling(slot, value);
+                        merge_filling(slot, value, inner_schema.field(child.json))?;
                     }
                 }
             }
             continue;
         }
-        let Some(value) = security.document.get(field.json) else {
-            continue;
-        };
         // The channel section merges per entry rather than wholesale, and it answers to
-        // either spelling in the file while the document has only one.
+        // either spelling in the file while the document has only one -- so it is handled
+        // before the lookup, which asks for the one name the yaml encoder writes.
         if field.json == "channel_list" {
             let source = security
                 .document
                 .get("channel_list")
                 .or_else(|| security.document.get("channels"));
             if let (Some(source), Some(target)) = (source, merged.get_mut_at("channel_list")) {
-                apply_security_channels(target, source, file_channel_settings);
+                apply_security_channels(target, source)?;
             }
             continue;
         }
+        // The file is keyed by the names `yaml.v3` writes; the document by the JSON tags.
+        // Ninety-odd fields in the dump spell the two differently, because a Go field with
+        // no `yaml:` tag gets the lowercased field name -- `web.searxng.base_url` is
+        // `baseurl` in the file, `agents.defaults.model_name` is `modelname`. Asking the
+        // file for the JSON spelling therefore ignores what the shipped binary reads and
+        // applies what it would ignore, in both directions, silently.
+        let Some(value) = security.document.get(field.name) else {
+            continue;
+        };
         if let Some(target) = merged.get_mut_at(field.json) {
-            merge_filling(target, value);
+            // The schema is threaded for the document's sake, not the corpus's: dropping it
+            // here passes every case in the fixture, because both files are rendered from the
+            // typed struct and the schema, so an invented key never reaches either. It is
+            // kept because Go's struct genuinely does not have the key, and a document that
+            // carries things Go's does not is a document that will diverge the first time
+            // anything renders it raw. `security_unknown_key_reaches_neither_written_file`
+            // is the byte-level half of the same rule.
+            merge_filling(target, value, schema.field(field.json))?;
         }
     }
 
-    skills::apply(merged, security, baseline_registries);
-
-    Ok(())
+    skills::apply(merged, security, baseline_registries)
 }
 
 /// What `loadConfigMap` (migration.go:429) builds: config.json and `.security.yml`
@@ -804,7 +861,32 @@ fn load_config_map(config: &Doc, security: &Doc) -> Result<Doc, Error> {
     Ok(merge_maps(&m1, &m2))
 }
 
-/// Rewrites the legacy `skills` spelling in place into the `registries` shape.
+/// The two registry spellings `migration.go:437-454` performs on the lifted `skills` node.
+///
+/// Both exist because the registry *map* is newer than the file format being migrated: an old
+/// security file spells a registry at the top of `skills`, and the migration rewrites it into
+/// `skills.registries` before anything looks at the result. Skipping the rewrite stopped being
+/// cosmetic the moment `load_config_map`'s output became the bytes the strict validator reads:
+/// `skills` is a **struct** node, so a key that is not one of its fields is refused with
+/// config.json's own sentence -- `config.json contains unknown field(s): tools.skills.clawhub`
+/// -- on exactly the installs the migration exists to serve. Go never refuses them, at either
+/// version.
+///
+/// The two halves are not symmetric, and the asymmetry is the behaviour:
+///
+/// * `clawhub` **replaces** `registries` wholesale (`m["registries"] = map[string]any{"clawhub":
+///   m["clawhub"]}`), so a `registries` the file already carried is discarded when `clawhub` is
+///   present. A `clawhub` that is present but null is left where it is, because the `delete`
+///   sits inside Go's `!= nil` guard -- the one shape the rewrite does not rescue.
+/// * `github` is **copied, not moved**: `skills.github` stays and `registries.github` is a copy
+///   with `auth_token` set from `token` when `token` is there (and `token` itself stays in the
+///   copy). That is the second half of why a legacy `skills.github.token` reaches the registry
+///   twice on the save side.
+/// * a `registries` that is not a mapping is replaced rather than merged into, because Go's type
+///   assertion yields nil and the code then builds a fresh map.
+///
+/// What the rewrite does *not* do is make the node permissive: `skills` stays a struct node, so
+/// a key that is neither one of its fields nor one of these two spellings is still refused.
 fn legacy_skills_as_registries(skills: &mut Doc) {
     let Doc::Object(entries) = skills else { return };
     // Go's guard is `if m["clawhub"] != nil`, and it is load-bearing in both directions.
@@ -942,41 +1024,6 @@ fn merge_maps(destination: &Doc, source: &Doc) -> Doc {
     Doc::Object(out)
 }
 
-/// The `settings` each channel carried in the config file itself, keyed by channel name.
-///
-/// This exists because a channel's settings are stored twice over in Go and only one of
-/// the copies is what the file said. `Channel.Settings` is a `RawNode`, and a `RawNode`
-/// holds exactly the nodes decoded into it; the defaults live in the unexported typed
-/// struct, which is a different slot and is what `Channel.MarshalJSON` emits once
-/// `InitChannelList` has run. The security file merges into the `RawNode`.
-///
-/// So the merge cannot read the document it is handed. By the time the security file is
-/// applied, `merge_over` has already filled the document with defaults, and merging into
-/// *that* produces the defaults plus the secrets file's keys. Go produces the file's keys
-/// plus the secrets file's keys, and the two differ on every field the config left out --
-/// which is most of them, since the settings structs are large and configs are short.
-/// Capturing the pre-merge values here is the only way to see the file's own settings
-/// again.
-///
-/// An empty `settings: {}` is recorded as absent rather than as `{}`. `Channel
-/// ::UnmarshalYAML` drops the typed struct the moment any settings node arrives,
-/// *including an empty one*, so "the file mentioned settings" and "the file mentioned
-/// nothing" are the same state, and both mean the loaded channel has no settings at all.
-/// Go writes that empty map into every `.security.yml`, so it is the ordinary case rather
-/// than an edge.
-fn stored_channel_settings(document: &Doc) -> BTreeMap<String, Doc> {
-    let mut out = BTreeMap::new();
-    let Some(entries) = document.get("channel_list").and_then(Doc::as_object) else {
-        return out;
-    };
-    for (name, channel) in entries {
-        if let Some(settings) = channel.get("settings") {
-            out.insert(name.clone(), settings.clone());
-        }
-    }
-    out
-}
-
 /// Merges the security file's `channel_list` section into the loaded one, per entry.
 ///
 /// `ChannelsConfig.UnmarshalYAML` (:411) walks the file's entries and calls
@@ -985,21 +1032,30 @@ fn stored_channel_settings(document: &Doc) -> BTreeMap<String, Doc> {
 /// that decides what a saved config looks like:
 ///
 /// `settings` lands in a `RawNode`, whose `UnmarshalYAML` (:115) deep-merges into
-/// **the raw bytes the file carried**, not into the defaults -- because the defaults are
-/// not in that slot. Then `Channel.UnmarshalYAML` does `if len(b.Settings) > 0 {
-/// b.extend = nil }`: any settings node at all, *even an empty* `{}`, throws away the
-/// decoded typed struct. `InitChannelList` later rebuilds it from the raw node, so what
-/// comes back is the zero value of every field the merge did not name.
+/// **whatever that channel slot already holds**. The seed is therefore the channel as it
+/// stands after the config document, and that is where the two files part company: a
+/// channel the *config file* names is a fresh map element (`encoding/json` allocates one
+/// per key), so its slot holds the file's node and the security entry merges into the
+/// file's zeros; a channel only the defaults name keeps its default node, so the same
+/// entry merges into the defaults. `security_settings_apply_to_a_channel_the_config_names`
+/// records the first (`media_group_delay_ms: 1234` on a channel whose other settings are
+/// zero), `security_channel_list_entry_merges_into_the_default` the second (`port: 9999`
+/// beside a default `host` the security file never mentioned). Seeding from the file's
+/// settings alone -- what this function did first -- gets the second one wrong and shows
+/// `host: ""`, and no case written against `discord` can see it, because discord's default
+/// settings are an empty map.
 ///
-/// That is why a config that has been saved once comes back with `group_trigger: {}` and
+/// Then `Channel.UnmarshalYAML` does `if len(b.Settings) > 0 { b.extend = nil }`: any
+/// settings node at all, *even an empty* `{}`, throws away the decoded typed struct.
+/// `InitChannelList` later rebuilds it from the raw node into a **fresh** zero struct
+/// (`newChannelSettings`), so what comes back is the merged node and nothing else. That is
+/// why a config that has been saved once comes back with `group_trigger: {}` and
 /// `typing: {}` where a fresh one has `mention_only: true` and `enabled: true`: Go writes
 /// `settings: {}` for every channel into every `.security.yml`, and the next load reads
-/// that empty node as "no settings", not as "keep the defaults". Merging the security
-/// node into the defaults-filled document -- the obvious reading -- keeps every default
-/// and matches Go on no saved config at all.
-fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTreeMap<String, Doc>) {
+/// that empty node as "no settings", not as "keep the defaults".
+fn apply_security_channels(target: &mut Doc, source: &Doc) -> Result<(), Error> {
     let (Some(entries), Some(channels)) = (source.as_object(), target.as_object_mut()) else {
-        return;
+        return Ok(());
     };
     for (name, value) in entries.clone() {
         let position = match channels.iter().position(|(k, _)| k == &name) {
@@ -1013,51 +1069,180 @@ fn apply_security_channels(target: &mut Doc, source: &Doc, file_settings: &BTree
         };
         let channel = &mut channels[position].1;
         if let Some(settings) = value.get("settings") {
-            let mut merged = file_settings
-                .get(&name)
+            let mut merged = channel
+                .get("settings")
                 .cloned()
                 .unwrap_or(Doc::Object(Vec::new()));
-            merge_filling(&mut merged, settings);
+            // No schema here, deliberately. `Channel` keeps `settings` as a `RawNode`, so
+            // the security file's node is merged as data and only later decoded -- through
+            // JSON, into the typed struct, by `InitChannelList`. A key the settings type
+            // does not have is therefore *kept* by this walk and dropped at marshal time,
+            // which is what the corpus records; gating it here would drop it from the
+            // document and change what a later save writes. It also means this call cannot
+            // refuse a shape: the check in `merge_filling` only runs where there is a schema.
+            merge_filling(&mut merged, settings, None)?;
             channel.set("settings", merged);
         }
-        for (key, child) in value.as_object().cloned().unwrap_or_default() {
-            if key == "settings" {
-                continue;
-            }
-            match channel.get_mut_at(&key) {
-                Some(slot) => merge_filling(slot, &child),
-                None => channel.set(&key, child.clone()),
-            }
-        }
+        // Everything else in the entry is dropped, and not by a schema check: every base
+        // field of `Channel` is tagged `yaml:"-"` (config_channel.go:224-231), so the yaml
+        // decoder never reads `enabled`, `type`, `allow_from` or the rest. A security file
+        // can say exactly one thing about a channel, which is its settings.
+        //
+        // That is what makes an entry under an unknown name a refusal rather than a new
+        // telegram channel: `type` in the entry is ignored, `InitChannelList` infers the
+        // type from the map key because the struct's is empty (config_channel.go:738), and
+        // `isValidChannelType` rejects `mychan`. A port that copies the entry's other keys
+        // accepts a file the shipped binary refuses -- and silently turns a secrets file
+        // into a way to enable a channel, which is not what it is for.
     }
+    Ok(())
 }
 
-/// Like [`merge_over`], but a key the schema does not know is dropped instead of added.
+/// The security file's walk: like [`merge_over`], but a key the **target's own** yaml
+/// surface cannot place is dropped rather than added.
 ///
 /// That is the whole difference between the two passes: the JSON document is validated
 /// before it is merged, so an unknown key there is a refusal; the security file is not
-/// validated, so an unknown key there is nothing at all.
-fn merge_filling(base: &mut Doc, overlay: &Doc) {
+/// validated, so an unknown key there is nothing at all. Shape is the exception, and the
+/// other way round: `loadSecurityConfig` runs `yaml.Unmarshal(data, cfg)` over the whole
+/// file, so a node that does not fit its field fails the load -- see [`yaml_accepts`].
+///
+/// `fields` is the schema of the node being merged *into*, and it has to be threaded from
+/// the caller. Asking the top-level `Config` schema instead -- which is what this function
+/// did at every depth until a save case caught it -- is right for nothing below the root:
+/// `brave` is a field of `WebSearchConfig`, `media_group_delay_ms` of `TelegramSettings`,
+/// and neither is a field of `Config`, so both were dropped and the security file's values
+/// never reached the typed decode. The failure is quiet in the worst way: the channel came
+/// back with the zero its own entry had already forced, which is exactly what a port that
+/// ignored the security file entirely records.
+///
+/// `fields` is the yaml surface of the node being merged into, or `None` where there is no
+/// yaml decoder in play at all -- a channel's `settings`, which is stored as a raw node and
+/// decoded later through JSON. `None` means every key is readable, and that is a claim about
+/// Go, not an absence of one: an unknown key inside `settings` survives the merge and is
+/// dropped at marshal time, which is what the corpus records.
+///
+/// Visibility comes from `yaml_fields`, never from the JSON list. `tools.web.brave` has
+/// three JSON fields and one yaml field, and a secrets file can set exactly the one.
+fn merge_filling(base: &mut Doc, overlay: &Doc, fields: Option<&Schema>) -> Result<(), Error> {
+    // Go never merges this file into anything: `loadSecurityConfig` runs
+    // `yaml.Unmarshal(data, cfg)` over the whole document into the typed config first, and
+    // `yaml.v3` refuses a node whose shape does not fit the field it lands on. So a
+    // position with a schema has to be shape-checked here, before the merge walk decides
+    // the value is fine to place.
+    if let Some(schema) = fields {
+        if !yaml_accepts(overlay, schema) {
+            return Err(Error::SecurityType(format!(
+                "cannot unmarshal {} into {}",
+                node_kind(overlay),
+                schema_type(schema)
+            )));
+        }
+    }
     let (Some(base_entries), Some(overlay_entries)) = (base.as_object_mut(), overlay.as_object())
     else {
         // Not an object on both sides, so there is nothing to fill: the security value
         // is the whole new value for this position, exactly as Go's yaml decode assigns
         // the decoded node rather than merging into what was there.
         *base = overlay.clone();
-        return;
+        return Ok(());
     };
-    let schema = schema::config_schema();
     let overlay_entries = overlay_entries.clone();
     for (k, v) in &overlay_entries {
-        if schema.field(k).is_none() && !matches!(k.as_str(), "settings" | "api_keys") {
-            // Not a field of the target type. Go's yaml decode has no place for it and
+        // The overlay carries the names `yaml.v3` wrote; the base is the JSON document. So
+        // the file's key is translated before anything asks the schema about it -- otherwise
+        // the gate below passes on `baseurl` and the merge then hunts for a JSON field called
+        // `baseurl`, finds none, and appends a key no rendering of the config can produce.
+        let field = fields.and_then(|schema| schema.yaml_fields().iter().find(|f| f.name == *k));
+        if fields.is_some() && field.is_none() {
+            // Not a field the yaml decoder can place. Go's decode has no place for it and
             // moves on; the JSON path would have refused the same key.
             continue;
         }
-        match base_entries.iter_mut().find(|(bk, _)| bk == k) {
-            Some(slot) => merge_filling(&mut slot.1, v),
-            None => base_entries.push((k.clone(), v.clone())),
+        let key = field.map_or(k.as_str(), |f| f.json);
+        let child = fields.and_then(|schema| schema.field(key));
+        match base_entries.iter_mut().find(|(bk, _)| bk.as_str() == key) {
+            Some(slot) => merge_filling(&mut slot.1, v, child)?,
+            // The key is not in the document yet, which changes nothing about the shape
+            // check: Go's decode refuses the node against the field's type whether or not
+            // there was anything to merge into, so an absent `api_keys` holding a mapping is
+            // still `cannot unmarshal !!map into []config.SecureString`. Going through the
+            // merge rather than pushing directly is what makes that true here -- `Doc::Null`
+            // takes the whole overlay, exactly as the push did.
+            None => {
+                let mut slot = Doc::Null;
+                merge_filling(&mut slot, v, child)?;
+                base_entries.push((key.to_string(), slot));
+            }
         }
+    }
+    Ok(())
+}
+
+/// Does `yaml.v3` have anywhere to put this node?
+///
+/// Only the two shapes the corpus measures are refused, and the rule is deliberately
+/// narrower than "does the type fit": a `null` is Go's zero value and is never a complaint
+/// (`security_skills_null_loads_unchanged`), and a scalar into an `int` is a third refusal
+/// no case pins, so it is left alone rather than guessed at. What is pinned is a non-mapping
+/// where a struct belongs (`security_scalar_where_a_struct_belongs`) and a mapping where a
+/// slice belongs (`security_map_where_a_sequence_belongs`) -- both refused by the shipped
+/// binary, both previously overwritten here.
+fn yaml_accepts(node: &Doc, schema: &Schema) -> bool {
+    if matches!(node, Doc::Null) {
+        return true;
+    }
+    // Defensive, and unreachable today: probed by panicking on this branch and running the
+    // whole suite (72 unit, 73 conformance, 3 golden), which never reached it. It stays
+    // because the exemption is a property of the Go type, not of the corpus -- a position
+    // whose type has its own `(Unm|M)arshalYAML` decides its own shape, and the generic walk
+    // has no business judging it (`SecureString` takes a bare scalar, `SecureModelList` and
+    // `SkillsRegistriesConfig` each project to something the field list does not describe).
+    // The first one this walk does reach through a schema has to arrive with a case, not
+    // with this branch already graded green.
+    let custom = match schema {
+        Schema::Struct { marshaler, .. } | Schema::Map { marshaler, .. } => *marshaler,
+        Schema::Slice { marshaler, .. } => *marshaler,
+        Schema::Scalar { .. } => true,
+    };
+    if custom {
+        return true;
+    }
+    match schema {
+        Schema::Struct { .. } | Schema::Map { .. } => matches!(node, Doc::Object(_)),
+        Schema::Slice { .. } => matches!(node, Doc::Array(_)),
+        Schema::Scalar { .. } => true,
+    }
+}
+
+/// The node's shape, in the words `yaml.v3` uses in its `TypeError`.
+fn node_kind(node: &Doc) -> &'static str {
+    match node {
+        Doc::Null => "!!null",
+        Doc::Bool(_) => "!!bool",
+        Doc::Int(_) => "!!int",
+        Doc::Float(_) => "!!float",
+        Doc::String(_) => "!!str",
+        Doc::Array(_) => "!!seq",
+        Doc::Object(_) => "!!map",
+    }
+}
+
+/// The Go type a position decodes into, or the shape it wanted when the dump names none.
+fn schema_type(schema: &Schema) -> String {
+    let name = match schema {
+        Schema::Struct { name, .. } | Schema::Map { name, .. } | Schema::Slice { name, .. } => {
+            *name
+        }
+        Schema::Scalar { name, .. } => *name,
+    };
+    match name {
+        Some(name) => name.to_string(),
+        None => match schema {
+            Schema::Struct { .. } | Schema::Map { .. } => "a mapping".to_string(),
+            Schema::Slice { .. } => "a sequence".to_string(),
+            Schema::Scalar { .. } => "a scalar".to_string(),
+        },
     }
 }
 
@@ -1100,35 +1285,96 @@ pub fn save(path: &Path, cfg: &mut Config, _home: &str) -> Result<Vec<String>, E
     // `m1__key_1:0: {api_keys: [sk-2]}`, and the next load then finds a model the user
     // never wrote and merges a secret under it.
     let filtered = hide_virtual_models(cfg);
+    let masked = unmask_registry_tokens(cfg);
 
     let security_path = path.with_file_name(SECURITY_FILE);
-    // Everything that can fail happens inside the helper, and the list goes back
-    // unconditionally afterwards. Go restores on a `defer`, so its caller is left holding a
-    // whole config even when the save fails; the `?`s this used to carry returned early with
-    // the caller's real models still removed, and the next `save` on that same config would
-    // then write a `model_list` missing every virtual entry's primary.
-    let rendered = write_security_then_marshal(cfg, &security_path);
+    // Everything that can fail is inside the block below, and both undo steps run after it
+    // whichever way it ends. Go restores the model list on a `defer`, so its caller is left
+    // holding a whole config even when the save fails; the `?`s this used to carry returned
+    // early with the caller's real models still removed, and the next `save` on that config
+    // would write a `model_list` missing every virtual entry's primary.
+    //
+    // The mask is the worse half of the same mistake. The document is the JSON rendering, so
+    // a registry left holding its real token after a failed save renders that secret into
+    // anything that reads the loaded value afterwards -- which is why the mask goes back on
+    // the failure path too, and why it goes back *before* `config.json` is marshalled on the
+    // success path, exactly where Go puts it.
+    //
+    // The corpus cannot reach any of this: no recorded case fails a write, so a fixture run
+    // grades the success path only. `ENOSPC`, `EACCES` or `EROFS` on `.security.yml` is the
+    // route, and a retry after a failed write is the normal flow, not an exotic one.
+    let mut pending = Some(masked);
+    let outcome = (|| -> Result<(String, String), Error> {
+        let schema = schema::config_schema();
+        let security = yaml::write(&cfg.document, &schema)?;
+        write_atomic(&security_path, &security)?;
+        if let Some(tokens) = pending.take() {
+            remask_registry_tokens(cfg, tokens);
+        }
+        Ok((security, marshal::config_file(&cfg.document, &schema)?))
+    })();
+    if let Some(tokens) = pending.take() {
+        remask_registry_tokens(cfg, tokens);
+    }
     restore_model_list(cfg, filtered);
-    let (security, document) = rendered?;
+    let (security, document) = outcome?;
     write_atomic(path, &document)?;
 
     Ok(vec![security, document])
 }
 
-/// The first two of `SaveConfig`'s three steps, in Go's order: the security file from the
-/// filtered document, then the marshalled `config.json` bytes.
+/// Swaps the real `auth_token` into every registry the loader recorded a token for, and
+/// hands back what was there, so the caller can put the placeholders back.
 ///
-/// The config file is not written here. It is the caller's last step, so that the filtered
-/// list can be put back before the write that ends the save.
-fn write_security_then_marshal(
-    cfg: &Config,
-    security_path: &Path,
-) -> Result<(String, String), Error> {
-    let schema = schema::config_schema();
-    let security = yaml::write(&cfg.document, &schema)?;
-    write_atomic(security_path, &security)?;
-    let document = marshal::config_file(&cfg.document, &schema)?;
-    Ok((security, document))
+/// The document is the JSON rendering, where `SkillRegistryConfig.MarshalJSON` writes the
+/// literal `[NOT_HERE]` for that key -- which is exactly what the loaded value must show. The
+/// security file is the *other* rendering: `yaml.Marshal` asks `SecureString` itself and gets
+/// the value. Writing the file straight from the document therefore records a placeholder in
+/// the one file whose entire purpose is holding the secret, and the next load then reads back
+/// a registry whose token is the string `[NOT_HERE]`.
+fn unmask_registry_tokens(cfg: &mut Config) -> Vec<(String, String)> {
+    let mut previous = Vec::new();
+    let Some(registries) = cfg
+        .document
+        .get_mut_at("tools")
+        .and_then(|tools| tools.get_mut_at("skills"))
+        .and_then(|skills| skills.get_mut_at("registries"))
+        .and_then(Doc::as_object_mut)
+    else {
+        return previous;
+    };
+    for (name, token) in &cfg.secure_tokens {
+        let Some(entry) = registries.iter_mut().find(|(key, _)| key == name) else {
+            continue;
+        };
+        if let Some(slot) = entry.1.get_mut_at("auth_token") {
+            // Always the placeholder -- `to_doc` is the only writer of this key -- so
+            // reading it back as text is exact rather than a lossy coercion.
+            previous.push((name.clone(), slot.as_str().unwrap_or_default().to_string()));
+            *slot = Doc::String(token.clone());
+        }
+    }
+    previous
+}
+
+/// The inverse of [`unmask_registry_tokens`], run before `config.json` is marshalled.
+fn remask_registry_tokens(cfg: &mut Config, previous: Vec<(String, String)>) {
+    let Some(registries) = cfg
+        .document
+        .get_mut_at("tools")
+        .and_then(|tools| tools.get_mut_at("skills"))
+        .and_then(|skills| skills.get_mut_at("registries"))
+        .and_then(Doc::as_object_mut)
+    else {
+        return;
+    };
+    for (name, value) in previous {
+        if let Some(entry) = registries.iter_mut().find(|(key, _)| key == &name) {
+            if let Some(slot) = entry.1.get_mut_at("auth_token") {
+                *slot = Doc::String(value);
+            }
+        }
+    }
 }
 
 /// Removes the loader-created `model_list` entries and hands back what was taken, so the
@@ -1659,12 +1905,136 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Go decodes the whole `.security.yml` into the typed config *before* anything is
+    /// merged, so a node that does not fit the field it lands on fails the load. The port
+    /// overwrote the node instead, which is the direction that loses data without saying so.
+    ///
+    /// `security_scalar_where_a_struct_belongs` and `security_map_where_a_sequence_belongs`
+    /// record both refusals as Go's bytes; the two accepted siblings are here because a
+    /// blanket "not a mapping" refusal is wrong in Go's unfavourable direction -- a `null`
+    /// decodes to the zero value without ever asking for a mapping, and a real sequence of
+    /// keys is what the writer emits.
+    #[test]
+    fn a_security_node_that_does_not_fit_its_field_fails_the_load() {
+        for (body, refused) in [
+            ("web:\n    brave: oops\n", true),
+            ("web:\n    brave:\n        api_keys: {a: b}\n", true),
+            ("web:\n    brave: null\n", false),
+            ("web:\n    brave:\n        api_keys: [bk]\n", false),
+        ] {
+            let (dir, path) = write_temp(r#"{"version":3}"#);
+            std::fs::write(dir.path().join(SECURITY_FILE), body).expect("security file");
+            let outcome = load(&path, "/home/oracle");
+            if refused {
+                assert!(
+                    matches!(outcome, Err(Error::SecurityType(_))),
+                    "{body:?} should be refused, got {outcome:?}"
+                );
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "{body:?} should load, got {:?}",
+                    outcome.err()
+                );
+            }
+        }
+    }
+
     fn write_temp(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("config.json");
         let mut file = std::fs::File::create(&path).expect("create");
         file.write_all(body.as_bytes()).expect("write");
         (dir, path)
+    }
+
+    /// The invariant the security merge's readability gate rests on.
+    ///
+    /// `YamlField` carries two spellings on purpose -- `json`, the key in the document, and
+    /// `name`, the key `yaml.v3` writes -- and `.security.yml` is written and read in the
+    /// second one while `config.json` holds the first. The gate therefore has to compare the
+    /// file's key against `name` and then merge into `json`, which is what the code does.
+    ///
+    /// Today the two columns agree for **every field this path can gate**, because each of
+    /// them carries an explicit `yaml:"snake_case"` tag; 96 of the dump's 260 yaml fields do
+    /// not, and they are all in subtrees the walk never enters with a schema. That is why the
+    /// 73 cases cannot see the distinction and why this assertion exists instead: the first
+    /// extension that reaches an untagged Go struct through a schema silently changes which
+    /// keys are readable, and this fails loudly at the schema instead of grading green on the
+    /// wrong column. `ModelConfig` is the known exclusion -- a security entry is read for
+    /// `api_keys` alone, on both the current-version path and the migration one -- so it is
+    /// named rather than silently skipped.
+    #[test]
+    fn every_field_the_security_gate_reads_is_spelled_the_same_in_both_files() {
+        fn walk(schema: &Schema, path: &str, out: &mut Vec<String>) {
+            for field in schema.yaml_fields() {
+                if field.json != field.name {
+                    out.push(format!(
+                        "{path}.{} is written as `{}`",
+                        field.json, field.name
+                    ));
+                }
+                if let Some(child) = schema.field(field.json) {
+                    walk(child, &format!("{path}.{}", field.json), out);
+                    if let Some(elem) = child.elem() {
+                        walk(elem, &format!("{path}.{}[]", field.json), out);
+                    }
+                }
+            }
+        }
+
+        let schema = config_schema();
+        let mut drifted = Vec::new();
+        for field in schema.yaml_fields() {
+            if field.json == "model_list" {
+                continue;
+            }
+            if field.json != field.name {
+                drifted.push(format!(
+                    "{}.{} is written as `{}`",
+                    "config", field.json, field.name
+                ));
+            }
+            if let Some(child) = schema.field(field.json) {
+                walk(child, field.json, &mut drifted);
+                if let Some(elem) = child.elem() {
+                    walk(elem, &format!("{}[]", field.json), &mut drifted);
+                }
+            }
+        }
+
+        assert!(
+            drifted.is_empty(),
+            "the security merge gates readability on YamlField.name and merges into YamlField.json, which is only behaviour-neutral while the two agree. These gated fields now disagree, so a `.security.yml` key stops being readable (or becomes readable) depending on which column is asked: {drifted:?}"
+        );
+    }
+
+    /// The security walk has exactly three sections it can be asked about, and the tail of
+    /// its loop -- the lookup that asks the file for a field by its yaml spelling -- is
+    /// therefore unreachable today: `model_list` and `channel_list` are each handled before
+    /// it, and `tools` is inlined so it never appears as a key of its own.
+    ///
+    /// Asserted rather than commented because the branch is not wrong, only unwitnessed: a
+    /// fourth yaml section in the dump would make it live, and no case would say so. The
+    /// corpus pins the boundary from the other side --
+    /// `security_agents_section_is_not_readable_from_the_file` records that a section outside
+    /// these three is not merely unknown to the decoder but `yaml:"-"` and unreadable, so a
+    /// port that walked the JSON field list would apply `agents` and diverge on every field
+    /// inside it.
+    #[test]
+    fn the_security_walk_has_exactly_the_three_sections_it_handles() {
+        let mut names: Vec<&str> = config_schema()
+            .yaml_fields()
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["channel_list", "model_list", "tools"],
+            "a fourth yaml section makes apply_security's tail lookup live, unwitnessed, and \
+             in need of a case before it is trusted"
+        );
     }
 
     #[test]
@@ -1972,6 +2342,67 @@ mod tests {
                 .map(Vec::len),
             Some(2),
             "the failed save left the caller's config with its virtual entries filtered out"
+        );
+    }
+
+    /// The secret half of the same promise, and the one no `save`-op case can grade.
+    ///
+    /// `save` swaps each registry's real `auth_token` into the document so the yaml writer
+    /// can print it -- the document normally holds the `[NOT_HERE]` placeholder that
+    /// `SkillRegistryConfig.MarshalJSON` produces -- and puts the placeholder back before
+    /// `config.json` is marshalled. On the failure path that is a *second* restore, and
+    /// without it the caller keeps a document that renders its own credential: the loaded
+    /// value prints it, and the retry writes it into `config.json`, the file that is not the
+    /// secrets file. The model-list half above cannot see this; the two restores are
+    /// different calls on different paths.
+    #[test]
+    fn a_failed_save_does_not_hand_back_a_real_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"version\":3,\"tools\":{\"skills\":{\"registries\":{\"github\":",
+                "{\"enabled\":true,\"base_url\":\"https://github.com\"}}}}}"
+            ),
+        )
+        .expect("write config.json");
+        // The token has to arrive through the security file. A token the *document* carries
+        // is already in the document as its real text -- the placeholder is a rendering rule,
+        // not a stored one -- so only a file-sourced token is the one `save` swaps in and
+        // back out.
+        std::fs::write(
+            dir.path().join(SECURITY_FILE),
+            "skills:\n  registries:\n    github:\n      auth_token: ghp_sec\n",
+        )
+        .expect("write .security.yml");
+        let mut cfg = load(&path, "/home/oracle").expect("the config must load");
+
+        let token = |cfg: &Config| {
+            cfg.document
+                .get("tools")
+                .and_then(|tools| tools.get("skills"))
+                .and_then(|skills| skills.get("registries"))
+                .and_then(|registries| registries.get("github"))
+                .and_then(|github| github.get("auth_token"))
+                .and_then(Doc::as_str)
+                .map(str::to_string)
+        };
+        assert_eq!(
+            token(&cfg).as_deref(),
+            Some("[NOT_HERE]"),
+            "the loaded document must hold the placeholder, not the credential"
+        );
+
+        let unwritable = dir.path().join("gone/config.json");
+        assert!(
+            save(&unwritable, &mut cfg, "/home/oracle").is_err(),
+            "a missing directory must fail the save"
+        );
+        assert_eq!(
+            token(&cfg).as_deref(),
+            Some("[NOT_HERE]"),
+            "the failed save handed the caller a document holding its own token"
         );
     }
 
@@ -2286,6 +2717,46 @@ mod tests {
     }
 
     #[test]
+    fn the_web_section_of_the_security_file_reaches_tools() {
+        // `Tools` is `yaml:",inline"`, so the file's top-level `web:` is a `tools` field and Go
+        // applies it. This port reached the section and then dropped it, because the inline walk
+        // resolved field knowledge at the root: `web` is a field of `Tools`, one level down. The
+        // entry recording that in `docs/DIVERGENCES.md` is deleted by this commit and this is the
+        // pin that replaced it.
+        //
+        // What each fault costs, measured one fault per run with the other 102 lib tests green:
+        // leaving `web` out of the inline walk fails this test *and*
+        // `a_security_node_that_does_not_fit_its_field_fails_the_load`; handing `merge_filling`
+        // the *root* schema fails the same two; handing it no child schema fails only the refusal
+        // test. So the walk has two witnesses and this is not a unique one -- what this
+        // assertion alone owns is that the value **lands with the right shape**, which the
+        // refusal test does not claim either way.
+        //
+        // The `skills` half of the same section is deliberately not asserted here: it never goes
+        // through `merge_filling` -- `skills::apply` rebuilds it -- and its own tests, starting at
+        // `a_null_registries_header_in_the_file_wipes_to_the_builtins_at_zero_values`, pin what
+        // the file's `skills` node does to the registries.
+        let (_dir, path) = write_pair(
+            ONE_MODEL,
+            "web:\n  brave:\n    api_keys: [bk-from-security]\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        let tools = cfg.document.get("tools").expect("tools is in the defaults");
+        let api_keys: Vec<&str> = tools
+            .get("web")
+            .and_then(|w| w.get("brave"))
+            .and_then(|b| b.get("api_keys"))
+            .and_then(Doc::as_array)
+            .map(|items| items.iter().filter_map(Doc::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            api_keys,
+            vec!["bk-from-security"],
+            "the security file's search key lands on `tools.web.brave.api_keys`"
+        );
+    }
+
+    #[test]
     fn web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema() {
         // `Tools` is `yaml:",inline"`, so the file's top-level `web:` and `skills:` are
         // `tools` fields and Go applies them. This port reaches them -- `apply_security`
@@ -2293,32 +2764,35 @@ mod tests {
         // them, because `merge_filling` still asks the *root* schema whether a key is a
         // field, and `web` is a field of `Tools`, not of `Config`.
         //
-        // So this test pins the divergence, not the goal: it fails the day the gate is
-        // threaded with the target's schema, and the day it does, `docs/DIVERGENCES.md`
-        // loses the entry and these three assertions turn into the merge they describe.
-        // Recorded here rather than only in the doc because the doc claimed a mechanism
-        // (`apply_security` merges only the two named sections) that the code no longer has.
+        // What each fault costs, measured one fault per run with the other 102 lib tests green:
+        // leaving `web` out of the inline walk fails this test *and*
+        // `a_security_node_that_does_not_fit_its_field_fails_the_load`; handing `merge_filling`
+        // the *root* schema fails the same two; handing it no child schema fails only the refusal
+        // test. So the walk has two witnesses and this is not a unique one -- what this
+        // assertion alone owns is that the value **lands with the right shape**, which the
+        // refusal test does not claim either way.
+        //
+        // The `skills` half of the same section is deliberately not asserted here: it never goes
+        // through `merge_filling` -- `skills::apply` rebuilds it -- and its own tests, starting at
+        // `a_null_registries_header_in_the_file_wipes_to_the_builtins_at_zero_values`, pin what
+        // the file's `skills` node does to the registries.
         let (_dir, path) = write_pair(
             ONE_MODEL,
-            "web:\n  brave:\n    api_keys: [bk-from-security]\nskills:\n  github:\n    auth_token: gh-from-security\n",
+            "web:\n  brave:\n    api_keys: [bk-from-security]\n",
         );
         let cfg = load(&path, "/home/oracle").expect("the pair loads");
         let tools = cfg.document.get("tools").expect("tools is in the defaults");
+        let api_keys: Vec<&str> = tools
+            .get("web")
+            .and_then(|w| w.get("brave"))
+            .and_then(|b| b.get("api_keys"))
+            .and_then(Doc::as_array)
+            .map(|items| items.iter().filter_map(Doc::as_str).collect())
+            .unwrap_or_default();
         assert_eq!(
-            tools
-                .get("web")
-                .and_then(|w| w.get("brave"))
-                .and_then(|b| b.get("api_keys")),
-            None,
-            "the security key does not land -- docs/DIVERGENCES.md"
-        );
-        assert_eq!(
-            tools
-                .get("skills")
-                .and_then(|s| s.get("github"))
-                .and_then(|g| g.get("auth_token")),
-            None,
-            "nor the registry token -- docs/DIVERGENCES.md"
+            api_keys,
+            vec!["bk-from-security"],
+            "the security file's search key lands on `tools.web.brave.api_keys`"
         );
     }
 
