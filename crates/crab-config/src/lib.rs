@@ -129,6 +129,21 @@ pub enum Error {
     /// migration ladder; reading it as "no version" would run the ladder over a document
     /// the shipped binary refuses.
     VersionType(String),
+    /// A value whose shape the type Go decodes it into cannot hold.
+    ///
+    /// Go raises this from its own typed decoder, and its sentence names a line, a column and
+    /// a quoted excerpt of the file:
+    ///
+    /// ```text
+    /// config.json type error at line 1, column 2: expected []*config.SecureString but got number
+    /// ```
+    ///
+    /// This crate keeps no byte offsets, so the payload is Go's `expected ... but got ...` tail
+    /// with the dotted path it refused appended. No case pins that wording: a refusing corpus
+    /// case records `error_op_index` and nothing else, so the shape of the value is graded and
+    /// the sentence is not. Saying so here is what keeps a later reader from quoting this as
+    /// Go's text -- the measurements behind it are in `schema.rs`, beside the type.
+    TypeMismatch(String),
     /// A behaviour this crate does not implement yet, reached by real input.
     ///
     /// It exists so "not ported" is an answer rather than a guess: the alternative is
@@ -153,6 +168,7 @@ impl std::fmt::Display for Error {
                 write!(f, "failed to parse security config: {m}")
             }
             Self::VersionType(m) => write!(f, "{m}"),
+            Self::TypeMismatch(m) => write!(f, "config.json type error: {m}"),
             Self::NotPorted(m) => write!(f, "not ported: {m}"),
             Self::Channel(m) => write!(f, "{m}"),
             Self::Io(m) => write!(f, "{m}"),
@@ -370,6 +386,19 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // the validated bytes a second time: the merge above already put its keys in `document`.
     validate_against(&document, &config_schema())
         .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
+    // Go's decode is typed, so a shape it cannot place fails the load with its own sentence,
+    // and it checks *every* field. This walk checks the one named type where being permissive
+    // is silently wrong: `SecureStrings`, which does not have the tolerance the port assumed
+    // every named string slice has (issue #15). The rest of Go's type errors stay unported and
+    // tracked rather than assumed away -- a `model_list` holding a bare number is refused by
+    // the shipped binary and still loads here, which is stated in the issue filed with this
+    // change, not hidden by it.
+    if let Some((path, wanted, got)) = schema::misplaced_secure_strings(&document, &config_schema())
+    {
+        return Err(Error::TypeMismatch(format!(
+            "expected {wanted} but got {got} at {path}"
+        )));
+    }
     // That is also why the security file is never folded into the validated bytes a second
     // time: the merge above already put its keys in `document`. Validating a projection of
     // the file alongside the document -- the shape used before `load_config_map` existed --
@@ -714,7 +743,23 @@ fn apply_security(
                     .or_else(|| entries.iter().find(|(spelled, _)| spelled == name))
                     .map(|(_, value)| value);
                 match entry.and_then(|value| value.get("api_keys")) {
-                    Some(found) => list[position].set("api_keys", found.clone()),
+                    Some(found) => {
+                        // `SecureModelList.UnmarshalYAML` decodes the entry map into
+                        // `map[string]*ModelConfig`, so this node goes through yaml's decoder
+                        // against the typed field and yaml's refusal travels with it. The
+                        // generic shape gate above never sees it: this pass owns `model_list`
+                        // because the file is a map here and the document a sequence. Sequence
+                        // elements stay permissive -- `api_keys: [42]` in a security entry
+                        // loads, measured -- so this is the field's own kind and nothing more.
+                        if !crate::schema::secure_strings_yaml_accepts(found) {
+                            return Err(Error::SecurityType(format!(
+                                "cannot unmarshal {} into {}",
+                                node_kind(found),
+                                crate::schema::SECURE_STRINGS_GO_TYPE
+                            )));
+                        }
+                        list[position].set("api_keys", found.clone());
+                    }
                     // Go assigns a nil slice, which marshals to nothing. Removing the key is
                     // that; an empty array would be a different value that happens to print
                     // the same.
@@ -1200,6 +1245,16 @@ fn yaml_accepts(node: &Doc, schema: &Schema) -> bool {
     // `SkillsRegistriesConfig` each project to something the field list does not describe).
     // The first one this walk does reach through a schema has to arrive with a case, not
     // with this branch already graded green.
+    if crate::schema::is_secure_strings(schema) {
+        // The dump flags `SecureStrings` with a marshaler, and the exemption below is right
+        // that a type with its own `(Unm|M)arshalYAML` decides its own shape -- but this type
+        // has only a *marshaler*, plus one on its element. Measured: `api_keys: 42` in a
+        // security entry is refused with `cannot unmarshal !!int `42` into
+        // config.SecureStrings`, while `api_keys: [42]` loads. So the field is a plain sequence
+        // and the elements are the permissive part, which is the one case the exemption below
+        // would otherwise get backwards for every position of this type.
+        return crate::schema::secure_strings_yaml_accepts(node);
+    }
     let custom = match schema {
         Schema::Struct { marshaler, .. } | Schema::Map { marshaler, .. } => *marshaler,
         Schema::Slice { marshaler, .. } => *marshaler,
@@ -1924,6 +1979,84 @@ mod tests {
         ] {
             let (dir, path) = write_temp(r#"{"version":3}"#);
             std::fs::write(dir.path().join(SECURITY_FILE), body).expect("security file");
+            let outcome = load(&path, "/home/oracle");
+            if refused {
+                assert!(
+                    matches!(outcome, Err(Error::SecurityType(_))),
+                    "{body:?} should be refused, got {outcome:?}"
+                );
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "{body:?} should load, got {:?}",
+                    outcome.err()
+                );
+            }
+        }
+    }
+
+    /// Issue #15: `SecureStrings` is a plain sequence of strings, not a `FlexibleStringSlice`.
+    ///
+    /// Every refused spelling here is one the shipped binary refuses at the same position,
+    /// measured one process per shape. The accepted siblings are part of the test because a
+    /// blanket "must be an array" would be wrong in Go's unfavourable direction: `null` is
+    /// answered before anything else and leaves the slice nil, an empty array is an empty
+    /// slice, and a number is refused only where Go's element decode asks for a string.
+    #[test]
+    fn a_shape_secure_strings_cannot_hold_fails_the_load() {
+        for (spelling, refused) in [
+            (r#""sk-1""#, true),
+            ("42", true),
+            ("[42]", true),
+            (r#"["a",42]"#, true),
+            ("{}", true),
+            ("true", true),
+            (r#"["a","b"]"#, false),
+            ("[]", false),
+            ("null", false),
+        ] {
+            let body = format!(
+                r#"{{"version":3,"model_list":[{{"model_name":"m1","provider":"p","model":"m","api_keys":{spelling}}}]}}"#
+            );
+            let (_dir, path) = write_temp(&body);
+            let outcome = load(&path, "/home/oracle");
+            if refused {
+                assert!(
+                    matches!(outcome, Err(Error::TypeMismatch(_))),
+                    "api_keys: {spelling} should be refused, got {outcome:?}"
+                );
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "api_keys: {spelling} should load, got {:?}",
+                    outcome.err()
+                );
+            }
+        }
+    }
+
+    /// The same field in `.security.yml` follows yaml's rule, which is *not* the document's:
+    /// the field has to be a sequence, but its elements go through `SecureString`'s raw-text
+    /// decoder, so a number inside the array loads while a bare number at the field is refused
+    /// as `cannot unmarshal !!int `42` into config.SecureStrings`. Both halves are pinned
+    /// because one predicate for the two files gets one of them backwards.
+    #[test]
+    fn a_security_api_keys_that_is_not_a_sequence_fails_the_load() {
+        let document = r#"{"version":3,"model_list":[{"model_name":"m1","provider":"p","model":"m","api_keys":["sk-doc"]}]}"#;
+        for (body, refused) in [
+            ("model_list:\n    m1:0:\n        api_keys: 42\n", true),
+            ("model_list:\n    m1:0:\n        api_keys: sk-sec\n", true),
+            ("model_list:\n    m1:0:\n        api_keys: {a: b}\n", true),
+            ("model_list:\n    m1:0:\n        api_keys: [42]\n", false),
+            (
+                "model_list:\n    m1:0:\n        api_keys: [sk-sec]\n",
+                false,
+            ),
+            ("model_list:\n    m1:0:\n        api_keys: null\n", false),
+        ] {
+            let (_dir, path) = write_temp(document);
+            std::fs::write(path.parent().expect("config dir").join(SECURITY_FILE), body)
+                .expect("security file");
             let outcome = load(&path, "/home/oracle");
             if refused {
                 assert!(
