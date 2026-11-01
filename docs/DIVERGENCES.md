@@ -85,6 +85,90 @@ this file as long as observable behaviour is identical. They belong in
   mechanism `base_fields` uses), plus one corpus case per refusal.
 - Recorded: 2026-10-27, #7.
 
+### A scalar at a document's `registries` is refused by Go and loads here
+
+- Go: `tools.skills.registries` is decoded through the `jsontext` map reader, so a scalar is a
+  type error naming its own line and column -- measured at picoclaw `1a4e1edf`, whose
+  `pkg/config` loader differs from the `01635da3` the review ran at only by `schema_dump.go`
+  and a test file:
+  `config.json type error at line 1, column 3: expected map[string]jsontext.Value but got
+  string`, with the offending line quoted and a caret under the path. A sequence is *not* in
+  that family: it is ignored, and the builtin registries stand at their defaults.
+- Rust: `skills::rebuild` treats a sequence as "ignored, baseline stands" (pinned by
+  `a_non_mapping_registries_node_leaves_the_builtins_standing`, which covers both that and a
+  document `null`) and leaves a scalar in the document untouched rather than refusing it,
+  because this crate has no stage that raises Go's `jsontext` type error at all -- the
+  unknown-field validator reports names, not kinds, and the two sentences differ.
+- Why it is left: inventing a refusal here would be inventing its wording too, and the
+  measured Go sentence -- `config.json type error at line 1, column 1: expected
+  map[string]jsontext.Value but got number`, at picoclaw `01635da3` -- belongs to a loader
+  stage this crate has not ported. The blast radius
+  is a config that should not load, loading with a scalar where a registry map belongs; the
+  registries themselves come back as the baseline's, so nothing silently gains a credential.
+- Closes with: the type-error stage, which is the same missing stage as the `SecureString`
+  number refusal in vicowa-botworks/rusty-crab#15.
+- Recorded: 2026-10-28, #8 round 4. The entry this replaces -- "a null or non-mapping
+  `registries` section cannot be answered without the builtin registries" -- was wrong about
+  its own cause: the names and defaults are in the embedded `defaults.json`, which is the
+  baseline `load` merges into, so both arms were four lines each and they are now landed
+  (`normalise_document` for the document side, the null-header wipe for the file's).
+
+
+
+### `crates/crab-config` loads a non-mapping value *inside* a legacy skills key
+
+- Go: `applyLegacySkillsSecurityNode` (`pkg/config/security.go:124`) decodes every value in
+  the security file's `skills` mapping into a `SkillRegistryConfig`, and that decoder
+  decodes into a `map[string]any`. A scalar or sequence there is a decode failure, so
+  `skills: {github: ghp_direct}` is a config the shipped binary will not load.
+- Rust: `skills::apply` answers a non-mapping node by ignoring it, so the file loads. The
+  token really is dropped: an earlier round printed the bare scalar as a token, which made
+  the port *manufacture* a credential (`auth_token: "[NOT_HERE]"`) on a config Go refuses --
+  a worse divergence than the one recorded here, and fixed in #8 round 2.
+- Not this entry: the `skills:` node itself being a non-mapping. That is refused on both
+  sides since #10 -- `security_skills_{scalar,sequence,number}_is_refused`, with `null`
+  loading because a null never asks for a mapping. This entry is only about a value *under*
+  a legacy skills key, which the parent-node refusal does not reach.
+- Why: the one corpus case in this area, `security_a_scalar_under_registries_loads_unchanged`,
+  pins the file that *does* load -- `registries` is skipped by name before the decode, which
+  is the only reason it survives. No case pins a non-`registries` key holding a scalar, so
+  refusing now would be writing an error path against bytes nobody recorded, including which
+  diagnostic wins when several keys are wrong.
+- Blast radius: a hand-edited `.security.yml` with a typo that puts a token where a registry
+  mapping belongs loads under the port with the token dropped, and is refused by the shipped
+  binary. Nothing is silently rewritten -- the file is simply accepted that should not be --
+  but it is the class of divergence that turns a rejected config into a running one.
+- Closes with: one corpus case per shape (scalar, sequence) under a legacy skills key, then
+  an error type on this pass. The `registries` skip itself stays unpinnable until then: with
+  the skip removed this port still replays green, because it never reaches the refusal the
+  skip exists to avoid.
+- Recorded: 2026-10-27, re-scoped and restored 2026-10-28 (#10 round 3) after this head
+  deleted it while the behaviour it describes was still live.
+
+### The version probe's error has no preview block
+
+- Go: the version probe (`config.go:1311`, `json.Unmarshal` into
+  `struct { Version int }`) hands its error to `wrapJSONError` (`diagnostics.go:64`), which
+  for an `UnmarshalTypeError` returns the summary line *and*, when the offset lands on a
+  non-blank line, a second block: `   1 | {"version":"3"}` and a caret under the offending
+  column, dimmed and colour-bolded when `diagnosticsUseColor()` says the stream is a
+  terminal.
+- Rust: `version_type_diagnostic` returns the summary line only. The line, the column, the
+  field name, the expected type and the value word (`string`, `bool`, `number 3.5`) all
+  match; the preview is absent.
+- Why: the preview is a rendering decision, not a decoding one -- it depends on whether
+  stderr is a TTY, and on `trimDiagnosticLine`'s windowing around the caret. The corpus
+  records no error text at all (a failing case adds `error_op_index` and nothing else), so
+  there is nothing to pin it against and everything to get wrong.
+- Blast radius: anyone printing the error sees one line instead of two-then-two, and anyone
+  pattern-matching the *first* line is unaffected. `DiagnosticSummary` in Go strips the
+  preview for logs, so the summary the port does reproduce is the half Go treats as the
+  message.
+- Closes with: a preview renderer in `crab-config` plus a TTY probe, if anything ever needs
+  the two-line form. Nothing in the port prints config errors today.
+- Recorded: 2026-10-28, #11.
+
+
 ### `crates/crab-config` names a migration backup by the UTC date
 
 - Go: `MakeBackup` builds the suffix from `time.Now().Format("20060102")`, and `time.Now()`
@@ -109,3 +193,20 @@ this file as long as observable behaviour is identical. They belong in
   `/etc/localtime` -- and even then no corpus case can pin it, because the clock is masked, so
   treat this as permanent rather than deferred.
 - Recorded: 2026-10-28, #9.
+### A security `model_list` naming one slot two ways is decided by Go's map order
+
+- Go: `mergeModelListsWithMap` iterates `for k, v := range secML` (`migration.go:520`), so
+  when a `.security.yml` carries both spellings of the same slot -- `m1:0:` and `m1:`, each
+  with its own `api_keys` -- the winner is whichever key the map hands over last. Five
+  processes on one input and one binary gave `[b] [b] [a] [b] [b]`.
+- Rust: the port walks the document in file order, so it is deterministically `[b]`, the key
+  that comes later in the file.
+- Why this is recorded rather than fixed: there is no Go behaviour to reproduce. A corpus case
+  pinning either answer pins a coin flip, and it reads as a flaky test the first time the
+  iterator disagrees.
+- Blast radius: nobody running the port, which is the deterministic side. Anyone who tries to
+  witness this shape in the corpus, or who diffs a hand-edited security file against Go and
+  sees different keys for two files that look identical.
+- Closes with: nothing. If Go ever sorts the iteration this becomes an ordinary merge and the
+  corpus can pin it.
+- Recorded: 2026-10-30, #9 round 4.
