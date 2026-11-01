@@ -57,6 +57,16 @@ pub enum Schema {
         base_fields: Vec<&'static str>,
         /// `Channel` only: channel type -> the struct its `settings` block decodes into.
         settings_schemas: Vec<(&'static str, Schema)>,
+        /// `Channel` only: the singleton registry -- the channel types that allow at most
+        /// one *enabled* channel. `validateSingletonChannels` counts against exactly this
+        /// set, and in Go the set is built by `registerSingletonChannel` calls at init()
+        /// time, so there is no literal for a port to read.
+        singleton_channel_types: Vec<&'static str>,
+        /// This struct's `streaming` bounds are checked by `validateChannelStreamingConfig`.
+        /// The flag comes from that function's type switch, and its absence is a verdict:
+        /// the switch's default arm returns nil, so a settings struct not named there loads
+        /// any bounds the file carries.
+        streaming_validated: bool,
         /// The type implements `yaml.Marshaler`, so its own method decides what is
         /// emitted and the generic walk must not run for it.
         marshaler: bool,
@@ -154,6 +164,33 @@ impl Schema {
         match self {
             Self::Struct { base_fields, .. } => base_fields,
             _ => &[],
+        }
+    }
+
+    /// The singleton registry: channel types that allow at most one **enabled** channel.
+    /// Empty for anything that is not `Channel`, which is why an empty list means "check
+    /// nothing" rather than "the dump is old" -- see the note on the field.
+    #[must_use]
+    pub fn singleton_channel_types(&self) -> &[&'static str] {
+        match self {
+            Self::Struct {
+                singleton_channel_types,
+                ..
+            } => singleton_channel_types,
+            _ => &[],
+        }
+    }
+
+    /// Whether `validateChannelStreamingConfig` validates this struct's streaming bounds.
+    /// False is Go's default arm: the channel loads whatever bounds its file carries.
+    #[must_use]
+    pub const fn is_streaming_validated(&self) -> bool {
+        match self {
+            Self::Struct {
+                streaming_validated,
+                ..
+            } => *streaming_validated,
+            _ => false,
         }
     }
 
@@ -276,6 +313,21 @@ fn from_value(value: &Value) -> Schema {
                     .collect(),
                 _ => Vec::new(),
             };
+            let singleton_channel_types = value
+                .get("singleton_channel_types")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|i| i.as_str())
+                        .map(|s| Box::leak(s.to_string().into_boxed_str()) as &'static str)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let streaming_validated = value
+                .get("streaming_validated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let yaml = value
                 .get("yaml_fields")
                 .and_then(Value::as_array)
@@ -342,6 +394,8 @@ fn from_value(value: &Value) -> Schema {
                 json,
                 base_fields,
                 settings_schemas,
+                singleton_channel_types,
+                streaming_validated,
                 marshaler,
             }
         }

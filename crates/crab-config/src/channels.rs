@@ -137,6 +137,15 @@ pub fn init_channel_list(document: &mut Doc, schema: &Schema) -> Result<(), Erro
                         "channel {name:?} failed to decode settings: {reason}"
                     ))
                 })?;
+                // `validateChannelStreamingConfig`, in Go's position: after the decode
+                // into the typed struct, before the next channel is looked at. It reads
+                // the struct, so a bound the file never mentioned is 0 and legal, and a
+                // bound the file gave as a string never reaches here (the decode refused
+                // it). The flag is the switch's membership, so a settings struct the
+                // function does not name takes its default arm and loads any bound.
+                if settings_schema.is_streaming_validated() {
+                    validate_streaming_bounds(&name, &settings)?;
+                }
                 preserve_explicit_disabled_streaming(&mut settings, stored);
                 // `settings,omitzero` never fires past this point: with the typed struct
                 // decoded, MarshalJSON writes the marshalled bytes, which are at minimum
@@ -166,8 +175,92 @@ pub fn init_channel_list(document: &mut Doc, schema: &Schema) -> Result<(), Erro
         rebuilt.push((name, Doc::Object(out)));
     }
 
+    // Step 2 of InitChannelList: the singleton registry, checked over the whole list
+    // rather than per channel, and running on what step 1 left -- so a channel the file
+    // only named by its key counts under that key.
+    validate_singleton_channels(&rebuilt, elem)?;
+
     if let Some(slot) = document.get_mut_at("channel_list") {
         *slot = Doc::Object(rebuilt);
+    }
+    Ok(())
+}
+
+/// `validateChannelStreamingConfig`'s two comparisons (config_channel.go:804).
+///
+/// It reads the decoded struct, so a bound the file never mentioned is 0 and legal, and a
+/// bound the file gave as a string never gets here -- the decode refused it one step
+/// earlier. The throttle comparison comes first, which is the only thing that decides
+/// which sentence a file with both bounds negative gets.
+fn validate_streaming_bounds(name: &str, settings: &Doc) -> Result<(), Error> {
+    let Some(streaming) = settings.get("streaming") else {
+        return Ok(());
+    };
+    for key in ["throttle_seconds", "min_growth_chars"] {
+        if streaming.get(key).and_then(Doc::as_i64).unwrap_or_default() < 0 {
+            return Err(Error::Channel(format!(
+                "channel {name:?} streaming.{key} must be >= 0"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `validateSingletonChannels` (config_channel.go:511): a registered singleton type allows
+/// one **enabled** instance, and the count is keyed on the resolved type, not on the
+/// channel name.
+///
+/// Two things this deliberately does not do:
+///
+/// * count disabled channels -- Go's loop starts with `if !bc.Enabled { continue }`, so a
+///   switched-off second instance is the normal way to keep a config around;
+/// * apply to unregistered types. Two enabled `discord` channels are two working channels,
+///   which is why the rule cannot be generalised to one channel per type.
+///
+/// Go walks a map, so which type it names when two singleton types are both over the limit
+/// is not defined. The registry's own order is used instead: the corpus records no error
+/// text, so this is about a reproducible message for a human, not about matching bytes.
+fn validate_singleton_channels(channels: &[(String, Doc)], elem: &Schema) -> Result<(), Error> {
+    let registry = elem.singleton_channel_types();
+    if registry.is_empty() {
+        return Ok(());
+    }
+    let mut counts: Vec<(&str, usize, Vec<&str>)> = Vec::new();
+    for (name, channel) in channels {
+        if !matches!(channel.get("enabled"), Some(Doc::Bool(true))) {
+            continue;
+        }
+        // Step 1 wrote the resolved type into every entry it kept, which is Go's
+        // `bc.Type = name`; the `if t == ""` below is the same rule for an entry step 1
+        // passed through untouched.
+        let channel_type = channel
+            .get("type")
+            .and_then(Doc::as_str)
+            .unwrap_or(name.as_str());
+        if !registry.contains(&channel_type) {
+            continue;
+        }
+        match counts.iter_mut().find(|(t, ..)| *t == channel_type) {
+            Some((_, count, names)) => {
+                *count += 1;
+                names.push(name);
+            }
+            None => counts.push((channel_type, 1, vec![name.as_str()])),
+        }
+    }
+
+    for channel_type in registry {
+        let Some((_, count, names)) = counts.iter_mut().find(|(t, ..)| t == channel_type) else {
+            continue;
+        };
+        if *count > 1 {
+            names.sort();
+            return Err(Error::Channel(format!(
+                "channel type {channel_type:?} is singleton and does not support multiple \
+                 instances, found {count} enabled instances: [{}]",
+                names.join(" ")
+            )));
+        }
     }
     Ok(())
 }
