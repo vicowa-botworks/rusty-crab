@@ -193,3 +193,20 @@ this file as long as observable behaviour is identical. They belong in
   `/etc/localtime` -- and even then no corpus case can pin it, because the clock is masked, so
   treat this as permanent rather than deferred.
 - Recorded: 2026-10-28, #9.
+### A security `model_list` naming one slot two ways is decided by Go's map order
+
+- Go: `mergeModelListsWithMap` iterates `for k, v := range secML` (`migration.go:520`), so
+  when a `.security.yml` carries both spellings of the same slot -- `m1:0:` and `m1:`, each
+  with its own `api_keys` -- the winner is whichever key the map hands over last. Five
+  processes on one input and one binary gave `[b] [b] [a] [b] [b]`.
+- Rust: the port walks the document in file order, so it is deterministically `[b]`, the key
+  that comes later in the file.
+- Why this is recorded rather than fixed: there is no Go behaviour to reproduce. A corpus case
+  pinning either answer pins a coin flip, and it reads as a flaky test the first time the
+  iterator disagrees.
+- Blast radius: nobody running the port, which is the deterministic side. Anyone who tries to
+  witness this shape in the corpus, or who diffs a hand-edited security file against Go and
+  sees different keys for two files that look identical.
+- Closes with: nothing. If Go ever sorts the iteration this becomes an ordinary merge and the
+  corpus can pin it.
+- Recorded: 2026-10-30, #9 round 4.

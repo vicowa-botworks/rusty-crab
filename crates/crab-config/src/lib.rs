@@ -364,20 +364,17 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // over the document, not one. Which bytes those are depends on the version: a
     // current-version document is validated as config.json alone, because its security file
     // is decoded separately by `yaml.v3`; a legacy one has already been merged with the
-    // security file as plain data by `loadConfigMap`, re-marshalled, and validated as one
-    // document -- so a key only the security file introduced is refused there, with
-    // config.json's own sentence.
-    //
-    // That is why there is no second pass over the security file here. This branch used to
-    // validate a projection of the file alongside the document, which was the shape needed
-    // before `load_config_map` existed; with the merge in place the file's keys are already
-    // in `document`, and validating them again reports one unknown key twice --
-    // `config.json contains unknown field(s): nonsense, nonsense` -- the same doubled-seam
-    // failure the security *merge* had.
-    let issues = unknown_fields(&document, &config_schema());
-    if !issues.is_empty() {
-        return Err(Error::UnknownField(issues.join(", ")));
-    }
+    // security file as plain data by [`load_config_map`], re-marshalled, and validated as
+    // one document -- so a key only the security file introduced is refused there, with
+    // config.json's own sentence. That is also why the security file is never folded into
+    // the validated bytes a second time: the merge above already put its keys in `document`.
+    validate_against(&document, &config_schema())
+        .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
+    // That is also why the security file is never folded into the validated bytes a second
+    // time: the merge above already put its keys in `document`. Validating a projection of
+    // the file alongside the document -- the shape used before `load_config_map` existed --
+    // reports one unknown key twice, `config.json contains unknown field(s): nonsense,
+    // nonsense`, the same doubled-seam failure the security *merge* had.
     let mut merged = default_config(home);
     // The baseline `tools.skills.registries` before the document is merged over it. Go decodes
     // the file *into* the defaults, so a document whose `registries` is not a mapping leaves
@@ -387,39 +384,32 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
 
     // `SkillsRegistriesConfig`'s decoder, which Go runs as part of the JSON unmarshal -- that
     // is, before the security file is opened. It is the document-side half of the skills pass
-    // and it does not ask whether a `.security.yml` exists; the two merge passes below do.
+    // and it does not ask whether a `.security.yml` exists; the merge below does.
     let mut secure_tokens = skills::normalise_document(&mut merged, baseline_registries.as_ref());
 
-    // The security file, already read as text so the migration arm could merge it as data
-    // before the ladder ran. Absent is normal -- a config written before the split has none
-    // -- but any *other* read failure was fatal at the read: `if let Ok(..)` there would
-    // treat EACCES or invalid UTF-8 as "no secrets file" and carry on with default secrets,
-    // which is the one place a silent fallback points the wrong way. It does not load a
-    // slightly staler config, it loads one that believes nothing is configured and then
-    // writes that belief back on the next save.
-    if let Some(text) = &security_text {
+    // The typed security pass, with the version gate Go puts on it: `LoadConfig` calls
+    // `loadSecurityConfig` in `case CurrentVersion` and nowhere else, because the `case
+    // 0..=2` arms have already taken the security file in through [`load_config_map`] as
+    // plain data, before the ladder. Running both for a migrated document applies one file
+    // twice where Go applies it once -- and the second trip is through the stricter decoder,
+    // `yaml.v3` over typed structs instead of a plain map merge, which is the difference
+    // between merging a `channel_list` entry into its default and replacing that default.
+    // `filter` rather than a nested `if`: this edition has no let chains, and a nested one
+    // is what `collapsible_if` asks to collapse into a let chain.
+    if let Some(text) = security_text.as_ref().filter(|_| !migrated) {
         // Not wrapped. `Error::SecurityType` and `Error::UnparseableSecurity` are the two
         // kinds this stage can raise and both name themselves; folding them into `Error::Io`
         // would report a type error as a read failure.
         let security = yaml::parse(text)?;
-        let file_tokens = apply_security(
-            &mut merged,
-            &security,
-            migrated,
-            baseline_registries.as_ref(),
-        )?;
-        // The typed pass rebuilds the same `registries` the document-side pass just rebuilt, so
-        // for a current-version document its list *supersedes* the one above rather than adding
-        // to it: the file may have replaced an entry whose credential was just collected, or
-        // wiped the section to the builtins, and keeping the stale pair would write a credential
-        // Go no longer holds. A migrated document is the exception, and it is the reason "last
-        // one wins" is the wrong rule: `apply_security` skips the skills rebuild under `migrated`
-        // and returns an empty list, so assigning that here discards the credential
-        // `load_config_map` lifted out of the legacy `skills.github.token`. Same condition as the
-        // early return inside `apply_security` -- if that skip ever moves, this is where it leaks.
-        if !migrated {
-            secure_tokens = file_tokens;
-        }
+        secure_tokens = apply_security(&mut merged, &security, baseline_registries.as_ref())?;
+        // Assigning rather than extending is what the call-site gate buys: the typed pass
+        // rebuilds the same `registries` the document-side pass just rebuilt, so for a
+        // current-version document its list *supersedes* the one above -- the file may have
+        // replaced an entry whose credential was just collected, or wiped the section to the
+        // builtins, and keeping the stale pair would write a credential Go no longer holds.
+        // A migrated document must keep the document-side list, because that is where
+        // `load_config_map` lifted the legacy `skills.github.token` out of the file; this
+        // block never runs for one, so it cannot clobber it.
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before
@@ -469,6 +459,13 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // directory into "no config at all", which is a strictly worse failure than the one
         // the shipped binary has -- and the caller cannot retry, because `load` has already
         // returned the error instead of the config.
+        //
+        // Timing, for whoever ports the stages listed in this function's doc: Go's `defer`
+        // runs at the *return* of `LoadConfig`, so it persists whatever the loader did after
+        // the migration switch -- `env.Parse` and the `Validate*` calls included. This writes
+        // at the migration point, which produces the same bytes only while nothing follows
+        // it. When those stages land, move this beside `Ok(config)` or the file on disk will
+        // disagree with the value the caller receives.
         let _ = save(&path, &mut config, home);
     }
 
@@ -638,116 +635,73 @@ fn number_literal(text: &str, line: usize, column: usize) -> String {
 /// * Anything else in the file has no yaml-tagged field to land in and is dropped. That
 ///   is Go's behaviour, not a gap: the yaml half has no unknown-field validator, which is
 ///   the asymmetry [`yaml`] documents -- for a *current-version* document, since a migrated
-///   one has its security file validated as config.json bytes, because `load_config_map`
-///   has already folded the file into the document those bytes are validated from.
+///   one has its security file merged in as data by [`load_config_map`] and validated as
+///   config.json bytes.
 ///
 /// Per field, not per entry: the file decodes into a `Config` the JSON pass has already
 /// populated, so an entry touches the fields it names and leaves the rest alone. Which
 /// fields a section may name is decided by that section's own projection, not by the
 /// entry's shape -- `model_list` gets `api_keys` and nothing else, and an entry naming a
 /// model the document does not hold is ignored.
+///
+/// This is `loadSecurityConfig`, and it runs for a **current-version** document only.
+/// `LoadConfig` reaches it in `case CurrentVersion` and nowhere else: the `case 0..=2`
+/// arms have already taken the security file in through [`load_config_map`], as plain
+/// data, before the ladder. Calling both for a migrated document applies one file twice
+/// where Go applies it once -- and through the wrong decoder the second time, `yaml.v3`
+/// over typed structs instead of a map merge, which is the difference between merging a
+/// `channel_list` entry into its default and replacing that default outright.
 fn apply_security(
     merged: &mut Doc,
     security: &yaml::Security,
-    migrated: bool,
     baseline_registries: Option<&Doc>,
 ) -> Result<Vec<(String, String)>, Error> {
     let schema = schema::config_schema();
 
-    // A `model_list` that is not a mapping: the JSON shape copied into a YAML file, or gone
-    // entirely. Fatal here, ignored for a migrated document, where `loadConfigMap` merges
-    // the section only if it is a map and deletes it either way. Measured on both sides of
-    // the same file: v3 refuses with the decoder's sentence, v2 loads the default list.
-    // `filter` rather than a nested `if`: the edition here has no let chains, and a nested
-    // one is what `collapsible_if` asks to collapse into a let chain.
-    if let Some(kind) = security.model_list_kind.filter(|_| !migrated) {
+    // A `model_list` that is not a mapping: the JSON shape copied into a YAML file, or
+    // gone entirely. `SecureModelList.UnmarshalYAML` refuses either, and this is the only
+    // path that reaches it -- the migrated path merges the section only if it is a map and
+    // deletes it either way, so a non-mapping is ignored there rather than refused.
+    // Measured on both sides of the same file: v3 refuses with the decoder's sentence, v2
+    // loads the default list.
+    if let Some(kind) = security.model_list_kind {
         return Err(Error::SecurityType(format!(
             "cannot unmarshal !!{kind} into map[string]*config.ModelConfig"
         )));
     }
 
     // A `model_list` that is a mapping. A section that is not one was refused above, or
-    // parsed as an empty map for `model_list:` with no value; the migrated path ignores one.
+    // parsed as an empty map for `model_list:` with no value.
     if let Some(Doc::Object(entries)) = security.model_list() {
         if let Some(list) = merged.get_mut_at("model_list").and_then(Doc::as_array_mut) {
             // The file keys entries `name:index`; the document holds a sequence.
             //
-            // **Two loaders, two shapes.** The current version runs
-            // `SecureModelList.UnmarshalYAML` (config_struct.go:326), which walks the models
-            // the JSON loader produced and asks the security map for each one's `name:index`
-            // key, falling back to the bare name per position. A migrated document runs
-            // `mergeModelListsWithMap` (migration.go:497) instead, which builds a key set --
-            // `name:index` for every position, and the bare name **only for the first
-            // position carrying it** -- and iterates the security map. The two agree on every
-            // shape except one, and it is measurable rather than theoretical: two models both
-            // named `m1` with the file keyed `m1:` give v3 `["[NOT_HERE]", "[NOT_HERE]"]` and
-            // a migrated config `["[NOT_HERE]", "<nil>"]` -- the bare name resolves to the
-            // first position only. Measured at picoclaw `1a4e1edf`, one process per scenario,
-            // with `model` present on every entry so the required-field stage is not what is
-            // answering. So the loop below is chosen by `migrated`, and the three rules that
-            // both loaders share are stated once, after the branch.
+            // `SecureModelList.UnmarshalYAML` (config_struct.go:326) walks the models the
+            // JSON loader produced and asks the security map for each one's `name:index`
+            // key, falling back to the bare name per position. The migration path runs
+            // `mergeModelListsWithMap` instead -- see [`merge_model_list_into_array`] --
+            // and the two agree on every shape except one: two models both named `m1` with
+            // the file keyed `m1:` give v3 `["[NOT_HERE]", "[NOT_HERE]"]` and a migrated
+            // config `["[NOT_HERE]", "<nil>"]`, because the migration builds a key set in
+            // which the bare name resolves to the *first* position carrying it only.
+            // Measured at picoclaw `1a4e1edf`, one process per scenario, with `model`
+            // present on every entry so the required-field stage is not what is answering.
             //
-            // * **An entry naming no model is ignored, not appended.** Both loaders agree. The loop runs over the
-            //   models, not over the map, so a leftover `m9:0` against a config that lists
-            //   only `m1` contributes nothing. Appending it instead invents a model with an
-            //   empty name: the next `save` writes it into `config.json`, names it `:0` in
-            //   the security file, and the round trip cannot even reproduce the entry it
-            //   wrote. `mergeModelListsWithMap` drops it the same way on the migration path,
-            //   and deletes it from the map first so the generic data merge cannot turn it
-            //   into a top-level key.
+            // Three rules both loaders share, and both ports state here and there:
+            //
+            // * **An entry naming no model is ignored, not appended.** The loop runs over
+            //   the models, not over the map, so a leftover `m9:0` against a config that
+            //   lists only `m1` contributes nothing. Appending it instead invents a model
+            //   with an empty name: the next `save` writes it into `config.json`, names it
+            //   `:0` in the security file, and the round trip cannot even reproduce the
+            //   entry it wrote.
             // * **Only `api_keys` is taken.** `m.APIKeys = sec.APIKeys` is a field
-            //   assignment, so `m1:0: {provider: other}` leaves the provider alone -- merging
-            //   the whole entry would let the secrets file set a model's provider or rpm.
+            //   assignment, so `m1:0: {provider: other}` leaves the provider alone --
+            //   merging the whole entry would let the secrets file set a model's provider
+            //   or rpm.
             // * **The assignment is unconditional when the entry matches**, so a matching
             //   entry with no `api_keys` clears the model's keys rather than leaving them
             //   alone.
-            if migrated {
-                let mut positions: Vec<(String, usize)> = Vec::new();
-                let mut counts: Vec<(String, usize)> = Vec::new();
-                for (position, item) in list.iter().enumerate() {
-                    let name = item
-                        .get("model_name")
-                        .and_then(Doc::as_str)
-                        .unwrap_or_default();
-                    let index = match counts.iter_mut().find(|(n, _)| n == name) {
-                        Some(slot) => {
-                            slot.1 += 1;
-                            slot.1 - 1
-                        }
-                        None => {
-                            counts.push((name.to_string(), 1));
-                            0
-                        }
-                    };
-                    positions.push((format!("{name}:{index}"), position));
-                    if !positions.iter().any(|(key, _)| key == name) {
-                        positions.push((name.to_string(), position));
-                    }
-                }
-                for (spelled, entry) in entries {
-                    let Some(position) = positions
-                        .iter()
-                        .find(|(key, _)| key == spelled)
-                        .map(|(_, position)| *position)
-                    else {
-                        // Go logs `model_name not found in main config: <key>` and moves on.
-                        continue;
-                    };
-                    // Only a mapping entry assigns anything: `if vv, ok := v.(map[string]any)`.
-                    let Doc::Object(fields) = entry else { continue };
-                    match fields.iter().find(|(key, _)| key == "api_keys") {
-                        Some((_, value)) => list[position].set("api_keys", value.clone()),
-                        // `mVal["api_keys"] = vv["api_keys"]` assigns nil for a missing key.
-                        None => {
-                            list[position].remove("api_keys");
-                        }
-                    }
-                }
-                // No tokens on this path: the credential unmasking happens in the typed
-                // walk below, which a migrated document never reaches.
-                return Ok(Vec::new());
-            }
-
             let keys = yaml::to_name_index(list);
             for (position, key) in keys.iter().enumerate() {
                 let name = list[position]
@@ -771,13 +725,6 @@ fn apply_security(
                 }
             }
         }
-    }
-
-    if migrated {
-        // The typed pass ends here for a migrated document, and `skills::apply` with it, so
-        // there is no effective credential to hand back. See the module note on why a legacy
-        // document has exactly one security mechanism.
-        return Ok(Vec::new());
     }
 
     for field in schema.yaml_fields() {
@@ -869,6 +816,14 @@ fn load_config_map(config: &Doc, security: &Doc) -> Result<Doc, Error> {
     let mut m2 = security.clone();
 
     if let Doc::Object(entries) = &mut m2 {
+        // Go asks `m2[key] != nil` twice over: once to decide whether the lift runs at all
+        // (`migration.go:425`), and again **per key** inside it (`:429`, `:433`). So a
+        // null-valued section does not join the lift even when its sibling triggers it -- it
+        // stays in the merged document, where the strict validator names it. Testing only
+        // presence in the loop is the permissive half of that, and it loads a file
+        // `LoadConfig` refuses: measured, `web:` (null) beside a `skills:` mapping is refused
+        // by Go as `unknown field(s): web` and by the reverse shape as `unknown field(s):
+        // skills`. A hand-edited `.security.yml` with a bare `skills:` line is this shape.
         let present = |key: &str| {
             entries
                 .iter()
@@ -877,7 +832,10 @@ fn load_config_map(config: &Doc, security: &Doc) -> Result<Doc, Error> {
         if present("web") || present("skills") {
             let mut tools: Vec<(String, Doc)> = Vec::new();
             for key in ["web", "skills"] {
-                if let Some(position) = entries.iter().position(|(k, _)| k == key) {
+                if let Some(position) = entries
+                    .iter()
+                    .position(|(k, v)| k == key && !matches!(v, Doc::Null))
+                {
                     let (_, value) = entries.remove(position);
                     let mut value = value;
                     if key == "skills" {
@@ -931,15 +889,15 @@ fn load_config_map(config: &Doc, security: &Doc) -> Result<Doc, Error> {
 /// a key that is neither one of its fields nor one of these two spellings is still refused.
 fn legacy_skills_as_registries(skills: &mut Doc) {
     let Doc::Object(entries) = skills else { return };
-    // Go's guard is `if m["clawhub"] != nil`, not `if _, ok := m["clawhub"]; ok`: a
-    // `clawhub:` with nothing after the colon is nil, so the rewrite is skipped *and* the
-    // `delete` nested inside it never runs. The key stays under the `skills` struct node and
-    // the strict validator refuses the file as `tools.skills.clawhub` -- which is the whole
-    // point, because a rewrite that deleted unconditionally would load a file Go rejects.
+    // Go's guard is `if m["clawhub"] != nil`, and it is load-bearing in both directions.
+    // A `clawhub:` with nothing after it is nil, so the guard skips the rewrite *and* the
+    // `delete` inside it: the key stays in the lifted `tools.skills`, and the strict
+    // validator then refuses the document for `tools.skills.clawhub`. Deleting
+    // unconditionally -- the tempting reading -- makes that file load, which is a config Go
+    // never produces.
     if let Some((_, clawhub)) = entries
         .iter()
-        .find(|(k, _)| k == "clawhub")
-        .filter(|(_, value)| !matches!(value, Doc::Null))
+        .find(|(key, value)| key == "clawhub" && !matches!(value, Doc::Null))
         .cloned()
     {
         upsert(
@@ -1016,13 +974,28 @@ fn merge_model_list_into_array(m1: &mut Doc, m2: &mut Doc) -> Result<(), Error> 
         let Some((_, position)) = indexed.iter().find(|(k, _)| k == key) else {
             continue;
         };
-        let Some(keys) = entry.get("api_keys").cloned() else {
+        // Only a mapping entry assigns anything (`if vv, ok := v.(map[string]any)`), and
+        // what it assigns is `vv["api_keys"]` -- a missing key yields nil, so a matching
+        // entry that names no `api_keys` **clears** the model's keys instead of leaving
+        // them alone. Skipping there is the tempting reading and it diverges: the model
+        // keeps keys Go has just erased.
+        let Doc::Object(fields) = entry else {
             continue;
         };
-        if let Some(slot) = models[*position].get_mut_at("api_keys") {
-            *slot = keys;
-        } else {
-            models[*position].set("api_keys", keys);
+        match fields.iter().find(|(key, _)| key == "api_keys") {
+            Some((_, keys)) => {
+                if let Some(slot) = models[*position].get_mut_at("api_keys") {
+                    *slot = keys.clone();
+                } else {
+                    models[*position].set("api_keys", keys.clone());
+                }
+            }
+            // Go assigns nil, which the decoder turns back into a nil slice and
+            // `omitempty` then drops -- so the loaded value carries no key at all. An
+            // explicit null would be a different value that happens to print similarly.
+            None => {
+                models[*position].remove("api_keys");
+            }
         }
     }
 
@@ -2520,6 +2493,44 @@ mod tests {
     }
 
     #[test]
+    fn a_matching_entry_without_keys_clears_them_when_migrated_too() {
+        // The migrated path reaches the same rule by a different function, and the port had
+        // it only on the typed one. `mergeModelListsWithMap` (migration.go:521) assigns
+        // `mVal["api_keys"] = vv["api_keys"]`, and a missing key in `vv` yields nil -- so a
+        // matching entry that names no keys clears the model's keys there as well. Measured
+        // at picoclaw `1a4e1edf`, one process per scenario, against a document whose model
+        // starts with `sk-original`:
+        //
+        // | version | entry | Go's `api_keys` |
+        // | --- | --- | --- |
+        // | 3 | `m1:0: {}` | cleared |
+        // | 3 | `m1: {provider: other}` | cleared |
+        // | 2 | `m1:0: {}` | cleared |
+        // | 2 | `m1: {provider: other}` | cleared |
+        //
+        // Skipping a keyless match instead -- the tempting reading of "the file supplies
+        // each model's keys" -- leaves `sk-original` standing, which is a config Go does not
+        // produce, and it survives on the current version only because the typed pass has
+        // its own copy of the rule.
+        for version in ["2", "3"] {
+            let config = r#"{"version":%VERSION%,"model_list":[
+                {"model_name":"m1","model":"x","provider":"openai","api_keys":["sk-original"]}]}"#;
+            for spelling in ["m1:0: {}", "m1: {provider: other}"] {
+                let (_dir, path) = write_pair(
+                    &config.replace("%VERSION%", version),
+                    &format!("model_list:\n  {spelling}\n"),
+                );
+                let cfg = load(&path, "/home/oracle").expect("the pair loads");
+                assert_eq!(
+                    model_field(&cfg.document, 0, "api_keys"),
+                    None,
+                    "v{version} with `{spelling}` must clear the keys, not leave them alone"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_matching_entry_cannot_set_a_field_it_is_not_named_for() {
         // The security file is a secrets file. `SecureModelList.UnmarshalYAML` assigns
         // `api_keys` and nothing else, so `provider` here is inert -- merging the whole entry
@@ -2654,6 +2665,58 @@ mod tests {
     }
 
     #[test]
+    fn a_null_section_is_left_for_the_validator_even_when_its_sibling_is_lifted() {
+        // The per-key half of the lift's guard. Go's outer test is `m2["web"] != nil ||
+        // m2["skills"] != nil`, but each branch then asks the same question about *its own*
+        // key (`migration.go:429`, `:433`), so a null section is never lifted and the strict
+        // validator names it. Measured against Go at `f03fbd20`, one process per shape, on a
+        // legacy document that is valid at both versions (`model_name` *and* `model`, because
+        // `ModelConfig.Validate` requires both):
+        //
+        //   web: (null) + skills: mapping  -> unknown field(s): web
+        //   web: mapping + skills: (null)  -> unknown field(s): skills
+        //   both null                      -> unknown field(s): skills, web
+        //   tools: {} alone                -> loads
+        //
+        // The mixed rows are the whole point: the outer guard is satisfied either way, so a
+        // lift that tests only presence loads a document Go refuses.
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","model":"openai/gpt-4o"}]}"#;
+
+        let (_dir, path) = write_pair(legacy, "web:\nskills:\n  github:\n    token: gh\n");
+        let err = load(&path, "/home/oracle").expect_err("a null `web` is still a key");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "web"),
+            "Go refuses `unknown field(s): web`: {err}"
+        );
+
+        let (_dir, path) = write_pair(legacy, "web:\n  brave:\n    api_keys: [bk]\nskills:\n");
+        let err = load(&path, "/home/oracle").expect_err("a null `skills` is still a key");
+        assert!(
+            matches!(&err, Error::UnknownField(paths) if paths == "skills"),
+            "Go refuses `unknown field(s): skills`: {err}"
+        );
+
+        // Both null: the lift does not run at all, and each key is named on its own. Go's
+        // order is `skills, web`; the port's is whatever the document holds, so the assert
+        // names both without pinning an order Go gets from a map.
+        let (_dir, path) = write_pair(legacy, "web:\nskills:\n");
+        let err = load(&path, "/home/oracle").expect_err("neither null lifts");
+        assert!(
+            matches!(&err, Error::UnknownField(paths)
+                if paths.contains("web") && paths.contains("skills")),
+            "both nulls are named: {err}"
+        );
+
+        // Control: with no null in the file the same two sections lift and load, so the three
+        // refusals above are about `null` and not about a legacy document carrying them.
+        let (_dir, path) = write_pair(
+            legacy,
+            "web:\n  brave:\n    api_keys: [bk]\nskills:\n  github:\n    token: gh\n",
+        );
+        load(&path, "/home/oracle").expect("two present sections lift, as they always did");
+    }
+
+    #[test]
     fn the_web_section_of_the_security_file_reaches_tools() {
         // `Tools` is `yaml:",inline"`, so the file's top-level `web:` is a `tools` field and Go
         // applies it. This port reached the section and then dropped it, because the inline walk
@@ -2694,7 +2757,47 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_view_lifts_web_and_skills_into_tools() {
+    fn web_and_skills_are_reached_and_dropped_until_the_merge_carries_its_schema() {
+        // `Tools` is `yaml:",inline"`, so the file's top-level `web:` and `skills:` are
+        // `tools` fields and Go applies them. This port reaches them -- `apply_security`
+        // walks the inline branch and hands each child to `merge_filling` -- and then drops
+        // them, because `merge_filling` still asks the *root* schema whether a key is a
+        // field, and `web` is a field of `Tools`, not of `Config`.
+        //
+        // What each fault costs, measured one fault per run with the other 102 lib tests green:
+        // leaving `web` out of the inline walk fails this test *and*
+        // `a_security_node_that_does_not_fit_its_field_fails_the_load`; handing `merge_filling`
+        // the *root* schema fails the same two; handing it no child schema fails only the refusal
+        // test. So the walk has two witnesses and this is not a unique one -- what this
+        // assertion alone owns is that the value **lands with the right shape**, which the
+        // refusal test does not claim either way.
+        //
+        // The `skills` half of the same section is deliberately not asserted here: it never goes
+        // through `merge_filling` -- `skills::apply` rebuilds it -- and its own tests, starting at
+        // `a_null_registries_header_in_the_file_wipes_to_the_builtins_at_zero_values`, pin what
+        // the file's `skills` node does to the registries.
+        let (_dir, path) = write_pair(
+            ONE_MODEL,
+            "web:\n  brave:\n    api_keys: [bk-from-security]\n",
+        );
+        let cfg = load(&path, "/home/oracle").expect("the pair loads");
+        let tools = cfg.document.get("tools").expect("tools is in the defaults");
+        let api_keys: Vec<&str> = tools
+            .get("web")
+            .and_then(|w| w.get("brave"))
+            .and_then(|b| b.get("api_keys"))
+            .and_then(Doc::as_array)
+            .map(|items| items.iter().filter_map(Doc::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            api_keys,
+            vec!["bk-from-security"],
+            "the security file's search key lands on `tools.web.brave.api_keys`"
+        );
+    }
+
+    #[test]
+    fn the_legacy_data_merge_lifts_web_and_skills_into_tools() {
         // `Config.Tools` is `yaml:",inline"`, so `web` and `skills` are tools fields and the
         // lift keeps them legal under the strict validator. The lift also *replaces* the
         // file's own `tools` section -- `m2["tools"] = m3`, where `m3` holds only the two
@@ -2821,15 +2924,21 @@ mod tests {
     }
 
     #[test]
-    fn the_data_merge_rewrites_both_registry_spellings_and_keeps_their_asymmetry() {
-        // The rewrite is observable on the merged document the migration path decodes, so the
-        // helper asks the merge itself -- the same function `load` runs for a document below
-        // the current version, with an empty config.json on the other side so that every value
-        // these assertions read came out of the security file.
+    fn the_legacy_data_merge_rewrites_both_registry_spellings_and_keeps_their_asymmetry() {
+        // The rewrite lives in the data merge now, because the data merge is what carries a
+        // legacy document's security file into the config: `LoadConfig` reaches
+        // `loadSecurityConfig` only at `CurrentVersion`, so `load_config_map` is the one
+        // place these two spellings are rewritten for a migrated document. Asking it
+        // directly is what makes each assertion a fact about the shipped path rather than
+        // about a validator input.
         let view = |security: &str| {
-            let security = yaml::parse(security).expect("the security file parses");
-            load_config_map(&Doc::Object(Vec::new()), &security.document)
-                .expect("the merge itself does not fail")
+            load_config_map(
+                &Doc::Object(Vec::new()),
+                &yaml::parse(security)
+                    .expect("the security file parses")
+                    .document,
+            )
+            .expect("the data merge succeeds")
         };
         let registry = |view: &Doc, name: &str| {
             view.get("tools")
