@@ -52,6 +52,7 @@ mod marshal;
 mod multikey;
 mod schema;
 mod skills;
+mod validate;
 mod yaml;
 
 pub use defaults::{assert_table_shape, default_config, BUILTIN_MODEL_COUNT, TOP_LEVEL_KEYS};
@@ -138,6 +139,14 @@ pub enum Error {
     /// A channel the registry does not know, or settings its typed struct cannot hold.
     /// `InitChannelList`'s two refusals, with Go's sentence.
     Channel(String),
+    /// `ValidateTurnProfile`'s refusal: a profile block asking for `custom` where this
+    /// version has no custom implementation, or carrying a mode outside the three it
+    /// recognises. Go's sentence, kept because a user reads it.
+    TurnProfile(String),
+    /// `ValidateModelList`'s refusal -- a required field missing, an identifier with
+    /// whitespace or a stray slash, an unknown `tool_schema_transform`. Prefixed with
+    /// Go's `model_list[i]: `, where `i` counts the *expanded* list.
+    ModelList(String),
     Io(String),
 }
 
@@ -155,6 +164,7 @@ impl std::fmt::Display for Error {
             Self::VersionType(m) => write!(f, "{m}"),
             Self::NotPorted(m) => write!(f, "not ported: {m}"),
             Self::Channel(m) => write!(f, "{m}"),
+            Self::TurnProfile(m) | Self::ModelList(m) => write!(f, "{m}"),
             Self::Io(m) => write!(f, "{m}"),
         }
     }
@@ -241,19 +251,41 @@ impl Config {
 ///   cleared, so they are inert for every recorded case -- but a real process is not, and
 ///   this loader would silently differ from Go there. Recorded in
 ///   `docs/DIVERGENCES.md` with the three variables it reads.
-/// * `ValidateModelList` and `ValidateTurnProfile`. Both refuse a config rather than
-///   change one, and the corpus records no refusal for either, so a port that omits them
-///   accepts files the shipped binary rejects.
-/// * `validateSingletonChannels` and `validateChannelStreamingConfig`, the two validators
-///   at the end of `InitChannelList`. The singleton registry is Go-side data the schema
-///   dump does not carry, which is why closing this needs a Go-side decision and not only
-///   Rust work. Also recorded in `docs/DIVERGENCES.md`.
 ///
 /// Everything the fixture does reach is here: the version dispatch and the ladder, the
 /// migration's own security pre-merge ([`load_config_map`]), the decode and its unknown
 /// field refusal, the security file including both skills passes,
-/// `channels::init_channel_list`, `multikey::expand`, the session scope, and the
-/// persistence a migration owes the disk ([`make_backup`] and the deferred [`save`]).
+/// `channels::init_channel_list`, [`validate::turn_profile`], `multikey::expand`,
+/// [`validate::model_list`], the session scope, and the persistence a migration owes the
+/// disk ([`make_backup`] and the deferred [`save`]).
+///
+/// ## What grades the four validators
+///
+/// `LoadConfig` ends with two refusals (`ValidateTurnProfile`, `ValidateModelList`) and
+/// `InitChannelList` ends with two (`validateSingletonChannels`,
+/// `validateChannelStreamingConfig`). All four are ported; their *coverage* is uneven, and
+/// the difference is the kind that lets a green replay mean less than it looks.
+///
+/// * The streaming pair is graded by this fixture: `negative_streaming_throttle_seconds_is_refused`,
+///   `negative_streaming_min_growth_chars_is_refused`, the `_on_pico` and `_on_wecom`
+///   variants, and `zero_streaming_bounds_load`. Alongside them,
+///   `streaming_on_a_type_without_the_field_is_dropped_not_refused` is the reason the
+///   check cannot be generalised: Go applies it to the three settings structs that *have*
+///   a `Streaming` field and returns nil for every other channel type, which drops the
+///   node on the round trip instead of refusing it.
+/// * The other two refusals, and most of the singleton registry, are not graded by anything
+///   on this 96-case fixture: 42 of the corpus's 138 cases are newer than it. Among them are
+///   `two_enabled_channels_of_a_singleton_type_are_refused`,
+///   `a_disabled_second_singleton_channel_loads` and
+///   `a_singleton_type_reached_by_two_routes_is_refused` for the channel pair, and eleven
+///   for the model-entry and turn-profile rules ported here -- nine of the eleven are the
+///   refusals this port turns green, the other two being accept cases a missing validator
+///   passed by default. Until the bump lands, their pins are the unit tests beside them and
+///   not the replay. The bump's own cost
+///   is measured too: replaying the 138 corpus here leaves five disagreements, and all five
+///   are cases the bump itself brings in -- `#23`'s `float64` rewrite past 2^53 and `#15`'s
+///   four `api_keys` type refusals -- while every case this fixture already carries still
+///   matches byte for byte.
 ///
 /// The security file *is* read, because leaving it out would load a config whose secrets
 /// are in the wrong place. `channels`/`channel_list` and `model_list` are merged, and
@@ -418,11 +450,22 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // fields the file left out appear and the keys come back in declaration order.
     channels::init_channel_list(&mut merged, &config_schema())?;
 
+    // `ValidateTurnProfile`, in Go's position -- after the channel list, before the model
+    // expansion. The error is *captured* rather than returned here because a migration's
+    // `defer SaveConfig` runs at `LoadConfig`'s return whatever the validators decide: a
+    // migrated document that fails a validator still leaves the rewritten file behind. The
+    // return happens beside the migration write, at the bottom of this function.
+    let validation = validate::turn_profile(&merged);
+
     // `expandMultiKeyModels`, in Go's position: after the channel list, before the
     // session scope. It is the only stage that changes the *number* of model entries, so
     // it has to run after the security file has put the keys in and before anything reads
     // the list's length.
     let virtual_models = multikey::expand(&mut merged, &config_schema());
+
+    // `ValidateModelList`, after the expansion and so graded over the expanded list --
+    // which is why a fault in a multi-key entry is reported at the index of the copy.
+    let validation = validation.and_then(|()| validate::model_list(&merged));
 
     // The last two stages of LoadConfig, and the reason a loaded config can carry a
     // dm_scope the file never mentioned.
@@ -460,14 +503,20 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // the shipped binary has -- and the caller cannot retry, because `load` has already
         // returned the error instead of the config.
         //
-        // Timing, for whoever ports the stages listed in this function's doc: Go's `defer`
-        // runs at the *return* of `LoadConfig`, so it persists whatever the loader did after
-        // the migration switch -- `env.Parse` and the `Validate*` calls included. This writes
-        // at the migration point, which produces the same bytes only while nothing follows
-        // it. When those stages land, move this beside `Ok(config)` or the file on disk will
-        // disagree with the value the caller receives.
+        // Timing: Go's `defer` runs at the *return* of `LoadConfig`, so it persists whatever
+        // the loader did after the migration switch -- the two `Validate*` calls included. A
+        // migrated document that fails one of them still leaves the rewritten, version-raised
+        // file on disk while the caller gets only the error, which is why the write above is
+        // ordered before the return below and why the validators are captured rather than
+        // propagated where they run. (`env.Parse` still has no port at all; when it lands it
+        // belongs in the same position, ahead of both validators.)
         let _ = save(&path, &mut config, home);
     }
+
+    // The refusals the two validators decided, raised only now so the migration's deferred
+    // save has already happened. `MakeBackup`'s own failure still wins: in Go it returns
+    // from inside the migration arm, before either validator runs.
+    validation?;
 
     Ok(config)
 }
@@ -2448,8 +2497,10 @@ mod tests {
     }
 
     /// A v3 document with one model, `m1`, holding no keys.
-    const ONE_MODEL: &str =
-        r#"{"version":3,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+    /// The pair almost every security test loads. The entry carries `model` because
+    /// `ValidateModelList` refuses one without it: these fixtures were written while the
+    /// port had no validator, and Go rejects every file shaped like them.
+    const ONE_MODEL: &str = r#"{"version":3,"model_list":[{"model_name":"m1","provider":"openai","model":"gpt-4o-mini"}]}"#;
 
     #[test]
     fn the_security_file_merges_into_the_model_it_is_named_for() {
@@ -2481,8 +2532,7 @@ mod tests {
     fn a_matching_entry_without_keys_clears_them() {
         // `m.APIKeys = sec.APIKeys` is unconditional once the entry matches, so an entry
         // that names no keys assigns nil -- it does not leave the model's keys alone.
-        let config =
-            r#"{"version":3,"model_list":[{"model_name":"m1","api_keys":["sk-original"]}]}"#;
+        let config = r#"{"version":3,"model_list":[{"model_name":"m1","model":"gpt-4o-mini","api_keys":["sk-original"]}]}"#;
         let (_dir, path) = write_pair(config, "model_list:\n    m1:0: {}\n");
         let cfg = load(&path, "/home/oracle").expect("the pair loads");
         assert_eq!(
@@ -2565,7 +2615,7 @@ mod tests {
         // is the only field it names. (An earlier round of this PR's write-up credited the
         // file's "own typed decode", which is the v3 mechanism; the commit message of
         // 31043aec carries the same slip and is left as history rather than rewritten.)
-        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai","model":"gpt-4o-mini"}]}"#;
         let (_dir, path) = write_pair(
             legacy,
             "model_list:\n    m1:0:\n      provider: anthropic\n      api_keys: [sk-1]\n",
@@ -2629,7 +2679,7 @@ mod tests {
             "naming the type it wanted: {err}"
         );
 
-        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai","model":"gpt-4o-mini"}]}"#;
         let (_dir, path) = write_pair(legacy, security);
         let cfg = load(&path, "/home/oracle").expect("v2 loads the same file");
         assert!(
@@ -2655,7 +2705,7 @@ mod tests {
         let (_dir, path) = write_pair(ONE_MODEL, "nonsense:\n    a: 1\n");
         load(&path, "/home/oracle").expect("the current version ignores it");
 
-        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai","model":"gpt-4o-mini"}]}"#;
         let (_dir, path) = write_pair(legacy, "nonsense:\n    a: 1\n");
         let err = load(&path, "/home/oracle").expect_err("v2 refuses the same file");
         assert!(
@@ -2803,7 +2853,7 @@ mod tests {
         // file's own `tools` section -- `m2["tools"] = m3`, where `m3` holds only the two
         // lifted sections -- which is why a security file carrying both a `tools:` and a
         // `web:` section has its `tools:` thrown away.
-        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai"}]}"#;
+        let legacy = r#"{"version":2,"model_list":[{"model_name":"m1","provider":"openai","model":"gpt-4o-mini"}]}"#;
         let (_dir, path) = write_pair(
             legacy,
             "tools:\n  bogus: 1\nweb:\n  brave:\n    api_keys: [bk]\nskills:\n  github:\n    token: gh\n",
