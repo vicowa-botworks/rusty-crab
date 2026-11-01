@@ -335,7 +335,16 @@ impl<'de> Deserialize<'de> for Doc {
             }
 
             fn visit_u64<E>(self, v: u64) -> Result<Doc, E> {
-                Ok(Doc::Int(i64::try_from(v).unwrap_or(i64::MAX)))
+                // Past `i64::MAX` there is no integer left to keep. `encoding/json` hands
+                // every number to the decoder as a `float64`, so saturating at `i64::MAX`
+                // invents a value the file never held -- and renders it as
+                // `9223372036854775808` the moment anything formats the value through
+                // `%.0f`, because `i64::MAX as f64` rounds up to 2^63. Go's value at this
+                // literal is the float, and that is what the corpus records.
+                match i64::try_from(v) {
+                    Ok(v) => Ok(Doc::Int(v)),
+                    Err(_) => Ok(Doc::Float(v as f64)),
+                }
             }
 
             fn visit_f64<E>(self, v: f64) -> Result<Doc, E> {

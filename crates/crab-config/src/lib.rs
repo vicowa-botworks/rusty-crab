@@ -57,7 +57,9 @@ mod yaml;
 pub use defaults::{assert_table_shape, default_config, BUILTIN_MODEL_COUNT, TOP_LEVEL_KEYS};
 pub use doc::{from_json, Doc, Parsed};
 pub use marshal::{apply_omit, apply_session_shadow, config_file, loaded_value};
-pub use schema::{config_schema, unknown_fields, validate_against, Schema};
+pub use schema::{
+    config_schema, secure_strings_violations, unknown_fields, validate_against, Schema,
+};
 pub use yaml::{parse as parse_security, to_name_index, write as write_security, Security};
 
 use std::collections::BTreeMap;
@@ -138,6 +140,15 @@ pub enum Error {
     /// A channel the registry does not know, or settings its typed struct cannot hold.
     /// `InitChannelList`'s two refusals, with Go's sentence.
     Channel(String),
+    /// A position whose Go type brings its own decoder and rejects what the file holds.
+    ///
+    /// `SecureStrings` is the case that exists today: it is a slice, so the generic walk has
+    /// nothing to say about a scalar at it or a number inside it, and the unknown-field pass
+    /// cannot see either because both keys are real. Go refuses these during the decode, so
+    /// the load fails instead of keeping the file's bytes. The text names the position and the
+    /// value rather than quoting a Go sentence, because the wording is the one thing this
+    /// crate has no fixture for.
+    Decode(String),
     Io(String),
 }
 
@@ -155,6 +166,7 @@ impl std::fmt::Display for Error {
             Self::VersionType(m) => write!(f, "{m}"),
             Self::NotPorted(m) => write!(f, "not ported: {m}"),
             Self::Channel(m) => write!(f, "{m}"),
+            Self::Decode(m) => write!(f, "{m}"),
             Self::Io(m) => write!(f, "{m}"),
         }
     }
@@ -370,6 +382,18 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // the validated bytes a second time: the merge above already put its keys in `document`.
     validate_against(&document, &config_schema())
         .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
+    // The named-type half of the same decode. Every key involved is a *real* key, so the pass
+    // above has nothing to report: `api_keys` is a slice like any other to a walk that only
+    // places keys. Go gives `SecureStrings` its own decoder, which takes a list of strings and
+    // nothing else -- while `allow_from`, one screen away, *does* accept a bare scalar. That
+    // asymmetry is why this is keyed on the named type and not on the sequence shape: a rule
+    // written for "a slice of a custom scalar" would refuse `["alice"]` files Go loads.
+    if let Some((path, got)) = secure_strings_violations(&document, &config_schema()) {
+        return Err(Error::Decode(format!(
+            "{path}: a SecureStrings position holds {got}, and []config.SecureString decodes \
+             only a list of strings"
+        )));
+    }
     // That is also why the security file is never folded into the validated bytes a second
     // time: the merge above already put its keys in `document`. Validating a projection of
     // the file alongside the document -- the shape used before `load_config_map` existed --
@@ -410,6 +434,19 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // A migrated document must keep the document-side list, because that is where
         // `load_config_map` lifted the legacy `skills.github.token` out of the file; this
         // block never runs for one, so it cannot clobber it.
+
+        // The same decoder runs over the file's own values, and the two renders are not
+        // interchangeable: `api_keys: 42` in `.security.yml` is refused here at the current
+        // version -- where `yaml.v3` decodes the file into the typed structs -- while the
+        // document-side walk above never saw it, because that half only reads config.json. A
+        // migrated document takes the file in as plain data instead and is graded by the walk
+        // above, which is why this one sits inside the gate rather than beside it.
+        if let Some((path, got)) = secure_strings_violations(&merged, &config_schema()) {
+            return Err(Error::Decode(format!(
+                "security config: {path} holds {got}, and []config.SecureString decodes only a \
+                 list of strings"
+            )));
+        }
     }
 
     // `InitChannelList`, which sits here in Go too -- after the security merge, before

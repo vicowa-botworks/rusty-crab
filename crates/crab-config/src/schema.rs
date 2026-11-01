@@ -505,6 +505,95 @@ pub fn validate_against(document: &Doc, schema: &Schema) -> Result<(), Vec<Strin
 ///     the caller still reports.
 pub(crate) const FLEXIBLE_STRING_SLICE: &str = "FlexibleStringSlice";
 
+/// The other named slice type in the dump, and it behaves the opposite way.
+///
+/// `SecureStrings` is `[]config.SecureString` and `SecureString.UnmarshalJSON` unmarshals into
+/// a `string`: the array shape is required, and every element has to be a string (a `null`
+/// element is answered before that, the way Go's decoders answer null, and leaves the element
+/// empty). There is no scalar coercion to borrow, which is the whole reason the same file gets
+/// two answers: a bare string at `allow_from` loads as one element, a bare string at
+/// `api_keys` is refused. A port that models one sequence arm for both accepts files the
+/// shipped binary rejects.
+pub(crate) const SECURE_STRINGS: &str = "SecureStrings";
+
+/// The first `SecureStrings` position whose value Go's decoder would refuse, with what was
+/// there. `None` means every such position holds what `SecureStrings` accepts.
+///
+/// The traversal mirrors [`collect`], including the branches that stop descending when the
+/// shapes disagree -- and it stops at the first offender, because `json.Unmarshal` aborts at
+/// the first type error. What the fixture grades is that the load is refused and at which op,
+/// not a collected list, so a second opinion here would be a claim about Go's ordering that
+/// nothing has measured.
+pub fn secure_strings_violations(raw: &Doc, target: &Schema) -> Option<(String, &'static str)> {
+    let mut found = None;
+    check_shapes(raw, target, "", &mut found);
+    found
+}
+
+fn check_shapes(
+    raw: &Doc,
+    target: &Schema,
+    path: &str,
+    found: &mut Option<(String, &'static str)>,
+) {
+    if found.is_some() {
+        return;
+    }
+    match target {
+        Schema::Slice { elem, name, .. } => {
+            if matches!(name, Some(SECURE_STRINGS)) {
+                match raw {
+                    Doc::Null => return,
+                    Doc::Array(items) => {
+                        for (index, item) in items.iter().enumerate() {
+                            if !matches!(item, Doc::String(_) | Doc::Null) {
+                                *found = Some((format!("{path}[{index}]"), item.json_kind()));
+                                return;
+                            }
+                        }
+                    }
+                    other => {
+                        *found = Some((path.to_string(), other.json_kind()));
+                        return;
+                    }
+                }
+                return;
+            }
+            let Some(items) = raw.as_array() else {
+                return;
+            };
+            for (index, item) in items.iter().enumerate() {
+                check_shapes(item, elem, &format!("{path}[{index}]"), found);
+            }
+        }
+        Schema::Struct { .. } => {
+            let Some(entries) = raw.as_object() else {
+                return;
+            };
+            for (key, value) in entries {
+                if let Some(child) = target.field(key) {
+                    check_shapes(value, child, &append_json_path(path, key), found);
+                    if found.is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+        Schema::Map { elem, .. } => {
+            let Some(entries) = raw.as_object() else {
+                return;
+            };
+            for (key, value) in entries {
+                check_shapes(value, elem, &append_json_path(path, key), found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+        Schema::Scalar { .. } => {}
+    }
+}
+
 /// One element of the list Go ends up with: a string passes through, a number takes the
 /// `%.0f` arm, everything else takes `%v`.
 pub(crate) fn flexible_element_text(value: &Doc) -> Doc {
