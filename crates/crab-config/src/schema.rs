@@ -505,6 +505,184 @@ pub fn validate_against(document: &Doc, schema: &Schema) -> Result<(), Vec<Strin
 ///     the caller still reports.
 pub(crate) const FLEXIBLE_STRING_SLICE: &str = "FlexibleStringSlice";
 
+/// `SecureStrings` is `[]*SecureString`, and it is **not** a [`FLEXIBLE_STRING_SLICE`]. That one
+/// distinction is issue #15: the port had a single rule for named string slices, so it accepted
+/// at `api_keys` every shape the shipped binary refuses.
+///
+/// Which decoder method each file reaches is what decides the rule, so each half names its
+/// method and its line:
+///
+/// * `config.json` reaches `SecureStrings.UnmarshalJSON` (`pkg/config/config_struct.go:159`).
+///   It exists -- only `UnmarshalYAML` does not -- and it is where both of the document's rules
+///   come from: the nested `json.Unmarshal` into `[]*SecureString` inside that method is what
+///   makes the field need an array, and `SecureString.UnmarshalJSON` (`:241`), which decodes a
+///   `string`, is what makes every element need to be one.
+/// * A **`null` element is exempt**, for a reason that is code rather than implication: a JSON
+///   null decodes into a `*SecureString` as a nil pointer without that element's
+///   `UnmarshalJSON` ever running, and the filter at `:168-176` drops nil pointers before
+///   deciding anything. So `[null]` is behaviour of the type itself -- zero keys, and the next
+///   `save` omits the field -- and `[null, 1]` blames the number, not the null.
+/// * `.security.yml` reaches no method on the type at all, so yaml's generic decoder judges the
+///   field: it has to be a sequence. Each *element* then lands on
+///   `SecureString.UnmarshalYAML` (`:276`), which takes the node's raw text, so `api_keys: [42]`
+///   **loads** there.
+///
+/// The document asks for strings inside the array; the file does not. Measured at picoclaw
+/// `main`, one process per shape (the corpus records only that a load failed and at which op,
+/// never the sentence, so these are from `/tmp/opencode/picoclaw-probes/securestrings/probe.go`
+/// and `/tmp/opencode/picoclaw-probes/secstr-null/probe.go`, and nothing pins them):
+///
+/// ```text
+/// api_keys: "sk-1"     REFUSED  expected []*config.SecureString but got string
+/// api_keys: 42         REFUSED  expected []*config.SecureString but got number
+/// api_keys: [42]       REFUSED  expected string but got number
+/// api_keys: {}         REFUSED  expected []*config.SecureString but got object
+/// api_keys: true       REFUSED  expected []*config.SecureString but got bool
+/// api_keys: ["a"]      LOADED
+/// api_keys: null       LOADED   (nil slice)
+/// api_keys: [null]     LOADED   (nil slice -- the nil element is filtered out)
+/// api_keys: [null,"a"] LOADED   (one key: "a")
+/// ```
+///
+/// And the security file's own sentence, which is why this predicate cannot be shared: there,
+/// `api_keys: 42` is refused as `cannot unmarshal !!int `42` into config.SecureStrings`.
+pub(crate) const SECURE_STRINGS: &str = "SecureStrings";
+
+/// The type name Go puts in its yaml `TypeError` for [`SECURE_STRINGS`].
+pub(crate) const SECURE_STRINGS_GO_TYPE: &str = "config.SecureStrings";
+
+/// A slice field Go decodes as [`SECURE_STRINGS`].
+pub(crate) fn is_secure_strings(schema: &Schema) -> bool {
+    matches!(
+        schema,
+        Schema::Slice {
+            name: Some(SECURE_STRINGS),
+            ..
+        }
+    )
+}
+
+/// What Go's JSON decoder wanted at a [`SECURE_STRINGS`] position and what it was handed, the
+/// two halves of its sentence, or `None` when the shape decodes. `null` is answered before
+/// anything else in Go and leaves the slice nil, so it is accepted -- at the field *and* inside
+/// the array, where a null element becomes a nil `*SecureString` that the filter at
+/// `config_struct.go:168-176` drops. Skipping it is also what makes the blamed element agree
+/// with Go's: for `[null, 1]` Go says `expected string but got number`, and reporting the null
+/// instead would name the wrong position while still refusing.
+pub(crate) fn secure_strings_expectation(value: &Doc) -> Option<(&'static str, &'static str)> {
+    match value {
+        Doc::Null => None,
+        Doc::Array(items) => items.iter().find_map(|item| match item {
+            Doc::String(_) | Doc::Null => None,
+            other => Some(("string", json_kind(other))),
+        }),
+        other => Some((SECURE_STRING_ELEMENT, json_kind(other))),
+    }
+}
+
+/// Whether the security file's yaml decoder can place `value` in a [`SECURE_STRINGS`] field: a
+/// sequence, at any element shape, or `null`. See the type's own doc comment for why this is
+/// not [`secure_strings_expectation`].
+pub(crate) fn secure_strings_yaml_accepts(value: &Doc) -> bool {
+    matches!(value, Doc::Null | Doc::Array(_))
+}
+
+/// The word Go's `config.json type error` sentence uses for a JSON value's kind.
+pub(crate) fn json_kind(value: &Doc) -> &'static str {
+    match value {
+        Doc::Null => "null",
+        Doc::Bool(_) => "bool",
+        Doc::Int(_) | Doc::Float(_) => "number",
+        Doc::String(_) => "string",
+        Doc::Array(_) => "array",
+        Doc::Object(_) => "object",
+    }
+}
+
+/// `[]*config.SecureString`, the way Go names the slice type it wanted.
+const SECURE_STRING_ELEMENT: &str = "[]*config.SecureString";
+
+/// The first position in `document` that a [`SECURE_STRINGS`] field cannot hold, as
+/// `(dotted path, wanted, got)`, walking in document order because Go's decoder stops at the
+/// first mismatch.
+#[must_use]
+pub fn misplaced_secure_strings(
+    document: &Doc,
+    schema: &Schema,
+) -> Option<(String, &'static str, &'static str)> {
+    let mut found = None;
+    hunt(document, schema, "", &mut found);
+    found
+}
+
+/// The traversal [`collect`] makes, narrowed to the positions where the type is strict. It
+/// follows the schema rather than a list of field names, so a new `SecureStrings` field is
+/// covered by the dump alone -- the same reason `FlexibleStringSlice` is identified by its
+/// named type.
+fn hunt(
+    raw: &Doc,
+    target: &Schema,
+    path: &str,
+    found: &mut Option<(String, &'static str, &'static str)>,
+) {
+    if found.is_some() {
+        return;
+    }
+    // Hoisted above the match on purpose: the type is recognised wherever a schema position
+    // reaches it, not only as a struct field. The dump holds exactly five `SecureStrings` nodes
+    // today (`model_list[].api_keys` plus the four `tools.web.*` ones) and every one of them is
+    // a struct field, so a `[]SecureStrings` or a `map[string]SecureStrings` would be walked
+    // unjudged if this test lived inside the `Struct` arm -- and "the next regeneration covers
+    // it" is only a true statement about fields.
+    if is_secure_strings(target) {
+        if let Some((wanted, got)) = secure_strings_expectation(raw) {
+            *found = Some((path.to_string(), wanted, got));
+        }
+        return;
+    }
+    match target {
+        Schema::Struct { .. } => {
+            // A scalar where the type says struct is not this walk's problem, exactly as
+            // [`collect`] decides: the decode reports it, with a different sentence.
+            let Some(entries) = raw.as_object() else {
+                return;
+            };
+            for (key, value) in entries {
+                let Some(child) = target.field(key) else {
+                    continue;
+                };
+                hunt(value, child, &append_json_path(path, key), found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+        Schema::Slice { elem, .. } => {
+            let Some(items) = raw.as_array() else {
+                return;
+            };
+            for (i, item) in items.iter().enumerate() {
+                hunt(item, elem, &format!("{path}[{i}]"), found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+        Schema::Map { elem, .. } => {
+            let Some(entries) = raw.as_object() else {
+                return;
+            };
+            for (key, value) in entries {
+                hunt(value, elem, &append_json_path(path, key), found);
+                if found.is_some() {
+                    return;
+                }
+            }
+        }
+        Schema::Scalar { .. } => {}
+    }
+}
+
 /// One element of the list Go ends up with: a string passes through, a number takes the
 /// `%.0f` arm, everything else takes `%v`.
 pub(crate) fn flexible_element_text(value: &Doc) -> Doc {
