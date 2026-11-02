@@ -335,7 +335,16 @@ impl<'de> Deserialize<'de> for Doc {
             }
 
             fn visit_u64<E>(self, v: u64) -> Result<Doc, E> {
-                Ok(Doc::Int(i64::try_from(v).unwrap_or(i64::MAX)))
+                match i64::try_from(v) {
+                    Ok(i) => Ok(Doc::Int(i)),
+                    // Past the signed range Go's decoder has no integer to land in at all:
+                    // `encoding/json` hands a `float64` for every number, so the value is
+                    // approximated while it is being read and every later `%.0f` prints that
+                    // approximation. Saturating here kept the file's own digits nowhere and
+                    // invented `i64::MAX`, which then printed as `9223372036854775808` for a
+                    // file that said `12345678901234567890`. vicowa-botworks/rusty-crab#23.
+                    Err(_) => Ok(Doc::Float(v as f64)),
+                }
             }
 
             fn visit_f64<E>(self, v: f64) -> Result<Doc, E> {
@@ -464,6 +473,40 @@ mod tests {
             .expect("object");
         assert_eq!(inner[0].0, "b");
         assert_eq!(inner[1].0, "a");
+    }
+
+    #[test]
+    fn an_integer_past_the_signed_range_becomes_go_float64() {
+        // #23. The boundary is the parse, not the formatting: a saturated `Doc::Int` reaches
+        // `flexible_element_text` as `i64::MAX` and prints `9223372036854775808`, so no
+        // amount of care in the `%.0f` arm recovers what the file said.
+        let doc = from_json(r#"{"big":12345678901234567890}"#).into_doc();
+        let value = doc.get("big").expect("big");
+        assert!(matches!(value, Doc::Float(_)), "past i64::MAX: {value:?}");
+        assert_eq!(
+            crate::schema::flexible_element_text(value),
+            Doc::String("12345678901234567168".to_string()),
+            "Go's `%.0f` of the float64 the decoder actually handed over"
+        );
+    }
+
+    #[test]
+    fn the_signed_range_still_lands_in_an_integer() {
+        // Everything at or below `i64::MAX` keeps the exact integer, which is what every
+        // other reader of a document expects to find. Above it, `u64::MAX` rounds up to the
+        // nearest float64 and Go prints that, digits and all.
+        let doc =
+            from_json(r#"{"max":9223372036854775807,"over":18446744073709551615}"#).into_doc();
+        assert!(
+            matches!(doc.get("max"), Some(Doc::Int(i)) if *i == i64::MAX),
+            "the signed maximum stays exact"
+        );
+        let over = doc.get("over").expect("over");
+        assert!(matches!(over, Doc::Float(_)), "u64::MAX: {over:?}");
+        assert_eq!(
+            crate::schema::flexible_element_text(over),
+            Doc::String("18446744073709551616".to_string())
+        );
     }
 
     #[test]
