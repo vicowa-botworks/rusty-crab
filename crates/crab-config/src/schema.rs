@@ -505,30 +505,47 @@ pub fn validate_against(document: &Doc, schema: &Schema) -> Result<(), Vec<Strin
 ///     the caller still reports.
 pub(crate) const FLEXIBLE_STRING_SLICE: &str = "FlexibleStringSlice";
 
-/// `SecureStrings` is `[]*SecureString`, and it is **not** a [`FLEXIBLE_STRING_SLICE`]. It has
-/// no `UnmarshalJSON` and no `UnmarshalYAML` of its own, so the field keeps the array shape its
-/// type declares; only the *elements* are permissive, because `SecureString.UnmarshalYAML`
-/// takes a node's raw text. That one distinction is issue #15: the port had a single rule for
-/// named string slices, so it accepted at `api_keys` every shape the shipped binary refuses.
+/// `SecureStrings` is `[]*SecureString`, and it is **not** a [`FLEXIBLE_STRING_SLICE`]. That one
+/// distinction is issue #15: the port had a single rule for named string slices, so it accepted
+/// at `api_keys` every shape the shipped binary refuses.
 ///
-/// Measured at picoclaw `main`, one process per shape (the corpus records only that a load
-/// failed and at which op, never the sentence, so the sentences below are from
-/// `/tmp/opencode/picoclaw-probes/securestrings/probe.go` and nothing pins them):
+/// Which decoder method each file reaches is what decides the rule, so each half names its
+/// method and its line:
+///
+/// * `config.json` reaches `SecureStrings.UnmarshalJSON` (`pkg/config/config_struct.go:159`).
+///   It exists -- only `UnmarshalYAML` does not -- and it is where both of the document's rules
+///   come from: the nested `json.Unmarshal` into `[]*SecureString` inside that method is what
+///   makes the field need an array, and `SecureString.UnmarshalJSON` (`:241`), which decodes a
+///   `string`, is what makes every element need to be one.
+/// * A **`null` element is exempt**, for a reason that is code rather than implication: a JSON
+///   null decodes into a `*SecureString` as a nil pointer without that element's
+///   `UnmarshalJSON` ever running, and the filter at `:168-176` drops nil pointers before
+///   deciding anything. So `[null]` is behaviour of the type itself -- zero keys, and the next
+///   `save` omits the field -- and `[null, 1]` blames the number, not the null.
+/// * `.security.yml` reaches no method on the type at all, so yaml's generic decoder judges the
+///   field: it has to be a sequence. Each *element* then lands on
+///   `SecureString.UnmarshalYAML` (`:276`), which takes the node's raw text, so `api_keys: [42]`
+///   **loads** there.
+///
+/// The document asks for strings inside the array; the file does not. Measured at picoclaw
+/// `main`, one process per shape (the corpus records only that a load failed and at which op,
+/// never the sentence, so these are from `/tmp/opencode/picoclaw-probes/securestrings/probe.go`
+/// and `/tmp/opencode/picoclaw-probes/secstr-null/probe.go`, and nothing pins them):
 ///
 /// ```text
-/// api_keys: "sk-1"  REFUSED  expected []*config.SecureString but got string
-/// api_keys: 42      REFUSED  expected []*config.SecureString but got number
-/// api_keys: [42]    REFUSED  expected string but got number
-/// api_keys: {}      REFUSED  expected []*config.SecureString but got object
-/// api_keys: true    REFUSED  expected []*config.SecureString but got bool
-/// api_keys: ["a"]   LOADED
-/// api_keys: null    LOADED   (nil slice)
+/// api_keys: "sk-1"     REFUSED  expected []*config.SecureString but got string
+/// api_keys: 42         REFUSED  expected []*config.SecureString but got number
+/// api_keys: [42]       REFUSED  expected string but got number
+/// api_keys: {}         REFUSED  expected []*config.SecureString but got object
+/// api_keys: true       REFUSED  expected []*config.SecureString but got bool
+/// api_keys: ["a"]      LOADED
+/// api_keys: null       LOADED   (nil slice)
+/// api_keys: [null]     LOADED   (nil slice -- the nil element is filtered out)
+/// api_keys: [null,"a"] LOADED   (one key: "a")
 /// ```
 ///
-/// The security file is a different rule and cannot share this predicate: there, `api_keys: 42`
-/// is refused as `cannot unmarshal !!int `42` into config.SecureStrings` while `api_keys: [42]`
-/// **loads**, because yaml hands each element to `SecureString` as text. The document asks for
-/// strings inside the array; the file does not.
+/// And the security file's own sentence, which is why this predicate cannot be shared: there,
+/// `api_keys: 42` is refused as `cannot unmarshal !!int `42` into config.SecureStrings`.
 pub(crate) const SECURE_STRINGS: &str = "SecureStrings";
 
 /// The type name Go puts in its yaml `TypeError` for [`SECURE_STRINGS`].
@@ -547,12 +564,16 @@ pub(crate) fn is_secure_strings(schema: &Schema) -> bool {
 
 /// What Go's JSON decoder wanted at a [`SECURE_STRINGS`] position and what it was handed, the
 /// two halves of its sentence, or `None` when the shape decodes. `null` is answered before
-/// anything else in Go and leaves the slice nil, so it is accepted.
+/// anything else in Go and leaves the slice nil, so it is accepted -- at the field *and* inside
+/// the array, where a null element becomes a nil `*SecureString` that the filter at
+/// `config_struct.go:168-176` drops. Skipping it is also what makes the blamed element agree
+/// with Go's: for `[null, 1]` Go says `expected string but got number`, and reporting the null
+/// instead would name the wrong position while still refusing.
 pub(crate) fn secure_strings_expectation(value: &Doc) -> Option<(&'static str, &'static str)> {
     match value {
         Doc::Null => None,
         Doc::Array(items) => items.iter().find_map(|item| match item {
-            Doc::String(_) => None,
+            Doc::String(_) | Doc::Null => None,
             other => Some(("string", json_kind(other))),
         }),
         other => Some((SECURE_STRING_ELEMENT, json_kind(other))),
@@ -607,6 +628,18 @@ fn hunt(
     if found.is_some() {
         return;
     }
+    // Hoisted above the match on purpose: the type is recognised wherever a schema position
+    // reaches it, not only as a struct field. The dump holds exactly five `SecureStrings` nodes
+    // today (`model_list[].api_keys` plus the four `tools.web.*` ones) and every one of them is
+    // a struct field, so a `[]SecureStrings` or a `map[string]SecureStrings` would be walked
+    // unjudged if this test lived inside the `Struct` arm -- and "the next regeneration covers
+    // it" is only a true statement about fields.
+    if is_secure_strings(target) {
+        if let Some((wanted, got)) = secure_strings_expectation(raw) {
+            *found = Some((path.to_string(), wanted, got));
+        }
+        return;
+    }
     match target {
         Schema::Struct { .. } => {
             // A scalar where the type says struct is not this walk's problem, exactly as
@@ -618,15 +651,7 @@ fn hunt(
                 let Some(child) = target.field(key) else {
                     continue;
                 };
-                let child_path = append_json_path(path, key);
-                if is_secure_strings(child) {
-                    if let Some((wanted, got)) = secure_strings_expectation(value) {
-                        *found = Some((child_path, wanted, got));
-                        return;
-                    }
-                    continue;
-                }
-                hunt(value, child, &child_path, found);
+                hunt(value, child, &append_json_path(path, key), found);
                 if found.is_some() {
                     return;
                 }
