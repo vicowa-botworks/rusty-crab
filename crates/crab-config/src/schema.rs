@@ -611,6 +611,30 @@ const SECURE_STRING_ELEMENT: &str = "[]*config.SecureString";
 const SECURE_STRING: &str = "SecureString";
 /// `config.SkillsRegistriesConfig`, the one slice that answers to two different JSON shapes.
 const SKILLS_REGISTRIES: &str = "SkillsRegistriesConfig";
+/// `config.AgentModelConfig`, the other struct the wire carries as a bare string:
+/// `UnmarshalJSON` (`pkg/config/config.go:283-301`) tries a string first -- `"gpt-4"`, primary
+/// only, no fallbacks -- and reaches for the `{primary, fallbacks}` object only if that fails.
+/// `MarshalJSON` (`:303-312`) then collapses a primary with no fallbacks **back** to a string, so
+/// the string spelling is not a hand-edit someone tolerated: it is what `SaveConfig` writes.
+const AGENT_MODEL_CONFIG: &str = "AgentModelConfig";
+/// What Go names the wanted type at that position. Not the field's own struct: `UnmarshalJSON`
+/// hands `json.Unmarshal` an anonymous `raw` (`:288-292`), and [`crate::jsonerror::unwrap`] walks
+/// that pointer chain, so the sentence names `config.raw`. Measured one process per shape at
+/// picoclaw `99ea66d6` (`/tmp/opencode/picoclaw-probes/agentmodel/`, verdicts in `out.txt` and
+/// `out2.txt`); the two positions are the only two the dump types this way
+/// (`$.agents.list.model` and `$.agents.list.subagents.model`):
+///
+/// ```text
+/// agents.list[0].model "gpt-4"                 LOADED   primary "gpt-4", fallbacks nil
+/// agents.list[0].model 42                      REFUSED  expected config.raw but got number
+/// agents.list[0].model true                    REFUSED  expected config.raw but got bool
+/// agents.list[0].model null                    LOADED   the pointer stays nil, as at every position
+/// agents.list[0].model {"primary":"gpt-4"}     LOADED
+///            ... {"primary":"gpt-4","fallbacks":"x"}  REFUSED  field "fallbacks": expected []string but got string
+/// agents.list[0].subagents.model "x"           LOADED
+/// agents.list[0].subagents.model 7             REFUSED  expected config.raw but got number
+/// ```
+const AGENT_MODEL_CONFIG_GO_TYPE: &str = "config.raw";
 
 /// The first position in `document` whose JSON kind the type there cannot hold, as
 /// `(dotted path, what Go would name, the kind it got)`, walking in document order because
@@ -633,7 +657,13 @@ const SKILLS_REGISTRIES: &str = "SkillsRegistriesConfig";
 ///   is strict at its *container* and free below it: `extra_body: []` refuses
 ///   (`expected map[string]interface {} but got array`) while `extra_body: {"a":{"b":[1,2]}}`
 ///   loads.
-/// * **Two named types set their own kind rules.**
+/// * **Named types set their own kind rules, and there are exactly eight of them.**
+///   `git grep -c "func (.*) UnmarshalJSON(" -- pkg/config` at picoclaw `99ea66d6` answers eight,
+///   and each is accounted for here rather than left to the dump: [`FLEXIBLE_STRING_SLICE`],
+///   [`SECURE_STRINGS`], [`SECURE_STRING`] and [`AGENT_MODEL_CONFIG`] below, plus
+///   `RawNode` (judged nowhere, see the paragraph after this list), `ChannelsConfig` and
+///   `SkillRegistryConfig` (both decode a map, so the object-only arm is right for them), and
+///   [`SKILLS_REGISTRIES`]. A ninth would be a silent hole, because nothing else checks the list.
 ///   [`FLEXIBLE_STRING_SLICE`] exists to take what a `[]string` refuses -- `allow_from: 42` and
 ///   `allow_from: "a"` both load, as one-element lists -- and its decoder's last resort is a
 ///   string, so an *object* is the one shape it refuses (`expected string but got object`).
@@ -643,6 +673,11 @@ const SKILLS_REGISTRIES: &str = "SkillsRegistriesConfig";
 ///   `expected string but got number`) while its unknown keys are ignored, whereas the
 ///   sequence arm's unknown-key refusal comes from the diagnostics pass and is already made here
 ///   by [`collect`]. A non-object element refuses under either arm (`[[]]`, `{"x":42}`).
+/// * **Two structs arrive on the wire as a bare string**, so a `Struct` arm that demands an
+///   object would refuse a config Go both loads and writes: [`SECURE_STRING`] (36 positions) and
+///   [`AGENT_MODEL_CONFIG`] (2). Both accept a string, descend an object, and refuse the rest;
+///   neither is "a number is the only thing that offends it" -- `{"token":true}` and
+///   `agents.list[0].model: true` are both refused.
 ///
 /// What this walk does not judge is `RawNode` -- `channel_list[].settings`, which takes any kind
 /// *here* and is decoded into that channel's own settings struct by
@@ -677,9 +712,12 @@ const SKILLS_REGISTRIES: &str = "SkillsRegistriesConfig";
 /// The sentence itself is not pinned: a failing corpus case records `error_op_index` and nothing
 /// else (memory 1531), so `wanted` follows Go's `reflect` naming as closely as the dump allows
 /// -- `config.Channel` for a struct, `[]config.AgentConfig` for a slice of structs, a bare
-/// `string`/`int`/`bool`/`float64` for a scalar -- and one position is known to be off:
+/// `string`/`int`/`bool`/`float64` for a scalar -- and two positions are known to be off.
 /// `channel_list.<name>` is `config.channelsConfigAlias` in Go's sentence, and the dump names the
-/// same map `ChannelsConfig` because the alias does not survive to that depth in the dump.
+/// same map `ChannelsConfig` because the alias does not survive to that depth in the dump. And at
+/// [`AGENT_MODEL_CONFIG`] Go says [`AGENT_MODEL_CONFIG_GO_TYPE`], naming the anonymous struct its
+/// `UnmarshalJSON` hands the decoder rather than the field's declared type; that one is not a
+/// dump limitation but a measured name, so the code spells it instead of deriving it.
 #[must_use]
 pub fn misplaced_typed_values(
     document: &Doc,
@@ -732,6 +770,23 @@ fn hunt(
             if *name == Some(SECURE_STRING) {
                 if !matches!(raw, Doc::String(_)) {
                     *found = Some((path.to_string(), go_type_name(*name), json_kind(raw)));
+                }
+                return;
+            }
+            // `AgentModelConfig` is the same shape -- a struct whose decoder opens with a string
+            // attempt -- and the exemption list above was one name short of the eight types with
+            // their own `UnmarshalJSON`. Refusing here was not a wording drift: the port rejected
+            // `"model": "gpt-4"`, which is what `SaveConfig` itself writes for a primary with no
+            // fallbacks, so a config the Go binary produced would not load here. An object
+            // therefore falls through to the ordinary descent, a string is the value, and the
+            // remaining kinds are refused under the name Go's sentence uses.
+            if *name == Some(AGENT_MODEL_CONFIG) && !matches!(raw, Doc::Object(_)) {
+                if !matches!(raw, Doc::String(_)) {
+                    *found = Some((
+                        path.to_string(),
+                        AGENT_MODEL_CONFIG_GO_TYPE.to_string(),
+                        json_kind(raw),
+                    ));
                 }
                 return;
             }

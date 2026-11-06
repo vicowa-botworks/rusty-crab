@@ -64,8 +64,9 @@
 //!   ignore it", so `[{name: clawhub, enabled: false}]` came out with the builtin still enabled
 //!   -- a different config, not a refused one. Two cases grade the arm now
 //!   (`a_sequence_of_skill_registries_adds_the_entry_named_by_its_element`,
-//!   `..._merges_into_the_builtin_it_names`), and the pair was derived from Go's own decoder
-//!   comment, `config_struct.go:341-343`, not from a guess. What the pair does *not* witness is
+//!   `..._merges_into_the_builtin_it_names`), and `a_registries_sequence_element_*` pin the same
+//!   verdicts inside this crate, because those two cases live in a fixture this branch does not
+//!   carry yet. What the pair does *not* witness is
 //!   `[{}]` and an element whose `name` is empty or not a string -- this module adds nothing for
 //!   those, on the strength of `Set` refusing an empty name, with no case pinning it.
 
@@ -362,13 +363,11 @@ fn rebuild(
         // of this type and is not the same answer (issue #29).
         //
         // `SkillsRegistriesConfig.UnmarshalJSON` (`config_struct.go:360`) tries a JSON sequence
-        // first, so `[{...}]` is a config the shipped binary loads. Its comment says the shape
-        // exists so a `.security.yml` written in the `registries: [{name: clawhub}]` spelling
-        // survives `SaveConfig` -> `LoadConfig`, and `docs/DIVERGENCES.md:85-87` already says so
-        // outright: "a port that reads only `Object` would reject or drop a valid config." What
-        // it does with each element is what makes this a merge and not a replacement: the slice
-        // it decodes into is the one the defaults already put there, so a builtin the file named
-        // is cloned with its defaults intact and the element is decoded *over the clone*.
+        // first, so `[{...}]` is a config the shipped binary loads. The method carries no doc
+        // comment, so the shape is pinned by measurement rather than by a sentence in the source:
+        // what it does with each element is what makes this a merge and not a replacement -- the
+        // slice it decodes into is the one the defaults already put there, so a builtin the file
+        // named is cloned with its defaults intact and the element is decoded *over the clone*.
         // Measured one process per shape at picoclaw `99ea66d6`, no `.security.yml`:
         //
         // | document `registries` | Go's loaded set |
