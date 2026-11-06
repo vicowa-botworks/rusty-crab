@@ -66,33 +66,39 @@ this file as long as observable behaviour is identical. They belong in
   records the loaded value. Until then the replay staying green says nothing about this.
 - Recorded: 2026-10-27, #7.
 
-### A scalar at a document's `registries` is refused by Go and loads here
+### Wording of a refused document type, and of a `registries` node
 
-- Go: `tools.skills.registries` is decoded through the `jsontext` map reader, so a scalar is a
-  type error naming its own line and column -- measured at picoclaw `1a4e1edf`, whose
-  `pkg/config` loader differs from the `01635da3` the review ran at only by `schema_dump.go`
-  and a test file:
+- Go: a JSON kind the target type cannot place fails the load, and the sentence is laid out --
+  line, column, the field path in quotes when the decoder has one, the offending line quoted and
+  a caret under it. Two measured instances:
   `config.json type error at line 1, column 3: expected map[string]jsontext.Value but got
-  string`, with the offending line quoted and a caret under the path. A sequence is *not* in
-  that family: it is ignored, and the builtin registries stand at their defaults.
-- Rust: `skills::rebuild` treats a sequence as "ignored, baseline stands" (pinned by
-  `a_non_mapping_registries_node_leaves_the_builtins_standing`, which covers both that and a
-  document `null`) and leaves a scalar in the document untouched rather than refusing it,
-  because this crate has no stage that raises Go's `jsontext` type error at all -- the
-  unknown-field validator reports names, not kinds, and the two sentences differ.
-- Why it is left: inventing a refusal here would be inventing its wording too, and the
-  measured Go sentence -- `config.json type error at line 1, column 1: expected
-  map[string]jsontext.Value but got number`, at picoclaw `01635da3` -- belongs to a loader
-  stage this crate has not ported. The blast radius
-  is a config that should not load, loading with a scalar where a registry map belongs; the
-  registries themselves come back as the baseline's, so nothing silently gains a credential.
-- Closes with: the type-error stage, which is the same missing stage as the `SecureString`
-  number refusal in vicowa-botworks/rusty-crab#15.
-- Recorded: 2026-10-28, #8 round 4. The entry this replaces -- "a null or non-mapping
-  `registries` section cannot be answered without the builtin registries" -- was wrong about
-  its own cause: the names and defaults are in the embedded `defaults.json`, which is the
-  baseline `load` merges into, so both arms were four lines each and they are now landed
-  (`normalise_document` for the document side, the null-header wipe for the file's).
+  string` for a scalar at `tools.skills.registries` (picoclaw `1a4e1edf`), and
+  `config.json type error at line 1, column 28 for field "telegram.enabled": expected bool but
+  got string` for a string at a channel's `enabled` (picoclaw `99ea66d6`). Note the type each
+  sentence names: the `registries` position says `map[string]jsontext.Value`, Go's *decoder*
+  type, not the field's Go type.
+- Rust: `crates/crab-config/src/schema.rs` walks the embedded schema dump and refuses at the
+  first position whose kind the type cannot hold -- the same positions, the same load outcome --
+  but renders `expected <type> but got <kind> at <dotted.path>` with no line, no column, no
+  quoted line and no caret, and names the type as the dump knows it
+  (`config.SkillsRegistriesConfig`, not `map[string]jsontext.Value`).
+- Why: the layout belongs to `wrapJSONError`, which needs the byte offset of the failing token;
+  this crate parses to a `Doc` and does not keep token offsets. A failing corpus case records
+  `error_op_index` and no text at all, so nothing in the conformance set can pin either form --
+  the refusal is graded, the sentence is not.
+- Blast radius: anyone pattern-matching the error text. Which config loads, and which does not,
+  is the same on both sides as of this entry.
+- Recorded: 2026-10-28, #8 round 4, as "a scalar at a document's `registries` is refused by Go
+  and loads here". **Closed as a behaviour** by the strict-decode walk: the scalar, the
+  `SecureString` number and the non-sequence-at-a-typed-position families all refuse here now.
+  What closed it also corrected two claims this entry had made about Go. A
+  `tools.skills.registries` **sequence** is not "ignored, the builtins standing at their
+  defaults": `SkillsRegistriesConfig.UnmarshalJSON` (`pkg/config/config_struct.go:360`) decodes a
+  sequence by merging each element over the builtin it names by `name`, so
+  `[{name: clawhub, enabled: false}]` is a config that *changes* the set
+  (`skills::rebuild`, and the two `a_sequence_of_skill_registries_*` cases). And the "same missing
+  stage as the `SecureString` number refusal in vicowa-botworks/rusty-crab#15" it pointed at had
+  already landed; the stage was missing for the other types only.
 
 
 

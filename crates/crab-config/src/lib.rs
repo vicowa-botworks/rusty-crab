@@ -418,15 +418,15 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // the validated bytes a second time: the merge above already put its keys in `document`.
     validate_against(&document, &config_schema())
         .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
-    // Go's decode is typed, so a shape it cannot place fails the load with its own sentence,
-    // and it checks *every* field. This walk checks the one named type where being permissive
-    // is silently wrong: `SecureStrings`, which does not have the tolerance the port assumed
-    // every named string slice has (issue #15). The rest of Go's type errors stay unported and
-    // tracked rather than assumed away -- a `model_list` holding a bare number is refused by
-    // the shipped binary and still loads here, which is stated in the issue filed with this
-    // change, not hidden by it.
-    if let Some((path, wanted, got)) = schema::misplaced_secure_strings(&document, &config_schema())
-    {
+    // Go's decode is typed, so a shape it cannot place fails the load with its own sentence, and
+    // it checks *every* field. This walk is that generality: every position in the dump is judged
+    // by what its type can hold, with the exceptions the measurement found (a null anywhere, the
+    // raw passthroughs, `FlexibleStringSlice`, the two arms of `SkillsRegistriesConfig`). It
+    // started as the single named type where being permissive was silently wrong -- `SecureStrings`
+    // (issue #15) -- and issue #25 asked for exactly this generalization once the other half of
+    // its refusal cases were pinned by the corpus: a `model_list` holding a bare number is refused
+    // by the shipped binary and used to load here.
+    if let Some((path, wanted, got)) = schema::misplaced_typed_values(&document, &config_schema()) {
         return Err(Error::TypeMismatch(format!(
             "expected {wanted} but got {got} at {path}"
         )));
@@ -1421,9 +1421,11 @@ fn schema_type(schema: &Schema) -> String {
     // `tools.web.*` positions alike, which the `model_list` pass and this generic one reach by
     // different routes. Without the qualification the same field is named two different ways
     // depending on which refusal met it. The dump's other names carry the same unprefixed
-    // drift and are left alone: they are unmeasured, no corpus case grades a sentence (a
-    // refusing case records `error_op_index` and nothing else), and the general type-check gap
-    // that would produce most of those sentences is issue #25.
+    // drift and are left alone: they are unmeasured, and no corpus case grades a sentence (a
+    // refusing case records `error_op_index` and nothing else). The `config.json` half of the
+    // same naming problem is [`crate::schema::misplaced_typed_values`], which qualifies a name
+    // through `go_type_name` on its way to the same answer for this type; two routes, one
+    // spelling, and the exception above is what keeps them one spelling.
     if crate::schema::is_secure_strings(schema) {
         return crate::schema::SECURE_STRINGS_GO_TYPE.to_string();
     }
@@ -2483,24 +2485,30 @@ mod tests {
     }
 
     /// A bare bool or object at a `FlexibleStringSlice` falls through every arm of Go's
-    /// decoder, which refuses it naming the type. The override restored that by falling back
-    /// to the stored document, whose value then lands in the mismatch arm; before it, the
-    /// field projected to `Null`, `omitzero` dropped it, and the load *succeeded* with the
-    /// field absent -- a silently different config, the case the `Struct` arm exists for one
-    /// arm over.
+    /// decoder and the load fails. What the port used to say is not what Go says: this
+    /// assertion asked for `FlexibleStringSlice`, which is the crate's own sentence from
+    /// `fix(config): make the flexible-slice coercion an override, not a replacement`, and the
+    /// type name appears nowhere in Go's diagnostic. Measured one process per shape at picoclaw
+    /// `99ea66d6`, at `tools.web.private_host_whitelist`: `true` -> `expected string but got
+    /// bool`, `{"a":"b"}` -> `expected string but got object`, while `42`, `1.5`, `"a"`,
+    /// `[true]` and `[{"a":1}]` all **load** -- so the refusal is about the node's own kind and
+    /// not about what the elements are. The walk in [`crate::schema::misplaced_typed_values`]
+    /// now raises the measured sentence before the coercion is reached; the guard here is the
+    /// one the test was always for: a value Go refuses must not be *erased* into a config that
+    /// loads with the field absent.
     #[test]
     fn a_bool_or_object_at_a_flexible_slice_is_refused() {
-        for value in ["true", r#"{"a":"b"}"#] {
+        for (value, wanted) in [
+            ("true", "expected string but got bool"),
+            (r#"{"a":"b"}"#, "expected string but got object"),
+        ] {
             let document = format!(
                 r#"{{"version":3,"session":{{"dm_scope":"per-channel"}},"channel_list":{{"telegram":{{"allow_from":{value}}}}}}}"#
             );
             let (_dir, path) = write_temp(&document);
             let err = load(&path, "/home/oracle")
                 .expect_err("a bool or object at a FlexibleStringSlice is refused, not erased");
-            assert!(
-                err.to_string().contains("FlexibleStringSlice"),
-                "{value}: got {err}"
-            );
+            assert!(err.to_string().contains(wanted), "{value}: got {err}");
         }
     }
 

@@ -501,8 +501,12 @@ pub fn validate_against(document: &Doc, schema: &Schema) -> Result<(), Vec<Strin
 ///   * a number goes through `%.0f`, which rounds half to even (1.5 and 2.5 are both `"2"`)
 ///     and keeps the sign of a value that rounds to zero (-0.4 is `"-0"`).
 ///   * only an *element* of an array reaches `%v`. A bare object or bool at the field falls
-///     through every arm of Go's decoder and is a load error naming the type, which is what
-///     the caller still reports.
+///     through every arm of the decoder and is refused -- but the sentence names the kind it
+///     wanted, `expected string but got bool`, and never this type's name. Re-measured at
+///     picoclaw `99ea66d6` against `LoadConfig` at `channel_list.telegram.allow_from` and at
+///     `tools.web.private_host_whitelist`, which answer identically; [`misplaced_typed_values`]
+///     now raises that sentence from the root walk, where the channel decode used to invent a
+///     `config.FlexibleStringSlice` sentence Go does not print.
 pub(crate) const FLEXIBLE_STRING_SLICE: &str = "FlexibleStringSlice";
 
 /// `SecureStrings` is `[]*SecureString`, and it is **not** a [`FLEXIBLE_STRING_SLICE`]. That one
@@ -602,28 +606,99 @@ pub(crate) fn json_kind(value: &Doc) -> &'static str {
 /// `[]*config.SecureString`, the way Go names the slice type it wanted.
 const SECURE_STRING_ELEMENT: &str = "[]*config.SecureString";
 
-/// The first position in `document` that a [`SECURE_STRINGS`] field cannot hold, as
-/// `(dotted path, wanted, got)`, walking in document order because Go's decoder stops at the
-/// first mismatch.
+/// `config.SecureString`, the scalar Go reaches for at 36 positions -- a struct in the dump
+/// because it has a `MarshalJSON`, a bare string on the wire.
+const SECURE_STRING: &str = "SecureString";
+/// `config.SkillsRegistriesConfig`, the one slice that answers to two different JSON shapes.
+const SKILLS_REGISTRIES: &str = "SkillsRegistriesConfig";
+
+/// The first position in `document` whose JSON kind the type there cannot hold, as
+/// `(dotted path, what Go would name, the kind it got)`, walking in document order because
+/// Go's decoder stops at the first mismatch.
+///
+/// `encoding/json` is typed and `LoadConfig` asks for no leniency, so a kind the target cannot
+/// place fails the load wherever it appears -- which is the general statement [`collect`] could
+/// only make about unknown *keys*. It cannot be implemented as "the decoder is strict", though:
+/// three families of position are not, and each was measured one process per shape against
+/// `LoadConfig` at picoclaw `99ea66d6` (`/tmp/opencode/picoclaw-probes/strict/`, with the
+/// verdicts kept in `strict.txt` and `strict2.txt`) rather than assumed:
+///
+/// * **`null` is accepted at every position**, struct, map, slice, scalar and `SecureString`
+///   alike. `encoding/json` answers a null before consulting the type and leaves the zero value,
+///   so `{"agents":{"defaults":{"workspace":null}}}` and `{"tools":{"skills":null}}` both load.
+///   It is therefore never descended and never judged.
+/// * **Raw passthroughs accept any kind.** `json.RawMessage`
+///   (`agents.defaults.context_manager_config`) took a string, an object and an array; `any` --
+///   the element type of `model_list[].extra_body` -- takes anything, which is why that position
+///   is strict at its *container* and free below it: `extra_body: []` refuses
+///   (`expected map[string]interface {} but got array`) while `extra_body: {"a":{"b":[1,2]}}`
+///   loads.
+/// * **Two named types set their own kind rules.**
+///   [`FLEXIBLE_STRING_SLICE`] exists to take what a `[]string` refuses -- `allow_from: 42` and
+///   `allow_from: "a"` both load, as one-element lists -- and its decoder's last resort is a
+///   string, so an *object* is the one shape it refuses (`expected string but got object`).
+///   [`SKILLS_REGISTRIES`] answers a mapping and a sequence alike (issue #29), and the two arms
+///   judge their contents differently: under the mapping arm a value decodes into a
+///   `SkillRegistryConfig` whose *fields* are typed (`{"clawhub":{"base_url":1}}` refuses
+///   `expected string but got number`) while its unknown keys are ignored, whereas the
+///   sequence arm's unknown-key refusal comes from the diagnostics pass and is already made here
+///   by [`collect`]. A non-object element refuses under either arm (`[[]]`, `{"x":42}`).
+///
+/// What this walk does not judge is `RawNode` -- `channel_list[].settings`, which takes any kind
+/// *here* and is decoded into that channel's own settings struct by
+/// [`crate::channels::init_channel_list`]. That stage is where Go's sentence for a fractional
+/// `media_group_delay_ms` comes from (`a_fractional_number_in_an_int_channel_field`), and
+/// reaching the same verdict a second time from the root is the doubled-seam mistake this crate
+/// has already made once on the security file.
+///
+/// Placement is the migrated document, not the file as written, because that is what Go's
+/// decoder is handed: `case 0..=2` merges `.security.yml` in as plain data, runs the ladder, and
+/// decodes the result -- which is also where [`validate_against`] already looks. Judging the
+/// written bytes instead would refuse a config Go migrates into something valid, and the
+/// `api_key` -> `api_keys` fold (`unique_api_keys`) is exactly that shape: it deletes a scalar
+/// `api_key` and writes a list, so a legacy document carrying both spellings -- `api_key` a
+/// string, `api_keys` a string -- loads. Measured one process per shape at picoclaw `99ea66d6`
+/// against `LoadConfig`, and against this crate at the same shapes, same verdict every time:
+///
+/// ```text
+/// v1 model_list[].api_key "sk-1" + api_keys "sk-2"   LOADED   (the fold rewrites the pair)
+/// v1 model_list[].api_keys ["sk-2"]                  LOADED
+/// v1 model_list[].api_keys 42                        REFUSED  expected []*config.SecureString but got number
+/// v2 model_list[].api_keys {"a":1}                   REFUSED  expected []*config.SecureString but got object
+/// v2 model_list 42                                   REFUSED  expected []map[string]interface {} but got number
+/// ```
+///
+/// The last line is where the two still part company, and it is wording only: on the migration
+/// path Go's first decode is into `[]map[string]interface{}`, so its sentence names the loose
+/// type, while this walk already knows the field's real one. No corpus case spells `version: 0`
+/// as a value (memory 1597) or carries a bad kind on the legacy path, so nothing pins either
+/// form.
+///
+/// The sentence itself is not pinned: a failing corpus case records `error_op_index` and nothing
+/// else (memory 1531), so `wanted` follows Go's `reflect` naming as closely as the dump allows
+/// -- `config.Channel` for a struct, `[]config.AgentConfig` for a slice of structs, a bare
+/// `string`/`int`/`bool`/`float64` for a scalar -- and one position is known to be off:
+/// `channel_list.<name>` is `config.channelsConfigAlias` in Go's sentence, and the dump names the
+/// same map `ChannelsConfig` because the alias does not survive to that depth in the dump.
 #[must_use]
-pub fn misplaced_secure_strings(
+pub fn misplaced_typed_values(
     document: &Doc,
     schema: &Schema,
-) -> Option<(String, &'static str, &'static str)> {
+) -> Option<(String, String, &'static str)> {
     let mut found = None;
     hunt(document, schema, "", &mut found);
     found
 }
 
-/// The traversal [`collect`] makes, narrowed to the positions where the type is strict. It
-/// follows the schema rather than a list of field names, so a new `SecureStrings` field is
-/// covered by the dump alone -- the same reason `FlexibleStringSlice` is identified by its
-/// named type.
+/// The traversal [`collect`] makes, narrowed to the positions where the type decides what it can
+/// hold. It follows the schema rather than a list of field names, so a new strict field is
+/// covered by the dump alone -- the same reason `FlexibleStringSlice` and `SecureStrings` are
+/// identified by their named type.
 fn hunt(
     raw: &Doc,
     target: &Schema,
     path: &str,
-    found: &mut Option<(String, &'static str, &'static str)>,
+    found: &mut Option<(String, String, &'static str)>,
 ) {
     if found.is_some() {
         return;
@@ -636,15 +711,32 @@ fn hunt(
     // it" is only a true statement about fields.
     if is_secure_strings(target) {
         if let Some((wanted, got)) = secure_strings_expectation(raw) {
-            *found = Some((path.to_string(), wanted, got));
+            *found = Some((path.to_string(), wanted.to_string(), got));
         }
         return;
     }
+    if matches!(raw, Doc::Null) {
+        return;
+    }
     match target {
-        Schema::Struct { .. } => {
-            // A scalar where the type says struct is not this walk's problem, exactly as
-            // [`collect`] decides: the decode reports it, with a different sentence.
+        Schema::Scalar { name, .. } => {
+            if let Some(wanted) = scalar_mismatch(*name, raw) {
+                *found = Some((path.to_string(), wanted, json_kind(raw)));
+            }
+        }
+        Schema::Struct { name, .. } => {
+            // A struct on the wire as a bare string. `SecureString.UnmarshalJSON` accepts a
+            // string and refuses every other kind -- `{"token":true}` is refused, so the type
+            // error is not "only a number offends it" -- and the 36 positions of this type are
+            // exactly the surface issue #15 was filed against.
+            if *name == Some(SECURE_STRING) {
+                if !matches!(raw, Doc::String(_)) {
+                    *found = Some((path.to_string(), go_type_name(*name), json_kind(raw)));
+                }
+                return;
+            }
             let Some(entries) = raw.as_object() else {
+                *found = Some((path.to_string(), go_type_name(*name), json_kind(raw)));
                 return;
             };
             for (key, value) in entries {
@@ -657,8 +749,60 @@ fn hunt(
                 }
             }
         }
-        Schema::Slice { elem, .. } => {
+        Schema::Slice {
+            elem,
+            name: Some(SKILLS_REGISTRIES),
+            ..
+        } => match raw {
+            // The sequence arm: `[{...}]`. Judged element by element against the entry type,
+            // which is what refuses `[[]]` and `[42]`.
+            Doc::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    hunt(item, elem, &format!("{path}[{i}]"), found);
+                    if found.is_some() {
+                        return;
+                    }
+                }
+            }
+            // The mapping arm: `{"name":{...}}`. Not a JSON array at all, and this is the only
+            // walk that reaches inside it -- [`collect`] stops here on purpose, because Go's
+            // diagnostics pass does not descend a slice position holding an object, which is why
+            // an unknown key in the mapping spelling loads and the same key in the sequence
+            // spelling is refused.
+            Doc::Object(entries) => {
+                for (key, value) in entries {
+                    hunt(value, elem, &append_json_path(path, key), found);
+                    if found.is_some() {
+                        return;
+                    }
+                }
+            }
+            other => {
+                *found = Some((
+                    path.to_string(),
+                    go_type_name(Some(SKILLS_REGISTRIES)),
+                    json_kind(other),
+                ))
+            }
+        },
+        Schema::Slice { elem, name, .. } => {
+            if *name == Some(FLEXIBLE_STRING_SLICE) {
+                // The type's own decoder is a chain of attempts, and only two kinds fall off the
+                // end of it: a string, a number (`%.0f`, half-to-even), an array (`%v` per
+                // element) and `null` all load, while a **bool** and an **object** are refused.
+                // Measured one process per shape at picoclaw `99ea66d6` at
+                // `channel_list.telegram.allow_from` and at `tools.web.private_host_whitelist`,
+                // which answer identically: `true` -> `expected string but got bool`,
+                // `{"a":"b"}` -> `expected string but got object`, and `42`, `1.5`, `"a"`, `[true]`
+                // and `[{"a":1}]` all load. The last two are the reason the array is not descended:
+                // an element is stringified by `%v` rather than judged.
+                if matches!(raw, Doc::Bool(_) | Doc::Object(_)) {
+                    *found = Some((path.to_string(), "string".to_string(), json_kind(raw)));
+                }
+                return;
+            }
             let Some(items) = raw.as_array() else {
+                *found = Some((path.to_string(), go_type_name(*name), json_kind(raw)));
                 return;
             };
             for (i, item) in items.iter().enumerate() {
@@ -668,8 +812,9 @@ fn hunt(
                 }
             }
         }
-        Schema::Map { elem, .. } => {
+        Schema::Map { elem, name, .. } => {
             let Some(entries) = raw.as_object() else {
+                *found = Some((path.to_string(), go_type_name(*name), json_kind(raw)));
                 return;
             };
             for (key, value) in entries {
@@ -679,7 +824,64 @@ fn hunt(
                 }
             }
         }
-        Schema::Scalar { .. } => {}
+    }
+}
+
+/// What Go's decoder wanted at a scalar position of named type `name` and did not get, or `None`
+/// when the value fits.
+///
+/// Fail-open on any name this has no measurement for: a port that refuses what it cannot place
+/// has to be sure it is not placing something Go accepts, and inventing a rule is how it starts.
+fn scalar_mismatch(name: Option<&str>, raw: &Doc) -> Option<String> {
+    let ok = match name {
+        // Bytes handed to the field untouched. Measured at `context_manager_config`: a string,
+        // an object and an array all load.
+        Some("any") | Some("RawNode") | Some("json.RawMessage") => return None,
+        Some("string") => matches!(raw, Doc::String(_)),
+        Some("bool") => matches!(raw, Doc::Bool(_)),
+        // Go parses the literal as an integer, so `2.0`, `1e2` and `9223372036854775808` are all
+        // refusals (`expected int but got number`) while `-5` and `i64::MAX` load. This crate's
+        // `Doc` spells all three of the refusals as a `Float`, so one arm covers them; the
+        // beyond-`i64` shape is what `fix/parse-past-int64` made parseable in the first place.
+        Some("int") | Some("int64") => matches!(raw, Doc::Int(_)),
+        Some("float64") => matches!(raw, Doc::Int(_) | Doc::Float(_)),
+        // The one named scalar in the tree, and a string type: the four `*_turn_profile_*` cases
+        // that load a mode string pin the accepting half, and a number is refused like any other
+        // kind a string cannot hold.
+        Some("TurnProfileMode") => matches!(raw, Doc::String(_)),
+        _ => return None,
+    };
+    if ok {
+        return None;
+    }
+    Some(match name {
+        Some("string") | Some("bool") | Some("int") | Some("int64") | Some("float64") => {
+            name.unwrap_or("value").to_string()
+        }
+        other => go_type_name(other),
+    })
+}
+
+/// How Go's `reflect` names the type behind a dump node's `name`, as far as the dump reaches
+/// (see [`misplaced_typed_values`] for what that buys and what it cannot).
+fn go_type_name(name: Option<&str>) -> String {
+    let Some(name) = name else {
+        return "value".to_string();
+    };
+    if let Some(elem) = name.strip_prefix("[]") {
+        return format!("[]{}", go_type_name(Some(elem)));
+    }
+    if let Some(elem) = name.strip_prefix("map[string]") {
+        return format!("map[string]{}", go_type_name(Some(elem)));
+    }
+    match name {
+        "any" => "interface {}".to_string(),
+        "string" | "bool" | "int" | "int64" | "int32" | "uint64" | "float64" | "float32" => {
+            name.to_string()
+        }
+        // Already qualified, or a package-qualified name like `json.RawMessage`.
+        other if other.contains('.') => other.to_string(),
+        other => format!("config.{other}"),
     }
 }
 

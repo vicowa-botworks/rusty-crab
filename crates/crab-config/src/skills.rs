@@ -59,6 +59,15 @@
 //!   never reaches the refusal the skip exists to avoid. Recorded in
 //!   `docs/DIVERGENCES.md` rather than fixed here, because refusing needs an error type
 //!   on this pass and no case yet pins which diagnostic wins.
+//! * **The document's sequence spelling of `registries` was a gap and is closed.** Until the
+//!   168-case corpus this module read a `tools.skills.registries` array as "not a mapping,
+//!   ignore it", so `[{name: clawhub, enabled: false}]` came out with the builtin still enabled
+//!   -- a different config, not a refused one. Two cases grade the arm now
+//!   (`a_sequence_of_skill_registries_adds_the_entry_named_by_its_element`,
+//!   `..._merges_into_the_builtin_it_names`), and the pair was derived from Go's own decoder
+//!   comment, `config_struct.go:341-343`, not from a guess. What the pair does *not* witness is
+//!   `[{}]` and an element whose `name` is empty or not a string -- this module adds nothing for
+//!   those, on the strength of `Set` refusing an empty name, with no case pinning it.
 
 use crate::doc::Doc;
 use crate::yaml::Security;
@@ -250,20 +259,22 @@ pub fn apply(
 ///
 /// `baseline` is the `tools.skills.registries` node from `default_config` **before** the
 /// document was merged over it, because Go decodes into the defaults and a document whose
-/// `registries` is not a mapping leaves them standing:
+/// `registries` holds something the type cannot read leaves them standing:
 ///
 /// | document `registries` | Go's loaded value |
 /// | --- | --- |
 /// | a mapping | that mapping, merged over the builtins and normalised |
-/// | `null` | `clawhub` + `github` at their **defaults** -- the same answer as an array |
-/// | an array | the array ignored, the builtins standing at their **defaults** |
-/// | a number | refused outright, see the scalar arm in [`rebuild`] |
+/// | a sequence | the elements merged over the builtins by name (issue #29, see [`rebuild`]) |
+/// | `null` | `clawhub` + `github` at their **defaults** |
+/// | a number or a bool | refused by the decoder, in [`crate::schema::misplaced_typed_values`] |
 /// | absent | untouched -- Go's decoder is never called for a key that is not there |
 ///
 /// Measured at picoclaw `01635da3`, one process per shape, no `.security.yml` on disk:
-/// `null`, `[{enabled:true,name:github}]` and an absent key all give
+/// `null` and an absent key both give
 /// `{clawhub:{base_url:"https://clawhub.ai",enabled:true}, github:{...}}`, and a mapping
-/// `{"custom":{base_url:"u"}}` keeps both builtins and adds `custom` at zero values.
+/// `{"custom":{base_url:"u"}}` keeps both builtins and adds `custom` at zero values. The
+/// sequence shapes were re-measured at `99ea66d6` for issue #29 and are tabulated in
+/// [`rebuild`], where the arm lives.
 ///
 /// **Do not read the `null` row as the file's null header.** A `registries:` with nothing
 /// after the colon in `.security.yml` is a different pass and a different answer -- the
@@ -347,11 +358,69 @@ fn rebuild(
                 (name.clone(), registry)
             })
             .collect(),
-        // `null` and the JSON array shape are the same answer, measured: Go's decoder ignores
-        // a node it cannot read into the map and the builtins stand at their defaults. A
-        // `null` that *wipes* is the security file's, below -- the two are easy to confuse and
-        // only one of them replaces.
-        Some(Doc::Null) | Some(Doc::Array(_)) => baseline
+        // `null` is the baseline standing at its defaults; an **array** is Go's second spelling
+        // of this type and is not the same answer (issue #29).
+        //
+        // `SkillsRegistriesConfig.UnmarshalJSON` (`config_struct.go:360`) tries a JSON sequence
+        // first, so `[{...}]` is a config the shipped binary loads. Its comment says the shape
+        // exists so a `.security.yml` written in the `registries: [{name: clawhub}]` spelling
+        // survives `SaveConfig` -> `LoadConfig`, and `docs/DIVERGENCES.md:85-87` already says so
+        // outright: "a port that reads only `Object` would reject or drop a valid config." What
+        // it does with each element is what makes this a merge and not a replacement: the slice
+        // it decodes into is the one the defaults already put there, so a builtin the file named
+        // is cloned with its defaults intact and the element is decoded *over the clone*.
+        // Measured one process per shape at picoclaw `99ea66d6`, no `.security.yml`:
+        //
+        // | document `registries` | Go's loaded set |
+        // | --- | --- |
+        // | `[{"name":"other"}]` | `clawhub` + `github` at their defaults, `other` added at zero values |
+        // | `[{"name":"clawhub","enabled":false}]` | `clawhub` **keeps** `base_url: "https://clawhub.ai"` and `enabled` flips |
+        // | `[]` | the defaults, untouched |
+        // | `[{}]` | the defaults, `Set` refusing an entry with no name |
+        //
+        // A non-object element and an unknown key in an element are refused before this point --
+        // the first by [`crate::schema::misplaced_typed_values`], the second by the diagnostics
+        // walk in [`crate::schema::collect`], which descends this slice precisely because the
+        // decoder is the sequence arm here. Neither is re-raised below.
+        Some(Doc::Array(items)) => {
+            let mut built = baseline
+                .and_then(Doc::as_object)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(name, node)| {
+                            let mut registry = Registry::default();
+                            registry.read(node);
+                            (name.clone(), registry)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for node in items {
+                let Doc::Object(entries) = node else {
+                    continue;
+                };
+                let name = entries
+                    .iter()
+                    .find(|(key, _)| key == "name")
+                    .and_then(|(_, value)| match value {
+                        Doc::String(text) => Some(text.trim().to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    // `[{}]` loads without adding anything, which is Go's `Set` refusing an entry
+                    // with no name. Unpinned by the corpus, so nothing here claims the *shape* of
+                    // the answer beyond "nothing was added".
+                    continue;
+                }
+                let mut registry = lookup(&built, &name).cloned().unwrap_or_default();
+                registry.read(node);
+                set(&mut built, &name, registry);
+            }
+            built
+        }
+        Some(Doc::Null) => baseline
             .and_then(Doc::as_object)
             .map(|entries| {
                 entries
@@ -364,12 +433,13 @@ fn rebuild(
                     .collect()
             })
             .unwrap_or_default(),
-        // A number where the mapping belongs is the one shape Go refuses here, measured at
-        // picoclaw `01635da3`: `config.json type error at line 1, column 1: expected
-        // map[string]jsontext.Value but got number`. That sentence belongs to a loader stage
-        // this crate has not ported -- it refuses nothing at this depth -- so the document
-        // keeps the shape it was given rather than an answer invented here, and the
-        // divergence is recorded in `docs/DIVERGENCES.md` rather than papered over.
+        // A scalar where the type belongs. Go refuses it, measured at picoclaw `01635da3`:
+        // `config.json type error at line 1, column 1: expected map[string]jsontext.Value but
+        // got number`. That refusal is raised one stage earlier now, in
+        // [`crate::schema::misplaced_typed_values`], which judges every position in the dump
+        // rather than the one named type it started as -- so this arm is unreachable through
+        // `load` and is left as the shape-preserving answer it always was: no rebuild, nothing
+        // invented here.
         Some(_) => Vec::new(),
         None => Vec::new(),
     };
