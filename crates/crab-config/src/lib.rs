@@ -473,34 +473,97 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // block never runs for one, so it cannot clobber it.
     }
 
-    // `InitChannelList`, which sits here in Go too -- after the security merge, before
-    // the session scope. It is the stage that makes a loaded config more than the file:
-    // every channel's `settings` is replaced by what its typed struct marshals, so the
-    // fields the file left out appear and the keys come back in declaration order.
-    channels::init_channel_list(&mut merged, &config_schema())?;
+    // Everything from here to the end of `load` is one `defer`, and its shape is the whole
+    // story of vicowa-botworks/rusty-crab#28. A migration arm closes with
+    // `defer func(cfg *Config){ _ = SaveConfig(path, cfg) }(cfg)` (`config.go:1379`), so the
+    // document that reaches the disk is the one that existed at *whichever statement returned*
+    // -- neither a snapshot of the ladder nor the finished config. Which stages had run is
+    // therefore visible in the file, and was measured one process per shape at picoclaw
+    // `99ea66d6` with a v2 document and a two-key `api_keys`:
+    //
+    // ```text
+    // the load succeeds               .security.yml + config.json + config.json.<date>.bak   dm_scope written
+    // InitChannelList refuses         the same three files                                   dm_scope absent
+    // ValidateTurnProfile refuses     the same three files                                   dm_scope absent
+    // ValidateModelList refuses       the same three files                                   dm_scope absent
+    // ```
+    //
+    // `ApplyDmScope` and `DeriveDmScope` are `LoadConfig`'s last two statements
+    // (`config.go:1548`-`1549`), past every refusal, so a refused load never reaches them, and
+    // `dm_scope` is `json:"dm_scope,omitempty"` (`config.go:353`): a config nobody wrote a scope
+    // into is marshalled without the key. `a_version_two_document_is_migrated_and_rewritten`
+    // pins the key present and
+    // `a_legacy_model_entry_without_a_model_name_is_refused_by_validation` pins it absent, and
+    // the only thing separating those two cases is which statement returned.
+    //
+    // So the refusals are captured rather than propagated where they run -- and the write sits
+    // at each return, not once at the end -- because the file has to be on disk before the
+    // caller sees the error, and because `MakeBackup` is a plain call inside the arm and still
+    // wins over a refusal that comes after it.
+    //
+    // `InitChannelList` is first among them, and it is a stage rather than a check: it makes a
+    // loaded config more than the file, replacing every channel's `settings` with what its typed
+    // struct marshals, so the fields the file left out appear and the keys come back in
+    // declaration order. Its own refusal is the one shape on this path whose *content* cannot be
+    // pinned -- it walks the channel map and mutates as it goes, so which channels were already
+    // rewritten when it returns is Go's map iteration order, exactly like the `name:index`
+    // collision the ledger records as unreproducible. The three files it leaves behind are
+    // deterministic; their bytes are not.
+    //
+    // `env.Parse` belongs between the channel list and the turn profile, where Go calls it
+    // (`config.go:1518`), the moment this crate has one; its refusal then joins the same set.
+    let mut validation = channels::init_channel_list(&mut merged, &config_schema());
 
-    // `ValidateTurnProfile`, in Go's position -- after the channel list, before the model
-    // expansion. The error is *captured* rather than returned here because a migration's
-    // `defer SaveConfig` runs at `LoadConfig`'s return whatever the validators decide: a
-    // migrated document that fails a validator still leaves the rewritten file behind. The
-    // return happens beside the migration write, at the bottom of this function.
-    let validation = validate::turn_profile(&merged);
+    // `ValidateTurnProfile`, in Go's position -- after the channel list, before the expansion.
+    if validation.is_ok() {
+        validation = validate::turn_profile(&merged);
+    }
 
-    // `expandMultiKeyModels`, in Go's position: after the channel list, before the
-    // session scope. It is the only stage that changes the *number* of model entries, so
-    // it has to run after the security file has put the keys in and before anything reads
-    // the list's length.
-    let virtual_models = multikey::expand(&mut merged, &config_schema());
+    // `expandMultiKeyModels`, in Go's position: after the channel list, before the session
+    // scope. It is the only stage that changes the *number* of model entries, so it has to run
+    // after the security file has put the keys in and before anything reads the list's length --
+    // and a load that has already refused must not run it, because the `defer` on that path is
+    // saving a list Go never expanded.
+    let virtual_models = if validation.is_ok() {
+        multikey::expand(&mut merged, &config_schema())
+    } else {
+        Vec::new()
+    };
 
-    // `ValidateModelList`, after the expansion and so graded over the expanded list --
-    // which is why a fault in a multi-key entry is reported at the index of the copy.
-    let validation = validation.and_then(|()| validate::model_list(&merged));
-
-    // The last two stages of LoadConfig, and the reason a loaded config can carry a
-    // dm_scope the file never mentioned.
-    apply_dm_scope(&mut merged);
+    // `ValidateModelList`, after the expansion and so graded over the expanded list -- which is
+    // why a fault in a multi-key entry is reported at the index of the copy.
+    if validation.is_ok() {
+        validation = validate::model_list(&merged);
+    }
 
     let migrated = version < CURRENT_VERSION;
+    let path = path.to_path_buf();
+
+    if let Err(e) = validation {
+        // The refusing path's deferred write: everything the loader got to, and neither of the
+        // two session stages.
+        if migrated {
+            let mut partial = Config {
+                document: merged,
+                needs_version_bump: true,
+                virtual_models,
+                secure_tokens,
+            };
+            // `MakeBackup` is a plain call in Go, so a directory that cannot hold a backup does
+            // fail the load, and fails it with its own error rather than the validator's.
+            make_backup(&path)?;
+            // The save's result is thrown away, in Go and here alike: a read-only config
+            // directory must not turn "your config is invalid" into "there is no config".
+            let _ = save(&path, &mut partial, home);
+        }
+        return Err(e);
+    }
+
+    // The last two stages of `LoadConfig`, and the reason a loaded config can carry a `dm_scope`
+    // the file never mentioned. Reaching them is exactly what makes the succeeding path's
+    // deferred write differ from the refusing path's.
+    apply_dm_scope(&mut merged);
+
     let mut config = Config {
         document: merged,
         needs_version_bump: migrated,
@@ -508,44 +571,19 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         secure_tokens,
     };
 
-    // A migration is not only in memory. Each `case 0..=2` arm of `LoadConfig` runs
-    // `MakeBackup(path)` and then `defer SaveConfig(path, cfg)`, so loading a v0 file on
-    // a real machine leaves four files behind: the two backups and the two rewritten
-    // configs. The defer is what makes the written file the *fully* loaded one -- it runs
-    // after the security merge, `InitChannelList` and the model expansion, not just after
-    // the ladder -- which is why this sits at the end of `load` rather than at the
-    // version switch.
-    //
-    // It also mutates the config the caller gets: `SaveConfig` raises `version` through
-    // the same pointer, so a migrated load reports `version: 3` in the loaded value even
-    // though the file said 0. Skipping the write is not a silent difference either -- the
-    // next start would migrate the same file again.
+    // A migration is not only in memory. `MakeBackup(path)` and the deferred `SaveConfig` run
+    // inside `LoadConfig`, so loading a v0 file on a real machine leaves the backups and the two
+    // rewritten configs behind. Skipping the write is not a silent difference either -- the next
+    // start would migrate the same file again -- and `SaveConfig` raises `version` through the
+    // same pointer, so a migrated load reports `version: 3` in the loaded value even though the
+    // file said 0.
     if migrated {
-        let path = path.to_path_buf();
-        // `MakeBackup` is a plain call in Go, so a directory that cannot hold a backup does
-        // fail the load. The save is the one whose result is thrown away.
         make_backup(&path)?;
-        // `defer SaveConfig(path, cfg)` discards its error, and that is a behaviour, not an
-        // oversight: Go starts the agent on the migrated config in memory while the file on
-        // disk stays at the old version. Propagating here would turn a read-only config
-        // directory into "no config at all", which is a strictly worse failure than the one
-        // the shipped binary has -- and the caller cannot retry, because `load` has already
-        // returned the error instead of the config.
-        //
-        // Timing: Go's `defer` runs at the *return* of `LoadConfig`, so it persists whatever
-        // the loader did after the migration switch -- the two `Validate*` calls included. A
-        // migrated document that fails one of them still leaves the rewritten, version-raised
-        // file on disk while the caller gets only the error, which is why the write above is
-        // ordered before the return below and why the validators are captured rather than
-        // propagated where they run. (`env.Parse` still has no port at all; when it lands it
-        // belongs in the same position, ahead of both validators.)
+        // Discarded on purpose, as above: Go starts the agent on the migrated config in memory
+        // while the file stays at the old version, and propagating here would take the config
+        // away from a caller who has one.
         let _ = save(&path, &mut config, home);
     }
-
-    // The refusals the two validators decided, raised only now so the migration's deferred
-    // save has already happened. `MakeBackup`'s own failure still wins: in Go it returns
-    // from inside the migration arm, before either validator runs.
-    validation?;
 
     Ok(config)
 }
@@ -2592,6 +2630,81 @@ mod tests {
         );
         let err = load(&path, "/home/oracle").expect_err("providers must be refused");
         assert_eq!(err, Error::UnknownField("providers".to_string()));
+    }
+
+    /// The migration's deferred write is a snapshot of the **return**, not of the ladder
+    /// (vicowa-botworks/rusty-crab#28).
+    ///
+    /// A migration arm closes with `defer func(cfg *Config){ _ = SaveConfig(path, cfg) }(cfg)`
+    /// (`config.go:1379`), and `ApplyDmScope`/`DeriveDmScope` are `LoadConfig`'s last two
+    /// statements (`config.go:1548`), past every refusal. Measured one process per shape at
+    /// picoclaw `99ea66d6` on `{"version":2,"model_list":[{"model":"openai/a"}]}`: the load
+    /// refuses with `model_list[0]: model_name is required`, the directory afterwards holds
+    /// `.security.yml`, a rewritten `config.json` and `config.json.<date>.bak`, and the rewritten
+    /// document carries **no** `dm_scope` -- while the same shape that succeeds writes one. The
+    /// corpus grades that pair (`a_version_two_document_is_migrated_and_rewritten` has the key,
+    /// `a_legacy_model_entry_without_a_model_name_is_refused_by_validation` does not); this
+    /// grades it on the Rust side so the ordering cannot silently move again.
+    #[test]
+    fn a_migration_refused_by_a_validator_is_written_without_the_session_scope() {
+        let (dir, path) = write_temp(r#"{"version":2,"model_list":[{"model":"openai/a"}]}"#);
+        let err = load(&path, "/home/oracle").expect_err("a model with no name is refused");
+        assert!(
+            err.to_string().contains("model_name is required"),
+            "the refusal is the validator's, got {err}"
+        );
+
+        let written = std::fs::read_to_string(&path)
+            .expect("a refusal after the migration's write still leaves the rewritten file");
+        assert!(
+            written.contains("\"version\": 3"),
+            "the deferred save still raises the version"
+        );
+        assert!(
+            !written.contains("dm_scope"),
+            "the refused load never reached DeriveDmScope, so the file has no scope: {written}"
+        );
+
+        let backups: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| {
+                e.ok()
+                    .and_then(|e| e.file_name().to_str().map(str::to_string))
+            })
+            .filter(|name| name.starts_with("config.json.") && name.ends_with(".bak"))
+            .collect();
+        assert_eq!(backups.len(), 1, "`MakeBackup` ran once: {backups:?}");
+    }
+
+    /// `InitChannelList`'s refusal is inside the `defer`'s reach as well, and returning it
+    /// straight away is what made the port the only side that left no file behind.
+    ///
+    /// Measured the same way on `{"version":2,"channel_list":{"bogus":{"enabled":true}},…}`: Go
+    /// refuses with `channel "bogus" has unknown type "bogus"` *and* writes the three files, the
+    /// rewritten `config.json` again without `dm_scope`. Which channels had already been
+    /// rewritten when it returns is Go's map iteration order, so the file set is pinned here and
+    /// the bytes are deliberately not.
+    #[test]
+    fn a_migration_refused_by_the_channel_list_is_written_too() {
+        let (_dir, path) = write_temp(
+            r#"{"version":2,"channel_list":{"bogus":{"enabled":true}},"model_list":[{"model_name":"m1","model":"openai/a","provider":"openai"}]}"#,
+        );
+        let err = load(&path, "/home/oracle").expect_err("an unknown channel type is refused");
+        assert!(
+            err.to_string().contains("has unknown type"),
+            "the refusal is the channel list's, got {err}"
+        );
+
+        let written = std::fs::read_to_string(&path)
+            .expect("the channel list's refusal is inside the deferred write's reach");
+        assert!(
+            written.contains("\"version\": 3"),
+            "the deferred save still raises the version"
+        );
+        assert!(
+            !written.contains("dm_scope"),
+            "neither session stage ran: {written}"
+        );
     }
 
     #[test]
