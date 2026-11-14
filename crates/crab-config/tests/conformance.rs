@@ -259,7 +259,10 @@ fn loading_matches_what_go_returned() {
         let got = run_script(&case.name, &input.ops);
         let known = KNOWN_UNPORTED.contains(&case.name.as_str());
         match (case.expected == got, known) {
-            (true, false) => matched += 1,
+            (true, false) => {
+                matched += 1;
+                report.record(case, got);
+            }
             (true, true) => panic!(
                 "{} now matches Go. Remove it from KNOWN_UNPORTED -- a case on that list \
                  that passes is a lie about what is still missing.",
