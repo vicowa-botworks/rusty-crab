@@ -191,3 +191,26 @@ this file as long as observable behaviour is identical. They belong in
 - Closes with: nothing. If Go ever sorts the iteration this becomes an ordinary merge and the
   corpus can pin it.
 - Recorded: 2026-10-30, #9 round 4.
+
+### A peer id that two `identity_links` keys both claim is decided by Go's map order
+
+- Go: `resolveLegacyBindingLinkedID` walks `for canonical, ids := range identityLinks`
+  (`pkg/config/legacy_bindings.go:250`) and returns the first canonical key whose value list holds
+  one of the peer id's three candidate spellings. Give two keys the same id -- `key-one: [dup]`
+  and `key-three: [other, dup]` -- and the winner is whichever key the map hands over first. Five
+  processes on one input and one binary gave `key-one key-one key-three key-one key-one` for the
+  same rule (probe shape `j`, 2026-11-14).
+- Rust: the port walks `identity_links` in the order the file lists it, so it answers `key-one`
+  every time -- the key that comes first in the document.
+- Why this is recorded rather than fixed: there is no Go behaviour to reproduce. Which candidate
+  *spelling* matched is deterministic -- Go builds the three into a `map[string]struct{}` and only
+  tests membership -- so only *which key answers* is up for grabs, and a corpus case pinning one
+  of them pins a coin flip that reads as a flaky test the first time the iterator disagrees.
+- Blast radius: nobody running the port, which is the deterministic side. Anyone whose hand-edited
+  `session.identity_links` has two entries claiming one peer id and who diffs a migration against
+  Go: the migrated `agents.dispatch.rules[].when.sender` differs, and dispatch matches on the
+  first rule that hits, so the difference can decide which agent receives the message. Also
+  anyone who tries to witness this shape in the corpus.
+- Closes with: nothing. If Go ever sorts the iteration this becomes an ordinary lookup, and the
+  ordering this port already has is the answer the corpus would pin.
+- Recorded: 2026-11-14, this PR.
