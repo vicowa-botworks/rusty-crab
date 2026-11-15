@@ -314,7 +314,8 @@ fn is_go_zero(schema: &Schema, value: &Doc) -> bool {
 /// The omit rules are applied here rather than by the caller, because in Go they are
 /// not a step anyone can skip — they are the marshaller.
 pub fn config_file(document: &Doc, schema: &Schema) -> Result<String, crate::Error> {
-    let marshalled = apply_session_shadow(apply_omit(document, schema));
+    let marshalled =
+        apply_session_shadow(apply_marshal_json(&apply_omit(document, schema), schema));
     marshalled
         .to_indented_json()
         .map_err(|e| crate::Error::Io(e.to_string()))
@@ -327,8 +328,96 @@ pub fn config_file(document: &Doc, schema: &Schema) -> Result<String, crate::Err
 /// file, minus the indentation.
 #[must_use]
 pub fn loaded_value(document: &Doc, schema: &Schema) -> String {
-    apply_session_shadow(apply_omit(document, schema)).to_compact_json()
+    let marshalled = apply_marshal_json(&apply_omit(document, schema), schema);
+    apply_session_shadow(marshalled).to_compact_json()
 }
+
+/// `config.AgentModelConfig` -- the struct the wire carries as a bare string.
+///
+/// `MarshalJSON` (`pkg/config/config.go:303-312`) returns `json.Marshal(m.Primary)` when
+/// `len(m.Fallbacks) == 0 && m.Primary != ""`, so `{"primary":"gpt-4"}` goes to disk as
+/// `"gpt-4"`. The dump already says a position's struct answers for itself -- both nodes
+/// carry `"json_marshaler": true` (`$.agents.list.model` and `$.agents.list.subagents.model`,
+/// the only two) -- but a flag is not a rule, and the other marshaler-named type must NOT be
+/// treated this way: `SecureString`'s method returns the literal `"[NOT_HERE]"` and the field
+/// never reaches here at all, because `omitzero` + `IsZero` drops it a level up ([`apply_omit`]).
+/// So the walk keys on the type name, the same way the decoder's string exemption does.
+///
+/// It runs on BOTH renderings, which is the part that was missing: `SaveConfig`'s file bytes
+/// and the corpus's recorded loaded value are the same `json.Marshal` of the typed `*Config`
+/// (`cmd/oracle/config.go:237-243` re-marshals for every `load`/`defaults` query), so a port
+/// that collapses only the file is right on disk and wrong in every recorded query. Measured
+/// one process per shape at picoclaw `99ea66d6`: the object spelling arrives at BOTH the
+/// written file and the recorded value as `"model":"gpt-4"`, on the migration path and on the
+/// current-version `SaveConfig` path. Filed as rusty-crab#33.
+///
+/// Deliberately run AFTER [`apply_omit`]: `primary` and `fallbacks` both carry `omitempty`, so
+/// by this point an absent `fallbacks` is Go's `len(...) == 0` and an absent `primary` is Go's
+/// `Primary == ""` -- the half of the condition that must NOT collapse. `{"primary":"","fallbacks":[]}`
+/// and `{"primary":"gpt-4","fallbacks":["b"]}` therefore stay objects, as Go writes them.
+#[must_use]
+pub fn apply_marshal_json(document: &Doc, schema: &Schema) -> Doc {
+    match (document, schema) {
+        (Doc::Object(entries), Schema::Struct { .. }) => {
+            if schema.name() == Some(AGENT_MODEL_CONFIG) {
+                if let Some(primary) = primary_only(entries) {
+                    return Doc::String(primary);
+                }
+            }
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                match schema.field(key) {
+                    Some(child) => out.push((key.clone(), apply_marshal_json(value, child))),
+                    // No field, so no type, so nothing that can answer for itself.
+                    // `apply_omit` already decided what happens to the data.
+                    None => out.push((key.clone(), value.clone())),
+                }
+            }
+            Doc::Object(out)
+        }
+        (Doc::Array(items), Schema::Slice { elem, .. }) => Doc::Array(
+            items
+                .iter()
+                .map(|item| apply_marshal_json(item, elem))
+                .collect(),
+        ),
+        (Doc::Object(entries), Schema::Map { elem, .. }) => Doc::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), apply_marshal_json(value, elem)))
+                .collect(),
+        ),
+        (other, _) => other.clone(),
+    }
+}
+
+/// Go's condition, in the order it writes it: a non-empty `Primary`, and nothing in
+/// `Fallbacks`. `null` counts as nothing (a nil slice), an empty array counts as nothing,
+/// and anything else that is standing there is a fallback list Go would marshal.
+fn primary_only(entries: &[(String, Doc)]) -> Option<String> {
+    let primary = entries
+        .iter()
+        .find(|(key, _)| key == "primary")
+        .and_then(|(_, value)| match value {
+            Doc::String(text) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        })?;
+    let holds_fallbacks = entries.iter().any(|(key, value)| {
+        key == "fallbacks"
+            && match value {
+                Doc::Null => false,
+                Doc::Array(items) => !items.is_empty(),
+                _ => true,
+            }
+    });
+    (!holds_fallbacks).then_some(primary)
+}
+
+/// The Go type name, from the dump, of the struct whose `MarshalJSON` collapses it to a
+/// string. Declared here rather than in `schema.rs` so this branch stays independent of
+/// rusty-crab#30, which adds the same literal for the decoder's string exemption; when that
+/// lands, the two should be one constant.
+const AGENT_MODEL_CONFIG: &str = "AgentModelConfig";
 
 #[cfg(test)]
 mod tests {
@@ -478,5 +567,91 @@ mod tests {
         let schema = config_schema();
         let document = doc(r#"{"version":3,"session":{"dimensions":[]}}"#);
         assert_eq!(loaded_value(&document, &schema), r#"{"version":3}"#);
+    }
+
+    // The four shapes `AgentModelConfig.MarshalJSON` produces (pkg/config/config.go:303-312).
+    // Every one is asserted at the WHOLE document, not at a plucked sub-schema, because the
+    // walk reaching `agents.list[].model` is half of what is being tested -- rusty-crab#33.
+
+    fn agents_with_model(model: &str) -> Doc {
+        doc(&format!(
+            r#"{{"version":3,"agents":{{"list":[{{"id":"a","model":{model}}}]}}}}"#
+        ))
+    }
+
+    #[test]
+    fn a_primary_only_agent_model_is_written_as_a_bare_string() {
+        let schema = config_schema();
+        let out = apply_marshal_json(&agents_with_model(r#"{"primary":"gpt-4"}"#), &schema);
+        assert_eq!(
+            out.to_compact_json(),
+            r#"{"version":3,"agents":{"list":[{"id":"a","model":"gpt-4"}]}}"#
+        );
+    }
+
+    #[test]
+    fn an_agent_model_with_fallbacks_keeps_the_object() {
+        let schema = config_schema();
+        let document = agents_with_model(r#"{"primary":"gpt-4","fallbacks":["gpt-3"]}"#);
+        let out = apply_marshal_json(&document, &schema);
+        assert_eq!(out.to_compact_json(), document.to_compact_json());
+    }
+
+    #[test]
+    fn an_empty_primary_does_not_collapse_even_with_nothing_to_fall_back_to() {
+        let schema = config_schema();
+        let document = agents_with_model(r#"{"primary":"","fallbacks":[]}"#);
+        let out = apply_marshal_json(&document, &schema);
+        assert_eq!(out.to_compact_json(), document.to_compact_json());
+    }
+
+    #[test]
+    fn a_second_agent_model_position_collapses_too() {
+        let schema = config_schema();
+        let document = doc(
+            r#"{"version":3,"agents":{"list":[{"id":"a","subagents":{"model":{"primary":"mini"}}}]}}"#,
+        );
+        let out = apply_marshal_json(&document, &schema);
+        assert_eq!(
+            out.to_compact_json(),
+            r#"{"version":3,"agents":{"list":[{"id":"a","subagents":{"model":"mini"}}]}}"#
+        );
+    }
+
+    #[test]
+    fn an_agent_model_already_written_as_a_string_is_left_alone() {
+        let schema = config_schema();
+        let document = agents_with_model(r#""gpt-4""#);
+        let out = apply_marshal_json(&document, &schema);
+        assert_eq!(out.to_compact_json(), document.to_compact_json());
+    }
+
+    #[test]
+    fn both_renderings_collapse_because_both_are_the_same_marshal() {
+        let schema = config_schema();
+        let document = agents_with_model(r#"{"primary":"gpt-4"}"#);
+        let file = config_file(&document, &schema).expect("marshals");
+        assert!(
+            file.contains(r#""model": "gpt-4""#),
+            "the file bytes carry the collapsed string: {file}"
+        );
+        assert_eq!(
+            loaded_value(&document, &schema),
+            r#"{"version":3,"agents":{"list":[{"id":"a","model":"gpt-4"}]}}"#
+        );
+    }
+
+    #[test]
+    fn an_empty_agent_model_is_written_as_an_empty_object() {
+        // `MarshalJSON`'s else branch marshals an alias whose two fields BOTH say
+        // `omitempty`, and `apply_omit` drops an empty string and a nil slice the same way,
+        // so running the collapse second reproduces `{}` without a special case.
+        let schema = config_schema();
+        let document = agents_with_model(r#"{"primary":"","fallbacks":null}"#);
+        assert!(
+            loaded_value(&document, &schema).contains(r#""model":{}"#),
+            "got {}",
+            loaded_value(&document, &schema)
+        );
     }
 }
