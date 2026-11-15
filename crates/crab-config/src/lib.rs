@@ -418,15 +418,15 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
     // the validated bytes a second time: the merge above already put its keys in `document`.
     validate_against(&document, &config_schema())
         .map_err(|issues| Error::UnknownField(issues.join(", ")))?;
-    // Go's decode is typed, so a shape it cannot place fails the load with its own sentence,
-    // and it checks *every* field. This walk checks the one named type where being permissive
-    // is silently wrong: `SecureStrings`, which does not have the tolerance the port assumed
-    // every named string slice has (issue #15). The rest of Go's type errors stay unported and
-    // tracked rather than assumed away -- a `model_list` holding a bare number is refused by
-    // the shipped binary and still loads here, which is stated in the issue filed with this
-    // change, not hidden by it.
-    if let Some((path, wanted, got)) = schema::misplaced_secure_strings(&document, &config_schema())
-    {
+    // Go's decode is typed, so a shape it cannot place fails the load with its own sentence, and
+    // it checks *every* field. This walk is that generality: every position in the dump is judged
+    // by what its type can hold, with the exceptions the measurement found (a null anywhere, the
+    // raw passthroughs, `FlexibleStringSlice`, the two arms of `SkillsRegistriesConfig`). It
+    // started as the single named type where being permissive was silently wrong -- `SecureStrings`
+    // (issue #15) -- and issue #25 asked for exactly this generalization once the other half of
+    // its refusal cases were pinned by the corpus: a `model_list` holding a bare number is refused
+    // by the shipped binary and used to load here.
+    if let Some((path, wanted, got)) = schema::misplaced_typed_values(&document, &config_schema()) {
         return Err(Error::TypeMismatch(format!(
             "expected {wanted} but got {got} at {path}"
         )));
@@ -1421,9 +1421,11 @@ fn schema_type(schema: &Schema) -> String {
     // `tools.web.*` positions alike, which the `model_list` pass and this generic one reach by
     // different routes. Without the qualification the same field is named two different ways
     // depending on which refusal met it. The dump's other names carry the same unprefixed
-    // drift and are left alone: they are unmeasured, no corpus case grades a sentence (a
-    // refusing case records `error_op_index` and nothing else), and the general type-check gap
-    // that would produce most of those sentences is issue #25.
+    // drift and are left alone: they are unmeasured, and no corpus case grades a sentence (a
+    // refusing case records `error_op_index` and nothing else). The `config.json` half of the
+    // same naming problem is [`crate::schema::misplaced_typed_values`], which qualifies a name
+    // through `go_type_name` on its way to the same answer for this type; two routes, one
+    // spelling, and the exception above is what keeps them one spelling.
     if crate::schema::is_secure_strings(schema) {
         return crate::schema::SECURE_STRINGS_GO_TYPE.to_string();
     }
@@ -2483,25 +2485,140 @@ mod tests {
     }
 
     /// A bare bool or object at a `FlexibleStringSlice` falls through every arm of Go's
-    /// decoder, which refuses it naming the type. The override restored that by falling back
-    /// to the stored document, whose value then lands in the mismatch arm; before it, the
-    /// field projected to `Null`, `omitzero` dropped it, and the load *succeeded* with the
-    /// field absent -- a silently different config, the case the `Struct` arm exists for one
-    /// arm over.
+    /// decoder and the load fails. What the port used to say is not what Go says: this
+    /// assertion asked for `FlexibleStringSlice`, which is the crate's own sentence from
+    /// `fix(config): make the flexible-slice coercion an override, not a replacement`, and the
+    /// type name appears nowhere in Go's diagnostic. Measured one process per shape at picoclaw
+    /// `99ea66d6`, at `tools.web.private_host_whitelist`: `true` -> `expected string but got
+    /// bool`, `{"a":"b"}` -> `expected string but got object`, while `42`, `1.5`, `"a"`,
+    /// `[true]` and `[{"a":1}]` all **load** -- so the refusal is about the node's own kind and
+    /// not about what the elements are. The walk in [`crate::schema::misplaced_typed_values`]
+    /// now raises the measured sentence before the coercion is reached; the guard here is the
+    /// one the test was always for: a value Go refuses must not be *erased* into a config that
+    /// loads with the field absent.
     #[test]
     fn a_bool_or_object_at_a_flexible_slice_is_refused() {
-        for value in ["true", r#"{"a":"b"}"#] {
+        for (value, wanted) in [
+            ("true", "expected string but got bool"),
+            (r#"{"a":"b"}"#, "expected string but got object"),
+        ] {
             let document = format!(
                 r#"{{"version":3,"session":{{"dm_scope":"per-channel"}},"channel_list":{{"telegram":{{"allow_from":{value}}}}}}}"#
             );
             let (_dir, path) = write_temp(&document);
             let err = load(&path, "/home/oracle")
                 .expect_err("a bool or object at a FlexibleStringSlice is refused, not erased");
+            assert!(err.to_string().contains(wanted), "{value}: got {err}");
+        }
+    }
+
+    /// `config.AgentModelConfig` is the other struct the wire carries as a **bare string**:
+    /// `UnmarshalJSON` (`pkg/config/config.go:283-301`) tries a string before it tries the
+    /// `{primary, fallbacks}` object, and `MarshalJSON` (`:303-312`) writes a primary with no
+    /// fallbacks back out as that string. Measured at picoclaw `99ea66d6`
+    /// (`/tmp/opencode/picoclaw-probes/agentmodel/`, `out.txt` and `out2.txt`): the string loads
+    /// with `primary="gpt-4"` and nil fallbacks, and loading `{"primary":"gpt-4"}` then calling
+    /// `SaveConfig` renders `"model":"gpt-4"` on disk. So the exemption this test pins is not a
+    /// leniency: without it the port refused a `config.json` the Go binary had itself written, at
+    /// both positions the dump types `AgentModelConfig` (`agents.list[].model` and
+    /// `agents.list[].subagents.model`), on the current-version path and on the migrated one.
+    #[test]
+    fn a_bare_string_at_an_agent_model_loads() {
+        let (_dir, path) =
+            write_config_only(r#"{"version":3,"agents":{"list":[{"id":"a","model":"gpt-4"}]}}"#);
+        let cfg = load(&path, "/home/oracle")
+            .expect("Go loads a bare string at agents.list[].model, so the port must too");
+        let model = cfg
+            .document
+            .get("agents")
+            .and_then(|agents| agents.get("list"))
+            .and_then(Doc::as_array)
+            .and_then(|list| list.first())
+            .and_then(|entry| entry.get("model"))
+            .map(Doc::to_compact_json);
+        assert_eq!(
+            model.as_deref(),
+            Some(r#""gpt-4""#),
+            "the string is the primary, and the port must not invent the object form"
+        );
+
+        let (_dir, path) = write_config_only(
+            r#"{"version":3,"agents":{"list":[{"id":"a","subagents":{"model":"x"}}]}}"#,
+        );
+        let cfg = load(&path, "/home/oracle").expect("subagents.model is typed the same way");
+        assert_eq!(
+            cfg.document
+                .get("agents")
+                .and_then(|agents| agents.get("list"))
+                .and_then(Doc::as_array)
+                .and_then(|list| list.first())
+                .and_then(|entry| entry.get("subagents"))
+                .and_then(|subagents| subagents.get("model"))
+                .map(Doc::to_compact_json)
+                .as_deref(),
+            Some(r#""x""#),
+            "the second position the dump types `AgentModelConfig`"
+        );
+
+        // The object spelling is still an object, so the exemption must not swallow its fields:
+        // a `fallbacks` that is not a list is refused by the ordinary descent, with Go's
+        // sentence for the inner field.
+        let (_dir, path) = write_config_only(
+            r#"{"version":3,"agents":{"list":[{"id":"a","model":{"primary":"gpt-4","fallbacks":"x"}}]}}"#,
+        );
+        let err =
+            load(&path, "/home/oracle").expect_err("Go refuses a fallbacks that is not a list");
+        assert!(
+            matches!(&err, Error::TypeMismatch(m)
+                if m == "expected []string but got string at agents.list[0].model.fallbacks"),
+            "{err}"
+        );
+
+        // The migrated path decodes the same type from the ladder's output, so a legacy file with
+        // the string spelling loads too (measured at `version: 2`, migration start -> success).
+        let (_dir, path) =
+            write_config_only(r#"{"version":2,"agents":{"list":[{"id":"a","model":"gpt-4"}]}}"#);
+        load(&path, "/home/oracle").expect("the migrated path decodes the same type");
+    }
+
+    /// A number and a bool are refused at that position, and Go's sentence names the **anonymous
+    /// struct inside `UnmarshalJSON`** (`config.raw`), not the field's declared type: the value
+    /// handed to `json.Unmarshal` is that struct, and [`crate::jsonerror`] walks its pointer
+    /// chain. Measured at picoclaw `99ea66d6` (`out2.txt`), and the reason the exemption carries a
+    /// spelled-out name instead of deriving one from the dump: deriving it here would have printed
+    /// `config.AgentModelConfig`, a sentence Go never says.
+    #[test]
+    fn a_number_at_an_agent_model_is_refused() {
+        for (value, wanted) in [
+            (
+                "42",
+                "expected config.raw but got number at agents.list[0].model",
+            ),
+            (
+                "true",
+                "expected config.raw but got bool at agents.list[0].model",
+            ),
+            (
+                r#"[{"primary":"gpt-4"}]"#,
+                "expected config.raw but got array at agents.list[0].model",
+            ),
+        ] {
+            let (_dir, path) = write_config_only(&format!(
+                r#"{{"version":3,"agents":{{"list":[{{"id":"a","model":{value}}}]}}}}"#
+            ));
+            let err = load(&path, "/home/oracle")
+                .expect_err("a non-string, non-object at agents.list[].model is refused by Go");
             assert!(
-                err.to_string().contains("FlexibleStringSlice"),
-                "{value}: got {err}"
+                matches!(&err, Error::TypeMismatch(m) if m == wanted),
+                "{value}: {err}"
             );
         }
+
+        // `null` is the exception every position shares -- the decoder answers it before
+        // consulting the type, and the pointer stays nil.
+        let (_dir, path) =
+            write_config_only(r#"{"version":3,"agents":{"list":[{"id":"a","model":null}]}}"#);
+        load(&path, "/home/oracle").expect("`null` is never judged, here either");
     }
 
     #[test]
@@ -3534,32 +3651,87 @@ mod tests {
     }
 
     #[test]
-    fn a_non_mapping_registries_node_leaves_the_builtins_standing() {
-        // A document whose `registries` is not a mapping is ignored rather than applied, so the
-        // baseline survives at its **defaults** -- the same answer as `null` at this depth, and
-        // the opposite of `null` in the file. This is the arm the ledger used to call
-        // unanswerable for want of the builtin names: they are in the embedded `defaults.json`
-        // that `default_config` returns, which is the very baseline `load` merges into.
-        for (shape, document) in [
-            (
-                "an array",
-                r#"{"version":3,"tools":{"skills":{"registries":[{"enabled":true,"name":"github"}]}}}"#,
-            ),
-            (
-                "null",
-                r#"{"version":3,"tools":{"skills":{"registries":null}}}"#,
-            ),
-        ] {
-            let (_dir, path) = write_config_only(document);
-            assert_eq!(
-                loaded_registries(&path),
-                serde_json::json!({
-                    "clawhub": {"base_url": "https://clawhub.ai", "enabled": true},
-                    "github": {"base_url": "https://github.com", "enabled": true},
-                }),
-                "{shape} at `registries` is ignored, not echoed over the builtins"
-            );
-        }
+    fn a_null_registries_node_leaves_the_builtins_standing() {
+        // A `null` at this depth is the baseline standing at its defaults: `encoding/json`
+        // answers a null before consulting the type, so `SkillsRegistriesConfig.UnmarshalJSON`
+        // never runs and the slice the defaults put there is untouched. The opposite of `null`
+        // written in `.security.yml`, where the section is absent and the builtins are wiped --
+        // see `a_registry_only_in_the_file_is_gone_from_the_loaded_config`.
+        //
+        // This row used to carry a second shape, `[{...}]`, and claim it gave the same answer.
+        // That was the pre-#29 behaviour: the array spelling is Go's own second form, decoded
+        // element by element into the baseline slice, so it merges instead of ignoring. The
+        // sequence's own verdicts live in
+        // `a_registries_sequence_element_merges_into_the_builtin_it_names` and
+        // `a_registries_sequence_element_adds_an_unknown_name`.
+        let (_dir, path) =
+            write_config_only(r#"{"version":3,"tools":{"skills":{"registries":null}}}"#);
+        assert_eq!(
+            loaded_registries(&path),
+            serde_json::json!({
+                "clawhub": {"base_url": "https://clawhub.ai", "enabled": true},
+                "github": {"base_url": "https://github.com", "enabled": true},
+            }),
+            "`null` at `registries` leaves the baseline standing"
+        );
+    }
+
+    /// Issue #29's merge, in the crate's own style. `SkillsRegistriesConfig.UnmarshalJSON`
+    /// (`pkg/config/config_struct.go:360`) tries a sequence first and decodes each element *over a
+    /// clone of the entry the baseline already holds* -- so naming a builtin changes one field of
+    /// it and keeps the rest, which is the difference between a merge and a replacement.
+    ///
+    /// This test exists because the port's own suite could not fail if the sequence arm were
+    /// deleted: the two cases that grade it (`a_sequence_of_skill_registries_adds_the_entry_named_by_its_element`,
+    /// `..._merges_into_the_builtin_it_names`) are in the 168-case corpus, and this PR defers that
+    /// copy. Same verdicts, same shapes, no fixture required.
+    #[test]
+    fn a_registries_sequence_element_merges_into_the_builtin_it_names() {
+        let (_dir, path) = write_config_only(
+            r#"{"version":3,"tools":{"skills":{"registries":[{"name":"clawhub","enabled":false}]}}}"#,
+        );
+        assert_eq!(
+            loaded_registries(&path),
+            serde_json::json!({
+                "clawhub": {"base_url": "https://clawhub.ai", "enabled": false},
+                "github": {"base_url": "https://github.com", "enabled": true},
+            }),
+            "the element is decoded over a clone, so clawhub keeps the base_url the defaults gave it"
+        );
+    }
+
+    /// An element naming nothing the baseline holds is *added*, at the zero value rather than at
+    /// the builtin defaults -- `Set` appends, it does not seed. An element with an empty or absent
+    /// `name` adds nothing, because `SkillRegistry.Set` (`pkg/config/config.go:1183-1189`)
+    /// trims the name and returns when it is empty; measured outcomes, one process per shape, are
+    /// in this module's docs.
+    #[test]
+    fn a_registries_sequence_element_adds_an_unknown_name() {
+        let (_dir, path) = write_config_only(
+            r#"{"version":3,"tools":{"skills":{"registries":[{"name":"other"}]}}}"#,
+        );
+        assert_eq!(
+            loaded_registries(&path),
+            serde_json::json!({
+                "clawhub": {"base_url": "https://clawhub.ai", "enabled": true},
+                "github": {"base_url": "https://github.com", "enabled": true},
+                "other": {"base_url": "", "enabled": false},
+            }),
+            "a new name joins the two builtins at its own zero value"
+        );
+
+        // And the empty-name rule is what makes `[{}]` a no-op rather than an entry keyed by "".
+        let (_dir, path) = write_config_only(
+            r#"{"version":3,"tools":{"skills":{"registries":[{},{"enabled":true}]}}}"#,
+        );
+        assert_eq!(
+            loaded_registries(&path),
+            serde_json::json!({
+                "clawhub": {"base_url": "https://clawhub.ai", "enabled": true},
+                "github": {"base_url": "https://github.com", "enabled": true},
+            }),
+            "`Set` refuses an empty name, so nothing is appended"
+        );
     }
 
     #[test]
