@@ -48,6 +48,7 @@
 mod channels;
 mod defaults;
 mod doc;
+mod legacy_bindings;
 mod marshal;
 mod multikey;
 mod schema;
@@ -383,6 +384,11 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         Err(e) => return Err(Error::Io(format!("failed to read security config: {e}"))),
     };
 
+    // The legacy `bindings` array, kept from the file's own bytes because the ladder deletes
+    // the key and Go reads the array out of `data`, not out of the security-merged map the
+    // ladder consumes. See [`legacy_bindings`].
+    let legacy_bindings = document.get("bindings").cloned();
+
     let document = match version {
         0..=2 => {
             // `case 0..=2` does not migrate config.json. It calls `loadConfigMap(path)`,
@@ -472,6 +478,13 @@ pub fn load(path: &Path, home: &str) -> Result<Config, Error> {
         // `load_config_map` lifted the legacy `skills.github.token` out of the file; this
         // block never runs for one, so it cannot clobber it.
     }
+
+    // `applyLegacyBindingsMigration` (`config.go:1514`), in Go's position: after the ladder,
+    // the decode and the security file, before the channel list and every validator. It is
+    // inside the migration arm's `defer SaveConfig`, so for a migrated document the rules it
+    // writes are part of the file the user's next start reads -- which is why this runs on the
+    // document the save will marshal rather than on a value only the loaded config sees.
+    legacy_bindings::apply(&mut merged, legacy_bindings.as_ref());
 
     // Everything from here to the end of `load` is one `defer`, and its shape is the whole
     // story of vicowa-botworks/rusty-crab#28. A migration arm closes with
