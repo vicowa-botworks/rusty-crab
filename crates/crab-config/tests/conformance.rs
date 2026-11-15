@@ -59,8 +59,16 @@ use crab_config::{config_schema, default_config, load, loaded_value};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// One step of a case's script.
+/// One step of a case's script. Every field any op can emit is listed, and unknown
+/// fields are refused: this is the only seam harness in the workspace that did not say
+/// so, and leniency here is not forward-compatibility, it is a silent downgrade of the
+/// case. A generator that starts emitting `{"op": "load", "env": {…}}` describes a load
+/// whose environment is part of what is being graded; replaying that op with the `env`
+/// key dropped runs the load in an environment the recorded bytes were never produced
+/// in, and reports whatever agreement that happens to reach as a match. Refusing the
+/// key instead sends the reader to this file, where the missing handling is obvious.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Op {
     op: String,
     #[serde(default)]
@@ -70,6 +78,7 @@ struct Op {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Script {
     ops: Vec<Op>,
 }
