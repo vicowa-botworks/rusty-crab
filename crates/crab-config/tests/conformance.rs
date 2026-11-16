@@ -53,6 +53,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use conformance::{Fixture, Report};
 use crab_config::{config_schema, default_config, load, loaded_value};
@@ -62,11 +63,10 @@ use serde_json::{json, Value};
 /// One step of a case's script. Every field any op can emit is listed, and unknown
 /// fields are refused: this is the only seam harness in the workspace that did not say
 /// so, and leniency here is not forward-compatibility, it is a silent downgrade of the
-/// case. A generator that starts emitting `{"op": "load", "env": {…}}` describes a load
-/// whose environment is part of what is being graded; replaying that op with the `env`
-/// key dropped runs the load in an environment the recorded bytes were never produced
-/// in, and reports whatever agreement that happens to reach as a match. Refusing the
-/// key instead sends the reader to this file, where the missing handling is obvious.
+/// case. A generator that emits `{"op": "load", "env": {…}}` describes a load whose
+/// environment is part of what is being graded; replaying that op with the `env` key
+/// dropped runs the load in an environment the recorded bytes were never produced in,
+/// and reports whatever agreement that happens to reach as a match.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Op {
@@ -75,6 +75,18 @@ struct Op {
     name: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// The `PICOCLAW_*` variables this load sees. **Absent means cleared**, because that
+    /// is what Go's generator does in `pinConfigEnv`: it fixes `$HOME` and strips every
+    /// `PICOCLAW_*` name, so the recorded bytes always come out of a known-empty
+    /// environment. A map therefore names the only variables the load may see — it is
+    /// not a patch over whatever the machine replaying the fixture happens to export.
+    ///
+    /// `load` is the only op that may carry it, because `load` is the only op that reads
+    /// an environment: Go's `env.Parse` and the `PICOCLAW_*` compat shims run inside
+    /// `LoadConfig`, so `defaults`, `write_file` and `save` have no such thing to vary.
+    /// [`reject_env_on`] refuses the key there instead of ignoring it.
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +128,65 @@ fn snapshot(dir: &Path) -> BTreeMap<String, String> {
     files
 }
 
+/// Refuses an `env` key on an op that has no environment to run in.
+///
+/// The alternative is the silent downgrade the `Op` doc comment describes: the case says
+/// the step happens under a variable, the harness replays it without one, and the
+/// disagreement that follows gets blamed on the crate.
+fn reject_env_on(other: &str, op: &Op) {
+    if op.env.is_some() {
+        panic!(
+            "op `{other}` carries `env`, but only `load` reads the environment: Go's \
+             env.Parse and the PICOCLAW_* compat shims both run inside LoadConfig"
+        );
+    }
+}
+
+/// Runs `f` with the process environment restricted to `env` for every `PICOCLAW_*` name.
+///
+/// Both directions are the point. Names the map does not mention are removed for the
+/// duration, so a developer's own exported `PICOCLAW_*` value cannot decide a case's
+/// verdict; and everything removed or overwritten is put back afterwards, so a case
+/// cannot leak its environment into the next one.
+///
+/// The lock exists because `cargo test` runs the tests of one binary on parallel threads
+/// and the environment is process-wide. Nothing else in this crate reads `PICOCLAW_*`
+/// yet -- the binding is the next slice -- so the guard only has to hold against this
+/// file's own tests, which is exactly what it cannot be assumed to do without one.
+fn with_env<R>(env: &Option<BTreeMap<String, String>>, f: impl FnOnce() -> R) -> R {
+    const PREFIX: &str = "PICOCLAW_";
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // `vars_os` rather than `vars`: the latter panics on any non-Unicode entry, which
+    // would let an unrelated variable in a runner's shell abort the whole replay.
+    let saved: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(name, _)| name.to_string_lossy().starts_with(PREFIX))
+        .collect();
+    for (name, _) in &saved {
+        std::env::remove_var(name);
+    }
+    if let Some(vars) = env {
+        for (name, value) in vars {
+            std::env::set_var(name, value);
+        }
+    }
+
+    let out = f();
+
+    if let Some(vars) = env {
+        for name in vars.keys() {
+            std::env::remove_var(name);
+        }
+    }
+    for (name, value) in saved {
+        std::env::set_var(name, value);
+    }
+    out
+}
+
 /// Runs one script and returns the value the harness compares.
 ///
 /// A failing op stops the script and is recorded by index only, with no message: Go's
@@ -138,11 +209,13 @@ fn run_script(case: &str, ops: &[Op]) -> Value {
     for (index, op) in ops.iter().enumerate() {
         match op.op.as_str() {
             "defaults" => {
+                reject_env_on("defaults", op);
                 let document = default_config(home);
                 results.push(json!({"op": op.op, "op_index": index, "value": loaded_value(&document, &schema)}));
                 loaded = Some(crab_config::Config::from_document(document));
             }
             "write_file" => {
+                reject_env_on("write_file", op);
                 let name = op.name.clone().expect("write_file names a file");
                 std::fs::write(
                     dir.join(&name),
@@ -152,7 +225,9 @@ fn run_script(case: &str, ops: &[Op]) -> Value {
             }
             "load" => {
                 let name = op.name.clone().expect("load names a file");
-                match load(&dir.join(&name), home) {
+                // The environment is part of the input being graded, so it is applied
+                // around the call rather than assumed to be the runner's.
+                match with_env(&op.env, || load(&dir.join(&name), home)) {
                     Ok(cfg) => {
                         results.push(json!({
                             "op": op.op,
@@ -168,6 +243,7 @@ fn run_script(case: &str, ops: &[Op]) -> Value {
                 }
             }
             "save" => {
+                reject_env_on("save", op);
                 // Go's harness refuses a save with nothing loaded, because a harness that
                 // manufactures the thing a case is named for cannot pin its absence. Same
                 // rule here: panic rather than write a default config.
@@ -299,4 +375,63 @@ fn loading_matches_what_go_returned() {
         eprintln!("known gaps: {}", gaps.join(", "));
     }
     report.finish(8);
+}
+
+/// The `env` map has to reach the process environment and then go away again, and the
+/// corpus cannot show either yet: no committed case carries the key, and this crate reads
+/// no `PICOCLAW_*` name at all until the binding lands. So the mechanism is graded
+/// directly, in both directions, rather than left as plumbing something else will
+/// eventually rely on.
+#[test]
+fn an_env_map_replaces_the_environment_for_the_duration_of_a_load() {
+    // A name Go really binds, so the test documents the shape of a real binding and not
+    // an invented one: pkg/config's agent max_tokens carries this tag.
+    let probe = "PICOCLAW_AGENT_MAX_TOKENS";
+    let map = BTreeMap::from([(probe.to_string(), "77".to_string())]);
+
+    std::env::set_var(probe, "3");
+
+    let inside: Option<String> = with_env(&Some(map.clone()), || std::env::var(probe).ok());
+    assert_eq!(
+        inside.as_deref(),
+        Some("77"),
+        "the map's value is what the load must see, not the ambient one"
+    );
+    assert_eq!(
+        std::env::var(probe).as_deref(),
+        Ok("3"),
+        "the ambient value must be back the moment the load returns"
+    );
+
+    // Absent means cleared: this is the environment every recorded byte in the fixture
+    // was produced in, so an ambient value must be invisible to such a load.
+    let blind = with_env(&None, || std::env::var(probe).is_err());
+    assert!(
+        blind,
+        "a load whose op carries no `env` must not see an ambient PICOCLAW_* value"
+    );
+    assert_eq!(
+        std::env::var(probe).as_deref(),
+        Ok("3"),
+        "and it must still hand that value back afterwards"
+    );
+
+    std::env::remove_var(probe);
+}
+
+/// An `env` on an op that reads no environment is a key the case believes and the harness
+/// would ignore, so it is refused rather than quietly replayed as something else.
+#[test]
+#[should_panic(expected = "only `load` reads the environment")]
+fn env_on_an_op_that_reads_no_environment_is_refused() {
+    let op = Op {
+        op: "defaults".to_string(),
+        name: None,
+        content: None,
+        env: Some(BTreeMap::from([(
+            "PICOCLAW_AGENT_MAX_TOKENS".to_string(),
+            "77".to_string(),
+        )])),
+    };
+    reject_env_on("defaults", &op);
 }
